@@ -170,36 +170,46 @@ def run_bot():
                                 notifier.send_trade_signal(symbol, data)
                         
                         # ثانياً: اختيار الأفضل وتنفيذ الصفقة
-                        top_picks = analysis.get_top_picks(results, top_n=1)
+                        top_picks = analysis.get_top_picks(results, top_n=3)
                         
                         if top_picks and config.TEST_MODE == False:
-                            symbol, data = top_picks[0]
-                            
-                            # التحقق من الرصيد الكافي
-                            if usdt_balance >= config.TRADE_AMOUNT_USD:
-                                print(f"\n🏆 أفضل اختيار: {symbol} (درجة: {data['score']})")
-                                sys.stdout.flush()
-                                
-                                # حساب الكمية
-                                price = data['current_price']
-                                quantity = config.TRADE_AMOUNT_USD / price
-                                
-                                print(f"💵 مبلغ الصفقة: ${config.TRADE_AMOUNT_USD}")
-                                print(f"📊 الكمية: {quantity} {symbol.replace('USDT', '')}")
-                                sys.stdout.flush()
-                                
-                                # فتح الصفقة
-                                success = trading_manager.open_position(symbol, quantity, price)
-                                
-                                if success:
-                                    print(f"✅ تم فتح الصفقة بنجاح!")
+                            # محاولة كل خيار حتى ينجح واحد
+                            trade_executed = False
+                            for idx, (symbol, data) in enumerate(top_picks):
+                                if trade_executed:
+                                    break
+                                    
+                                # التحقق من الرصيد الكافي
+                                if usdt_balance >= config.TRADE_AMOUNT_USD:
+                                    print(f"\n🏆 محاولة {idx+1}: {symbol} (درجة: {data['score']})")
                                     sys.stdout.flush()
+                                    
+                                    # حساب الكمية
+                                    price = data['current_price']
+                                    quantity = config.TRADE_AMOUNT_USD / price
+                                    
+                                    print(f"💵 مبلغ الصفقة: ${config.TRADE_AMOUNT_USD}")
+                                    print(f"📊 الكمية: {quantity} {symbol.replace('USDT', '')}")
+                                    sys.stdout.flush()
+                                    
+                                    # فتح الصفقة
+                                    success = trading_manager.open_position(symbol, quantity, price)
+                                    
+                                    if success:
+                                        print(f"✅ تم فتح الصفقة بنجاح!")
+                                        sys.stdout.flush()
+                                        trade_executed = True
+                                    else:
+                                        print(f"❌ فشل في {symbol}، جاري المحاولة التالية...")
+                                        sys.stdout.flush()
                                 else:
-                                    print(f"❌ فشل في فتح الصفقة!")
+                                    print(f"\n⚠️ رصيد USDT غير كافٍ! الرصيد: ${usdt_balance:.2f}, المطلوب: ${config.TRADE_AMOUNT_USD}")
                                     sys.stdout.flush()
-                            else:
-                                print(f"\n⚠️ رصيد USDT غير كافٍ! الرصيد: ${usdt_balance:.2f}, المطلوب: ${config.TRADE_AMOUNT_USD}")
+                            
+                            if not trade_executed and top_picks:
+                                print(f"\n⚠️ لم تنجح أي صفقة، سيتم المحاولة في الدورة القادمة")
                                 sys.stdout.flush()
+                                
                         elif config.TEST_MODE:
                             print(f"\n🧪 [TEST MODE] لن يتم تنفيذ أي صفقات حقيقية")
                             sys.stdout.flush()
