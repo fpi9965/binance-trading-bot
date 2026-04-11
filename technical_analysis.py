@@ -99,7 +99,7 @@ class TechnicalAnalysis:
                 if recent_volume > avg_volume * 1.5:
                     score += 10
                     signals.append("حجم تداول عالي")
-            if score >= 60:
+            if score >= 40:
                 recommendation = "BUY"
             elif score <= 20:
                 recommendation = "SELL"
