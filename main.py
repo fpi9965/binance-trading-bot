@@ -23,12 +23,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 binance = BinanceClient(API_KEY, API_SECRET, testnet=TEST_MODE)
 telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, enabled=TELEGRAM_ENABLED)
-ta = TechnicalAnalysis()
+ta = TechnicalAnalysis(binance)
 trading_manager = TradingManager(binance, telegram)
 
 print("=" * 50)
 print("بوت التداول الآلي")
-print(f"وضع الاختبار: {'نعم' if TEST_MODE else 'لا'}")
 print("=" * 50)
 
 TARGET_SYMBOLS = ["ADAUSDT", "DOGEUSDT", "SHIBUSDT", "1000SHIBUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "LTCUSDT", "ETHUSDT", "BTCUSDT"]
@@ -38,18 +37,24 @@ def scan_and_trade():
         try:
             print("\n🔍 جاري المسح...")
             for symbol in TARGET_SYMBOLS:
-                print(f"\n📊 تحليل {symbol}...")
-                market_open, _ = binance.check_market_status(symbol)
-                if not market_open:
-                    print(f"⚠️ {symbol} - السوق مغلق")
+                try:
+                    print(f"\n📊 تحليل {symbol}...")
+                    market_open, _ = binance.check_market_status(symbol)
+                    if not market_open:
+                        print(f"⚠️ {symbol} - السوق مغلق")
+                        continue
+                    signal = ta.analyze(symbol)
+                    if signal and signal['action'] == 'buy':
+                        print(f"✅ إشارة شراء في {symbol}!")
+                        trading_manager.open_position(symbol)
+                    time.sleep(1)
+                except Exception as e:
+                    print(f"خطأ في {symbol}: {e}")
                     continue
-                signal = ta.analyze(symbol)
-                if signal and signal['action'] == 'buy':
-                    print(f"✅ إشارة شراء في {symbol}!")
-                    trading_manager.open_position(symbol)
+            print(f"\n⏰ انتظار 60 ثانية...")
             time.sleep(60)
         except Exception as e:
-            print(f"خطأ: {e}")
+            print(f"خطأ عام: {e}")
             time.sleep(30)
 
 @app.route('/')
