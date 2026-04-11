@@ -10,7 +10,7 @@ import os
 import sys
 from flask import Flask
 
-from binance_client_fixed import BinanceClient
+from binance_client import BinanceClient
 from technical_analysis import TechnicalAnalysis
 from telegram_notifier import TelegramNotifier
 from trading_manager import TradingManager
