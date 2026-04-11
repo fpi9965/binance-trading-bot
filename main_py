@@ -9,7 +9,6 @@ import threading
 import os
 import sys
 from flask import Flask
-
 from binance_client import BinanceClient
 from technical_analysis import TechnicalAnalysis
 from telegram_notifier import TelegramNotifier
@@ -18,191 +17,104 @@ import config
 
 app = Flask(__name__)
 
-binance_client = None
-notifier = None
-trading_manager = None
-analysis = None
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
+
+API_KEY = os.getenv("BINANCE_API_KEY", "")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+binance = BinanceClient(API_KEY, API_SECRET, testnet=TEST_MODE)
+telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, enabled=TELEGRAM_ENABLED)
+ta = TechnicalAnalysis(binance)
+trading_manager = TradingManager(binance, ta, telegram)
+
+print("=" * 50)
+print("بوت التداول الآلي - التشغيل")
+print("=" * 50)
+print(f"وضع الاختبار: {'نعم' if TEST_MODE else 'لا'}")
+print(f"إشعارات تيليجرام: {'مفعلة' if TELEGRAM_ENABLED else 'معطلة'}")
+print(f"الحد الأقصى من الصفقات: {config.MAX_POSITIONS}")
+print("=" * 50)
+
+TARGET_SYMBOLS = ["MATICUSDT", "ADAUSDT", "DOGEUSDT", "SHIBUSDT", "1000SHIBUSDT"]
+
+def get_open_symbols():
+    try:
+        positions = binance.get_open_positions()
+        return [p['symbol'] for p in positions] if positions else []
+    except:
+        return []
+
+def scan_and_trade():
+    global TARGET_SYMBOLS
+    while True:
+        try:
+            print("\n" + "=" * 50)
+            print("🔍 جاري المسح...")
+            
+            open_symbols = get_open_symbols()
+            print(f"الصفقات المفتوحة حالياً: {len(open_symbols)}")
+            
+            closed_symbols = trading_manager.get_recently_traded_symbols()
+            excluded_symbols = set(open_symbols + closed_symbols + trading_manager.get_failed_symbols())
+            
+            for symbol in TARGET_SYMBOLS:
+                if symbol in excluded_symbols:
+                    print(f"⏭️ {symbol} - تم تخطيه")
+                    continue
+                    
+                print(f"\n📊 تحليل {symbol}...")
+                
+                market_open, _ = binance.check_market_status(symbol)
+                if not market_open:
+                    print(f"⚠️ {symbol} - السوق مغلق")
+                    trading_manager.add_failed_symbol(symbol)
+                    continue
+                
+                position = trading_manager.get_position(symbol)
+                if position:
+                    print(f"📈 {symbol} - متابعة الصفقة المفتوحة")
+                    trading_manager.monitor_position(position)
+                else:
+                    signal = ta.analyze(symbol)
+                    if signal and signal['action'] == 'buy':
+                        print(f"✅ إشارة شراء قوية في {symbol}!")
+                        success = trading_manager.open_position(symbol)
+                        if success:
+                            print(f"🎉 تم فتح صفقة في {symbol}")
+                            excluded_symbols.add(symbol)
+                    elif signal:
+                        print(f"❌ لا يوجد إشارة شراء - {symbol}")
+                    else:
+                        print(f"⚠️ فشل في تحليل {symbol}")
+                        trading_manager.add_failed_symbol(symbol)
+            
+            print("\n⏰ انتظار 60 ثانية...")
+            time.sleep(60)
+            
+        except Exception as e:
+            print(f"❌ خطأ في المسح: {e}")
+            time.sleep(30)
 
 @app.route('/')
 def home():
-    return 'Trading Bot is running!'
+    positions = trading_manager.get_all_positions()
+    return {'status': 'running', 'active_positions': len(positions), 'test_mode': TEST_MODE}
 
 @app.route('/health')
 def health():
-    return 'OK'
-
-def run_bot():
-    global binance_client, notifier, trading_manager, analysis
-    
-    print("\n" + "=" * 60)
-    print("🤖 جاري تشغيل بوت التداول الآلي...")
-    print("=" * 60)
-    
-    print(f"\n📋 الإعدادات:")
-    print(f"   صفقات متعددة: {config.MAX_POSITIONS} صفقات كحد أقصى")
-    print(f"   مبلغ كل صفقة: ${config.TRADE_AMOUNT_USD}")
-    print(f"   SYMBOLS: {len(config.SYMBOLS)} عملة")
-    sys.stdout.flush()
-    
-    if config.TEST_MODE:
-        print("\n⚠️ وضع الاختبار مفعل!")
-    else:
-        print("\n🔴 وضع التداول الحقيقي!")
-    
-    try:
-        binance_client = BinanceClient()
-        notifier = TelegramNotifier()
-        trading_manager = TradingManager(binance_client, notifier)
-        analysis = TechnicalAnalysis()
-        
-        notifier.send_message("🟢 *تم تشغيل البوت!*\n\n"
-                             f"🔢 الحد الأقصى: {config.MAX_POSITIONS} صفقات\n"
-                             f"💵 لكل صفقة: ${config.TRADE_AMOUNT_USD}")
-        
-        cycle_count = 0
-        usdt_balance = 0
-        
-        while True:
-            try:
-                cycle_count += 1
-                print(f"\n{'=' * 60}")
-                print(f"🔄 الدورة #{cycle_count} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print("=" * 60)
-                sys.stdout.flush()
-                
-                # جلب الرصيد
-                balance = binance_client.get_account_balance()
-                if balance:
-                    for b in balance['balances']:
-                        if b['asset'] == 'USDT':
-                            usdt_balance = float(b['free'])
-                            print(f"💰 الرصيد USDT: ${usdt_balance:.2f}")
-                            break
-                
-                open_count = trading_manager.get_open_positions_count()
-                print(f"📊 الصفقات المفتوحة: {open_count}/{config.MAX_POSITIONS}")
-                sys.stdout.flush()
-                
-                # مراقبة الصفقات المفتوحة
-                if open_count > 0:
-                    print("\n📍 جاري مراقبة الصفقات...")
-                    trading_manager.update_positions()
-                else:
-                    # البحث عن فرص
-                    print("\n📊 جاري البحث عن فرص...")
-                    sys.stdout.flush()
-                    
-                    results = {}
-                    
-                    for symbol in config.SYMBOLS:
-                        symbol = symbol.strip()
-                        if not symbol:
-                            continue
-                            
-                        try:
-                            # فحص إذا السوق مفتوح
-                            is_open, current_price = binance_client.check_market_status(symbol)
-                            
-                            if not is_open:
-                                print(f"  ⚫ {symbol}: السوق مغلق")
-                                continue
-                            
-                            # جلب البيانات
-                            klines = binance_client.get_klines(
-                                symbol=symbol,
-                                interval=config.TIMEFRAME,
-                                limit=100
-                            )
-                            
-                            if klines:
-                                result = analysis.analyze_symbol(klines)
-                                if result:
-                                    results[symbol] = result
-                                    
-                                    status = "🟢" if result['recommendation'] == "BUY" else ("🔴" if result['recommendation'] == "SELL" else "🟡")
-                                    print(f"  {status} {symbol}: {result['score']}/100 ({result['recommendation']})")
-                                    sys.stdout.flush()
-                            
-                            time.sleep(0.2)
-                            
-                        except Exception as e:
-                            print(f"  ⚠️ خطأ في {symbol}: {e}")
-                            continue
-                    
-                    print(f"\n📊 تم تحليل {len(results)} عملة")
-                    sys.stdout.flush()
-                    
-                    # فتح الصفقات
-                    if results and config.TEST_MODE == False:
-                        # ترتيب العملات حسب الدرجة
-                        sorted_results = sorted(results.items(), key=lambda x: x[1]['score'], reverse=True)
-                        
-                        opened_count = 0
-                        
-                        for idx, (symbol, data) in enumerate(sorted_results):
-                            # التحقق من عدد الصفقات
-                            if not trading_manager.can_open_position():
-                                print(f"\n⚠️已达到 الحد الأقصى للصفقات ({config.MAX_POSITIONS})")
-                                break
-
-                            # التحقق من الرصيد
-                            if usdt_balance < config.TRADE_AMOUNT_USD:
-                                print(f"\n⚠️ رصيد غير كافٍ!")
-                                break
-                            
-                            print(f"\n🏆 محاولة {idx+1}: {symbol} (درجة: {data['score']})")
-                            sys.stdout.flush()
-                            
-                            price = data['current_price']
-                            quantity = config.TRADE_AMOUNT_USD / price
-                            
-                            print(f"💵 مبلغ: ${config.TRADE_AMOUNT_USD}")
-                            print(f"📊 الكمية: {quantity:.4f} {symbol.replace('USDT', '')}")
-                            sys.stdout.flush()
-                            
-                            success = trading_manager.open_position(symbol, quantity, price)
-                            
-                            if success:
-                                opened_count += 1
-                                usdt_balance -= config.TRADE_AMOUNT_USD
-                                print(f"✅ تم فتح الصفقة!")
-                            else:
-                                print(f"⚠️ فشل في {symbol}")
-                            
-                            time.sleep(2)
-                        
-                        if opened_count > 0:
-                            print(f"\n✅ تم فتح {opened_count} صفقة!")
-                        else:
-                            print(f"\n⚠️ لم تنجح أي صفقة")
-                            
-                    elif config.TEST_MODE:
-                        print(f"\n🧪 [TEST MODE]")
-                
-                # Heartbeat
-                if cycle_count % 60 == 0:
-                    print("\n❤️ Heartbeat...")
-                    notifier.send_heartbeat()
-                
-                print(f"\n⏰ انتظار {config.CYCLE_INTERVAL} ثانية...")
-                sys.stdout.flush()
-                time.sleep(config.CYCLE_INTERVAL)
-                
-            except Exception as e:
-                print(f"\n❌ خطأ: {e}")
-                sys.stdout.flush()
-                time.sleep(60)
-                
-    except Exception as e:
-        print(f"\n❌ خطأFatal: {e}")
-        sys.stdout.flush()
+    return {'status': 'healthy', 'test_mode': TEST_MODE}
 
 if __name__ == "__main__":
-    print("🚀 بدء البوت...")
-    sys.stdout.flush()
+    print("🚀 بدء تشغيل البوت...")
     
-    bot_thread = threading.Thread(target=run_bot, daemon=False)
-    bot_thread.start()
+    if not TEST_MODE:
+        telegram.send_message("🚀 تم تشغيل بوت التداول الآلي!")
     
-    port = int(os.getenv("PORT", 10000))
+    scan_thread = threading.Thread(target=scan_and_trade, daemon=True)
+    scan_thread.start()
+    
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
