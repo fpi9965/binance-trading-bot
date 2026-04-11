@@ -105,7 +105,7 @@ class BinanceClient:
             print(f"🟢 جاري إرسال أمر شراء...")
             print(f"   العملة: {symbol}")
             print(f"   الكمية: {quantity}")
-print(f"   السعر: {price}")
+            print(f"   السعر: {price}")
             
             order = self.client.order_market_buy(
                 symbol=symbol,
@@ -164,7 +164,7 @@ print(f"   السعر: {price}")
             print(f"❌ خطأ في أمر البيع: {e}")
             return None
         except Exception as e:
-            print(f"❌ خطأ غير متوقع: {e}")
+print(f"❌ خطأ غير متوقع: {e}")
             return None
     
     def get_order(self, symbol, order_id):
