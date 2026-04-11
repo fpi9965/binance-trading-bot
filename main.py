@@ -23,7 +23,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 binance = BinanceClient(API_KEY, API_SECRET, testnet=TEST_MODE)
 telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, enabled=TELEGRAM_ENABLED)
-ta = TechnicalAnalysis(binance)
+ta = TechnicalAnalysis()
 trading_manager = TradingManager(binance, ta, telegram)
 
 print("=" * 50)
