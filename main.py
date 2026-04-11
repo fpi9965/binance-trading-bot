@@ -38,7 +38,6 @@ def run_bot():
         trading_manager = TradingManager(binance_client, notifier)
         analysis = TechnicalAnalysis()
         
-        symbols = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,MATICUSDT,DOTUSDT,LTCUSDT")
         notifier.send_message("🟢 *تم تشغيل بوت التداول الآلي!*")
         
         cycle_count = 0
@@ -75,14 +74,22 @@ def run_bot():
                         except:
                             pass
                     
+                    # اختيار أفضل فرصة
                     top = analysis.get_top_picks(results, top_n=1)
                     if top:
                         sym, data = top[0]
                         price = binance_client.get_symbol_price(sym)
-                        print(f"🏆 {sym} بسعر ${price}")
+                        print(f"🏆 اختيار: {sym} بسعر ${price}")
                         notifier.send_trade_signal(sym, data)
-                        qty = float(os.getenv("TRADE_AMOUNT_USD", "10")) / price
-                        trading_manager.open_position(sym, qty, price)
+                        
+                        # تنفيذ الشراء مباشرة!
+                        trade_amount = float(os.getenv("TRADE_AMOUNT_USD", "10"))
+                        quantity = trade_amount / price
+                        print(f"🟢 جاري تنفيذ الشراء...")
+                        success = trading_manager.open_position(sym, quantity, price)
+                        
+                        if success:
+                            notifier.send_message(f"✅ *تم فتح صفقة {sym}!*")
                 
                 if cycle_count % 60 == 0:
                     notifier.send_heartbeat()
