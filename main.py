@@ -31,7 +31,7 @@ print("بوت التداول الآلي")
 print(f"وضع الاختبار: {'نعم' if TEST_MODE else 'لا'}")
 print("=" * 50)
 
-TARGET_SYMBOLS = ["MATICUSDT", "ADAUSDT", "DOGEUSDT", "SHIBUSDT", "1000SHIBUSDT"]
+TARGET_SYMBOLS = ["ADAUSDT", "DOGEUSDT", "SHIBUSDT", "1000SHIBUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "LTCUSDT", "ETHUSDT", "BTCUSDT"]
 
 def scan_and_trade():
     while True:
