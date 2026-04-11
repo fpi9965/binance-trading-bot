@@ -150,9 +150,9 @@ class TechnicalAnalysis:
                 score -= 5
             
             # تحديد التوصية
-            if score >= 25:
+            if score >= 20:
                 recommendation = "BUY"
-            elif score <= 10:
+            elif score <= 5:
                 recommendation = "SELL"
             else:
                 recommendation = "HOLD"
