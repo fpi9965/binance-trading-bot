@@ -1,97 +1,38 @@
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                    إعدادات بوت التداول الآلي على Binance                      ║
-║                         Trading Bot Configuration                            ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+إعدادات البوت - عدّل هذه القيم حسب احتياجاتك
 """
+import os
 
-# ═══════════════════════════════════════════════════════════════════════════
-#                    إعدادات API Binance
-# ═══════════════════════════════════════════════════════════════════════════
-# للحصول على API Key:
-# 1. سجل دخول على Binance.com
-# 2. اذهب إلى Dashboard -> API Management
-# 3. أنشئ API Key جديد
-# 4. فعل "Enable Spot & Margin Trading"
-# 5. لا تفعل "Enable Withdrawal" لأسباب أمنية
+# Binance API
+# احصل على المفاتيح من: https://www.binance.com/en/my/settings/api-management
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
-BINANCE_API_KEY = "YOUR_BINANCE_API_KEY_HERE"
-BINANCE_API_SECRET = "YOUR_BINANCE_API_SECRET_HERE"
+# Telegram Bot
+# أنشئ بوت من: https://t.me/BotFather
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ═══════════════════════════════════════════════════════════════════════════
-#                    إعدادات Telegram
-# ═══════════════════════════════════════════════════════════════════════════
-# للحصول على Bot Token:
-# 1. ابحث عن @BotFather على Telegram
-# 2. أرسل /newbot
-# 3. اختر اسم للبوت
-# 4. احفظ الـ Token
+# إعدادات التداول
+TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", "10"))  # مبلغ كل صفقة بالدولار
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")  # الإطار الزمني
+SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,MATICUSDT,DOTUSDT,LTCUSDT").split(",")
+CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL", "60"))  # الفاصل بين كل دورة (بالثواني)
 
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-
-# للحصول على Chat ID:
-# 1. ابحث عن @userinfobot على Telegram
-# 2. أرسل أي رسالة للبوت
-# 3. سيعطيك Chat ID الخاص بك
-
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                    إعدادات التداول
-# ═══════════════════════════════════════════════════════════════════════════
-
-# مبلغ الاستثمار لكل صفقة (بالدولار)
-TRADE_AMOUNT_USD = 10.0  # يمكنك تغييره
-
-# وقف الخسارة الأولي (نسبة مئوية)
-STOP_LOSS_PERCENT = 2.0  # 2%
-
-# جني الأرباح (نسبة مئوية)
-TAKE_PROFIT_PERCENT = 10.0  # 10%
-
-# تفعيل/إلغاء وقف الخسارة المتحرك (Trailing Stop)
-TRAILING_STOP_ENABLED = True
-TRAILING_STOP_PERCENT = 1.5  # يتحرك عندما يرتفع السعر 1.5%
-
-# الأزواج المراد تحليلها
-# اتركها فارغة لتحليل جميع الأزواج
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "ADAUSDT", "DOGEUSDT", "MATICUSDT", "DOTUSDT", "LTCUSDT"
-]
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                    إعدادات التحليل الفني
-# ═══════════════════════════════════════════════════════════════════════════
-
-# عدد الشموع للتحليل
-CANDLE_COUNT = 100
-
-# الفترات الزمنية للتحليل
-# Options: 1m, 3m, 5m, 15m, 1h, 4h, 1d
-TIMEFRAME = "15m"
-
-# مؤشرات التحليل الفني
+# إعدادات المؤشرات الفنية
+MIN_RSI = 30  # الحد الأدنى لـ RSI للشراء
+MAX_RSI = 70  # الحد الأعلى لـ RSI للبيع
 RSI_PERIOD = 14
-RSI_OVERSOLD = 35
-RSI_OVERBROUGHT = 70
-
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+BB_PERIOD = 20
 
-# ═══════════════════════════════════════════════════════════════════════════
-#                    إعدادات إضافية
-# ═══════════════════════════════════════════════════════════════════════════
+# إعدادات Stop Loss و Trailing Stop
+STOP_LOSS_PERCENT = 2.0  # نسبة Stop Loss (2%)
+TAKE_PROFIT_PERCENT = 10.0  # نسبة جني الأرباح (10%)
+TRAILING_STOP_PERCENT = 1.5  # نسبة Trailing Stop (1.5%)
 
-# وقت الانتظار بين كل دورة (بالثواني)
-CYCLE_INTERVAL = 60
-
-# تفعيل وضع الاختبار (لن يتم التداول الحقيقي)
-TEST_MODE = True
-
-# تفعيل تسجيل الأخطاء
-LOG_FILE = "trading_bot.log"
-
-# الحد الأقصى للعمر الافتراضي للمركز (بالساعات)
-MAX_POSITION_HOURS = 24
+# إعدادات عامة
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"  # وضع الاختبار - تأكد أنه False للتداول الحقيقي
