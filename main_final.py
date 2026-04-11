@@ -1,0 +1,208 @@
+"""
+بوت التداول الآلي - النهائي
+- يجرب جميع العملات المتاحة
+- يتجاوز العملات المغلفة
+- يفتح عدة صفقات
+"""
+import time
+import threading
+import os
+import sys
+from flask import Flask
+
+from binance_client_fixed import BinanceClient
+from technical_analysis import TechnicalAnalysis
+from telegram_notifier import TelegramNotifier
+from trading_manager import TradingManager
+import config
+
+app = Flask(__name__)
+
+binance_client = None
+notifier = None
+trading_manager = None
+analysis = None
+
+@app.route('/')
+def home():
+    return 'Trading Bot is running!'
+
+@app.route('/health')
+def health():
+    return 'OK'
+
+def run_bot():
+    global binance_client, notifier, trading_manager, analysis
+    
+    print("\n" + "=" * 60)
+    print("🤖 جاري تشغيل بوت التداول الآلي...")
+    print("=" * 60)
+    
+    print(f"\n📋 الإعدادات:")
+    print(f"   صفقات متعددة: {config.MAX_POSITIONS} صفقات كحد أقصى")
+    print(f"   مبلغ كل صفقة: ${config.TRADE_AMOUNT_USD}")
+    print(f"   SYMBOLS: {len(config.SYMBOLS)} عملة")
+    sys.stdout.flush()
+    
+    if config.TEST_MODE:
+        print("\n⚠️ وضع الاختبار مفعل!")
+    else:
+        print("\n🔴 وضع التداول الحقيقي!")
+    
+    try:
+        binance_client = BinanceClient()
+        notifier = TelegramNotifier()
+        trading_manager = TradingManager(binance_client, notifier)
+        analysis = TechnicalAnalysis()
+        
+        notifier.send_message("🟢 *تم تشغيل البوت!*\n\n"
+                             f"🔢 الحد الأقصى: {config.MAX_POSITIONS} صفقات\n"
+                             f"💵 لكل صفقة: ${config.TRADE_AMOUNT_USD}")
+        
+        cycle_count = 0
+        usdt_balance = 0
+        
+        while True:
+            try:
+                cycle_count += 1
+                print(f"\n{'=' * 60}")
+                print(f"🔄 الدورة #{cycle_count} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("=" * 60)
+                sys.stdout.flush()
+                
+                # جلب الرصيد
+                balance = binance_client.get_account_balance()
+                if balance:
+                    for b in balance['balances']:
+                        if b['asset'] == 'USDT':
+                            usdt_balance = float(b['free'])
+                            print(f"💰 الرصيد USDT: ${usdt_balance:.2f}")
+                            break
+                
+                open_count = trading_manager.get_open_positions_count()
+                print(f"📊 الصفقات المفتوحة: {open_count}/{config.MAX_POSITIONS}")
+                sys.stdout.flush()
+                
+                # مراقبة الصفقات المفتوحة
+                if open_count > 0:
+                    print("\n📍 جاري مراقبة الصفقات...")
+                    trading_manager.update_positions()
+                else:
+                    # البحث عن فرص
+                    print("\n📊 جاري البحث عن فرص...")
+                    sys.stdout.flush()
+                    
+                    results = {}
+                    
+                    for symbol in config.SYMBOLS:
+                        symbol = symbol.strip()
+                        if not symbol:
+                            continue
+                            
+                        try:
+                            # فحص إذا السوق مفتوح
+                            is_open, current_price = binance_client.check_market_status(symbol)
+                            
+                            if not is_open:
+                                print(f"  ⚫ {symbol}: السوق مغلق")
+                                continue
+                            
+                            # جلب البيانات
+                            klines = binance_client.get_klines(
+                                symbol=symbol,
+                                interval=config.TIMEFRAME,
+                                limit=100
+                            )
+                            
+                            if klines:
+                                result = analysis.analyze_symbol(klines)
+                                if result:
+                                    results[symbol] = result
+                                    
+                                    status = "🟢" if result['recommendation'] == "BUY" else ("🔴" if result['recommendation'] == "SELL" else "🟡")
+                                    print(f"  {status} {symbol}: {result['score']}/100 ({result['recommendation']})")
+                                    sys.stdout.flush()
+                            
+                            time.sleep(0.2)
+                            
+                        except Exception as e:
+                            print(f"  ⚠️ خطأ في {symbol}: {e}")
+                            continue
+                    
+                    print(f"\n📊 تم تحليل {len(results)} عملة")
+                    sys.stdout.flush()
+                    
+                    # فتح الصفقات
+                    if results and config.TEST_MODE == False:
+                        # ترتيب العملات حسب الدرجة
+                        sorted_results = sorted(results.items(), key=lambda x: x[1]['score'], reverse=True)
+                        
+                        opened_count = 0
+                        
+                        for idx, (symbol, data) in enumerate(sorted_results):
+                            # التحقق من عدد الصفقات
+                            if not trading_manager.can_open_position():
+                                print(f"\n⚠️已达到 الحد الأقصى للصفقات ({config.MAX_POSITIONS})")
+                                break
+
+                            # التحقق من الرصيد
+                            if usdt_balance < config.TRADE_AMOUNT_USD:
+                                print(f"\n⚠️ رصيد غير كافٍ!")
+                                break
+                            
+                            print(f"\n🏆 محاولة {idx+1}: {symbol} (درجة: {data['score']})")
+                            sys.stdout.flush()
+                            
+                            price = data['current_price']
+                            quantity = config.TRADE_AMOUNT_USD / price
+                            
+                            print(f"💵 مبلغ: ${config.TRADE_AMOUNT_USD}")
+                            print(f"📊 الكمية: {quantity:.4f} {symbol.replace('USDT', '')}")
+                            sys.stdout.flush()
+                            
+                            success = trading_manager.open_position(symbol, quantity, price)
+                            
+                            if success:
+                                opened_count += 1
+                                usdt_balance -= config.TRADE_AMOUNT_USD
+                                print(f"✅ تم فتح الصفقة!")
+                            else:
+                                print(f"⚠️ فشل في {symbol}")
+                            
+                            time.sleep(2)
+                        
+                        if opened_count > 0:
+                            print(f"\n✅ تم فتح {opened_count} صفقة!")
+                        else:
+                            print(f"\n⚠️ لم تنجح أي صفقة")
+                            
+                    elif config.TEST_MODE:
+                        print(f"\n🧪 [TEST MODE]")
+                
+                # Heartbeat
+                if cycle_count % 60 == 0:
+                    print("\n❤️ Heartbeat...")
+                    notifier.send_heartbeat()
+                
+                print(f"\n⏰ انتظار {config.CYCLE_INTERVAL} ثانية...")
+                sys.stdout.flush()
+                time.sleep(config.CYCLE_INTERVAL)
+                
+            except Exception as e:
+                print(f"\n❌ خطأ: {e}")
+                sys.stdout.flush()
+                time.sleep(60)
+                
+    except Exception as e:
+        print(f"\n❌ خطأFatal: {e}")
+        sys.stdout.flush()
+
+if __name__ == "__main__":
+    print("🚀 بدء البوت...")
+    sys.stdout.flush()
+    
+    bot_thread = threading.Thread(target=run_bot, daemon=False)
+    bot_thread.start()
+    
+    port = int(os.getenv("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
