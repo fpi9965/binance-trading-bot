@@ -1,130 +1,93 @@
-"""بوت التداول الآلي الذكي v4 - محسن للفرص"""
-import time
-import threading
 import os
-import sys
-from flask import Flask
-from binance_client import BinanceClient
-from technical_analysis import TechnicalAnalysis
-from telegram_notifier import TelegramNotifier
-from trading_manager import TradingManager
-import config
-
-app = Flask(__name__)
-app.logger.disabled = True
-
+import time
+import math
 import logging
-logging.getLogger('werkzeug').disabled = True
+from datetime import datetime, timedelta
 
-TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
-API_KEY = os.getenv("BINANCE_API_KEY", "")
-API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+from binance.client import Client
+from binance.enums import *
+from flask import Flask
+import telebot
 
-binance = BinanceClient(API_KEY, API_SECRET, testnet=TEST_MODE)
-telegram = TelegramNotifier()
-ta = TechnicalAnalysis(binance)
-trading_manager = TradingManager(binance, telegram)
+# ================== الإعدادات العامة ==================
 
-print("=" * 60)
-print("🤖 بوت التداول الذكي v4 - محسن!")
-print("=" * 60)
-sys.stdout.flush()
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "YOUR_BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_BINANCE_API_SECRET")
 
-TARGET_SYMBOLS = [
-    "ADAUSDT", "DOGEUSDT", "SHIBUSDT", "1000SHIBUSDT", "BNBUSDT", 
-    "XRPUSDT", "SOLUSDT", "LTCUSDT", "ETHUSDT", "BTCUSDT", 
-    "AVAXUSDT", "DOTUSDT", "MATICUSDT", "LINKUSDT", "ATOMUSDT", "UNIUSDT"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+
+RISK_PER_TRADE = 0.05        # 5% من الرصيد
+LEVERAGE = 20                # 20x
+TIMEFRAME = "15m"            # الفريم المستخدم للتحليل
+TOP_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT",
+    "LTCUSDT", "DOGEUSDT", "MATICUSDT", "LINKUSDT", "SHIBUSDT"
 ]
 
+# فلتر حجم تداول (قيمة تقريبية – عدّلها لو حاب)
+MIN_24H_QUOTE_VOLUME = 50_000_000  # 50 مليون USDT
 
-def scan_and_trade():
-    cycle = 0
-    while True:
-        cycle += 1
-        print(f"\n🔄 الدورة #{cycle}")
-        sys.stdout.flush()
-        
-        try:
-            positions = trading_manager.get_all_positions()
-            
-            if positions:
-                print(f"📊 مراقبة {len(positions)} صفقة...")
-                for pos in positions:
-                    trading_manager.monitor_position(pos)
-            else:
-                print("🔍 البحث عن فرص شراء...")
-                sys.stdout.flush()
-                
-                best_symbol = None
-                best_signal = None
-                best_score = 0
-                
-                for symbol in TARGET_SYMBOLS:
-                    try:
-                        market_open, price = binance.check_market_status(symbol)
-                        if not market_open:
-                            continue
-                        
-                        signal = ta.analyze(symbol)
-                        
-                        if signal and signal['score'] > best_score:
-                            best_score = signal['score']
-                            best_symbol = symbol
-                            best_signal = signal
-                            print(f"  📈 {symbol}: {signal['score']} نقطة", end="")
-                            if 'reasons' in signal and signal['reasons']:
-                                print(f" - {' | '.join(signal['reasons'][:2])}")
-                            else:
-                                print()
-                        else:
-                            score = signal['score'] if signal else 0
-                            print(f"  ⚪ {symbol}: {score} نقطة")
-                        
-                        time.sleep(0.5)
-                        
-                    except:
-                        continue
-                
-                # فتح صفقة إذا كانت النقاط >= 50
-                if best_symbol and best_score >= 50:
-                    print(f"\n🎯 فرصة: {best_symbol} ({best_score} نقطة)")
-                    success = trading_manager.open_position(best_symbol)
-                    if success:
-                        print(f"✅ تم فتح الصفقة!")
-                elif best_symbol:
-                    print(f"\n📊 {best_symbol}: {best_score} نقطة - غير كافي")
-                else:
-                    print("\n❌ لا توجد فرص")
-            
-            if cycle % 5 == 0:
-                trading_manager.clear_failed_symbols()
-            
-            time.sleep(60)
+# إعدادات وقف الخسارة وجني الأرباح (نِسَب من سعر الدخول)
+STOP_LOSS_PCT = 0.01   # 1% وقف خسارة
+TAKE_PROFIT_PCT = 0.02 # 2% جني أرباح
 
-        except Exception as e:
-            print(f"❌ خطأ: {e}")
-            sys.stdout.flush()
-            time.sleep(30)
+# ================== تهيئة العملاء ==================
 
+client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return {'status': 'running', 'bot': 'Smart v4'}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
+# ================== دوال مساعدة ==================
 
-@app.route('/health')
-def health():
-    return {'status': 'healthy'}
+def send_telegram(msg: str):
+    try:
+        bot.send_message(TELEGRAM_CHAT_ID, msg)
+    except Exception as e:
+        logging.error(f"Telegram error: {e}")
 
+def get_futures_balance_usdt():
+    acc = client.futures_account_balance()
+    for b in acc:
+        if b["asset"] == "USDT":
+            return float(b["balance"])
+    return 0.0
 
-if __name__ == "__main__":
-    print("🚀 بدء التشغيل...")
-    sys.stdout.flush()
-    
-    t = threading.Thread(target=scan_and_trade, daemon=True)
-    t.start()
-    
-    time.sleep(2)
-    
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
+def get_symbol_filters(symbol):
+    info = client.futures_exchange_info()
+    for s in info["symbols"]:
+        if s["symbol"] == symbol:
+            lot_size = None
+            price_filter = None
+            for f in s["filters"]:
+                if f["filterType"] == "LOT_SIZE":
+                    lot_size = float(f["stepSize"])
+                if f["filterType"] == "PRICE_FILTER":
+                    price_filter = float(f["tickSize"])
+            return lot_size, price_filter
+    return None, None
+
+def adjust_quantity(symbol, quantity):
+    lot_size, _ = get_symbol_filters(symbol)
+    if lot_size is None:
+        # fallback
+        return float(f"{quantity:.3f}")
+    precision = int(round(-math.log(lot_size, 10)))
+    return float(f"{quantity:.{precision}f}")
+
+def adjust_price(symbol, price):
+    _, tick_size = get_symbol_filters(symbol)
+    if tick_size is None:
+        return float(f"{price:.2f}")
+    precision = int(round(-math.log(tick_size, 10)))
+    return float(f"{price:.{precision}f}")
+
+def get_klines(symbol, interval, limit=100):
+    kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    closes = [float(k[4]) for k in kl]
+    volumes = [float(k[7]) for k in kl]  # quote volume
+    return closes, volumes
+
+def ema(values
