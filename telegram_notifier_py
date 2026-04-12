@@ -18,7 +18,7 @@ class TelegramNotifier:
     
     def send_message(self, text):
         if not self.enabled:
-            print(f"📱 Telegram معطل: {text[:50]}...")
+            print(f"📱 Telegram معطل")
             return False
         try:
             response = requests.post(self.api_url, data={
@@ -26,14 +26,8 @@ class TelegramNotifier:
                 'text': text,
                 'parse_mode': 'Markdown'
             }, timeout=10)
-            if response.status_code == 200:
-                print(f"📱 تم الإرسال: {text[:50]}...")
-                return True
-            else:
-                print(f"❌ فشل الإرسال: {response.status_code}")
-                return False
-        except Exception as e:
-            print(f"❌ خطأ: {e}")
+            return response.status_code == 200
+        except:
             return False
     
     def send_position_opened(self, data):
