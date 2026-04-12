@@ -173,6 +173,7 @@ def analyze_symbol(symbol):
 
 def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
     try:
+        
         # حساب المبلغ المعرض للمخاطرة
         risk_amount = usdt_balance * RISK_PER_TRADE
         notional = risk_amount * LEVERAGE
@@ -185,8 +186,15 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
         if lot_size is None:
             lot_size = 0.0
 
-        # ضبط الكمية حسب فلاتر Binance
+              # ضبط الكمية حسب فلاتر Binance
         quantity = adjust_quantity(symbol, raw_qty)
+
+        # منع الصفقات التي قيمتها أقل من 5 USDT
+        if quantity * entry_price < 5:
+            msg = f"⚠️ قيمة الصفقة لـ {symbol} أقل من 5 USDT — إلغاء الصفقة."
+            logging.warning(msg)
+            send_telegram(msg)
+            return
 
         # إذا الكمية صفر → نحاول استخدام أقل كمية مسموحة
         if quantity <= 0 and lot_size > 0:
