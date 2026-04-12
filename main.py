@@ -17,29 +17,29 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
-RISK_PER_TRADE = 0.03        # 3% من الرصيد
+RISK_PER_TRADE = 0.05        # 5% من الرصيد
 LEVERAGE = 20                # 20x
-TIMEFRAME = "15m"            # الفريم المستخدم للتحليل
+TIMEFRAME = "15m"
 
 TOP_SYMBOLS = [
     "DOGEUSDT",
-    "SHIBUSDT",
-    "MATICUSDT",
+    "1000SHIBUSDT",
+    "POLUSDT",
     "XRPUSDT",
     "SOLUSDT",
     "LTCUSDT",
     "LINKUSDT"
 ]
 
-MIN_24H_QUOTE_VOLUME = 1_000_000  # 1 مليون USDT
+MIN_24H_QUOTE_VOLUME = 1_000_000
 
-STOP_LOSS_PCT    = 0.01   # 1%  وقف خسارة للصفقة
-TAKE_PROFIT_PCT  = 0.02   # 2%  جني أرباح للصفقة
+STOP_LOSS_PCT   = 0.01
+TAKE_PROFIT_PCT = 0.02
 
 # ================== حماية البوت ==================
 
-DAILY_LOSS_LIMIT_PCT = 0.05   # 5%  — وقف يومي تلقائي
-TOTAL_LOSS_LIMIT_PCT = 0.15   # 15% — وقف إجمالي نهائي
+DAILY_LOSS_LIMIT_PCT = 0.05
+TOTAL_LOSS_LIMIT_PCT = 0.15
 
 # ================== تهيئة العملاء ==================
 
@@ -49,16 +49,15 @@ app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
-# كاش لفلاتر الأزواج لتجنب طلبات API متكررة
 _symbol_filters_cache = {}
 
 # ================== متغيرات حماية البوت ==================
 
-bot_start_balance   = None   # رصيد البداية عند أول تشغيل
-daily_start_balance = None   # رصيد بداية اليوم الحالي
-daily_reset_date    = None   # تاريخ آخر إعادة تعيين يومي
-bot_halted_total    = False  # إيقاف نهائي (تجاوز 15%)
-bot_halted_daily    = False  # إيقاف يومي (تجاوز 5%)
+bot_start_balance   = None
+daily_start_balance = None
+daily_reset_date    = None
+bot_halted_total    = False
+bot_halted_daily    = False
 
 # ================== دوال مساعدة ==================
 
@@ -76,10 +75,8 @@ def get_futures_balance_usdt():
     return 0.0
 
 def get_symbol_filters(symbol):
-    """جلب فلاتر الزوج مع كاش لتجنب طلبات API متكررة."""
     if symbol in _symbol_filters_cache:
         return _symbol_filters_cache[symbol]
-
     info = client.futures_exchange_info()
     for s in info["symbols"]:
         sym = s["symbol"]
@@ -91,12 +88,11 @@ def get_symbol_filters(symbol):
             if f["filterType"] == "PRICE_FILTER":
                 price_filter = float(f["tickSize"])
         _symbol_filters_cache[sym] = (lot_size, price_filter)
-
     return _symbol_filters_cache.get(symbol, (None, None))
 
 def get_klines(symbol, interval, limit=100):
     kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-    closes = [float(k[4]) for k in kl]
+    closes  = [float(k[4]) for k in kl]
     volumes = [float(k[7]) for k in kl]
     return closes, volumes
 
@@ -115,7 +111,6 @@ def adjust_price(symbol, price):
     return float(f"{price:.{precision}f}")
 
 def ema(values, period):
-    """حساب EMA صحيح: يبدأ بـ SMA لأول period قيمة."""
     if len(values) < period:
         return sum(values) / len(values)
     ema_val = sum(values[:period]) / period
@@ -125,24 +120,19 @@ def ema(values, period):
     return ema_val
 
 def compute_macd(closes, fast=12, slow=26, signal=9):
-    """حساب MACD صحيح باستخدام سلسلة MACD الكاملة لحساب خط الإشارة."""
     if len(closes) < slow + signal:
         return 0, 0, False
-
     k_fast = 2 / (fast + 1)
     k_slow = 2 / (slow + 1)
-
     ema_fast = sum(closes[:fast]) / fast
     ema_slow = sum(closes[:slow]) / slow
-
     macd_line = []
     for i in range(slow, len(closes)):
         ema_fast = closes[i] * k_fast + ema_fast * (1 - k_fast)
         ema_slow = closes[i] * k_slow + ema_slow * (1 - k_slow)
         macd_line.append(ema_fast - ema_slow)
-
     signal_val = ema(macd_line, signal)
-    macd_val = macd_line[-1]
+    macd_val   = macd_line[-1]
     return macd_val, signal_val, macd_val > signal_val
 
 def get_trend_filter(symbol):
@@ -165,7 +155,6 @@ def pass_volume_filter(symbol):
         return False, 0
 
 def has_open_position(symbol):
-    """فحص وجود صفقة مفتوحة على الزوج لتجنب التكرار."""
     try:
         positions = client.futures_position_information(symbol=symbol)
         for p in positions:
@@ -177,7 +166,6 @@ def has_open_position(symbol):
         return True
 
 def setup_symbol(symbol):
-    """ضبط الرافعة المالية على Binance قبل فتح الصفقة."""
     try:
         client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
     except Exception as e:
@@ -185,9 +173,7 @@ def setup_symbol(symbol):
 
 def analyze_symbol(symbol):
     closes, _ = get_klines(symbol, TIMEFRAME, 150)
-
     macd_val, signal_val, macd_bullish = compute_macd(closes)
-
     gains, losses = [], []
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i - 1]
@@ -197,12 +183,10 @@ def analyze_symbol(symbol):
         else:
             gains.append(0)
             losses.append(-diff)
-
     avg_gain = sum(gains[-14:]) / 14
     avg_loss = sum(losses[-14:]) / 14 if sum(losses[-14:]) != 0 else 1e-9
-    rs = avg_gain / avg_loss
+    rs  = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-
     score = 0
     if macd_bullish:
         score += 30
@@ -210,7 +194,6 @@ def analyze_symbol(symbol):
         score += 30
     elif rsi < 70:
         score += 10
-
     return {
         "symbol": symbol,
         "score": score,
@@ -221,7 +204,6 @@ def analyze_symbol(symbol):
 # ================== حماية البوت — الدوال ==================
 
 def close_all_positions():
-    """إغلاق جميع الصفقات المفتوحة فورًا بأوامر MARKET عكسية."""
     try:
         positions = client.futures_position_information()
         closed = 0
@@ -230,7 +212,7 @@ def close_all_positions():
             if amt == 0:
                 continue
             symbol = p["symbol"]
-            side = SIDE_SELL if amt > 0 else SIDE_BUY
+            side   = SIDE_SELL if amt > 0 else SIDE_BUY
             quantity = abs(amt)
             try:
                 client.futures_create_order(
@@ -244,16 +226,12 @@ def close_all_positions():
                 logging.info(f"تم إغلاق صفقة {symbol} (الكمية: {quantity})")
             except Exception as e:
                 logging.error(f"فشل إغلاق {symbol}: {e}")
-
         if closed > 0:
             send_telegram(f"🔴 تم إغلاق {closed} صفقة مفتوحة بسبب تفعيل حماية البوت.")
-        else:
-            logging.info("لا توجد صفقات مفتوحة لإغلاقها.")
     except Exception as e:
         logging.error(f"خطأ في close_all_positions: {e}")
 
 def reset_daily_state(current_balance):
-    """إعادة تعيين متغيرات الحماية اليومية في بداية يوم جديد."""
     global daily_start_balance, daily_reset_date, bot_halted_daily
     daily_start_balance = current_balance
     daily_reset_date    = datetime.utcnow().date()
@@ -265,25 +243,16 @@ def reset_daily_state(current_balance):
     )
 
 def check_bot_protection(current_balance) -> bool:
-    """
-    فحص حماية البوت قبل كل دورة تداول.
-    يُعيد True إذا مسموح بالتداول، False إذا محظور.
-    """
-    global bot_halted_total, bot_halted_daily
-    global daily_start_balance, daily_reset_date
+    global bot_halted_total, bot_halted_daily, daily_start_balance, daily_reset_date
 
-    # إيقاف نهائي — لا استئناف
     if bot_halted_total:
         logging.warning("البوت متوقف نهائيًا (تجاوز حد الخسارة الإجمالية 15%).")
         return False
 
     today = datetime.utcnow().date()
-
-    # إعادة تعيين يومي في بداية كل يوم UTC
     if daily_reset_date != today:
         reset_daily_state(current_balance)
 
-    # فحص حد الخسارة اليومية
     daily_loss_pct = (daily_start_balance - current_balance) / daily_start_balance
     if daily_loss_pct >= DAILY_LOSS_LIMIT_PCT:
         if not bot_halted_daily:
@@ -300,7 +269,6 @@ def check_bot_protection(current_balance) -> bool:
             send_telegram(msg)
         return False
 
-    # فحص حد الخسارة الإجمالية
     if bot_start_balance and bot_start_balance > 0:
         total_loss_pct = (bot_start_balance - current_balance) / bot_start_balance
         if total_loss_pct >= TOTAL_LOSS_LIMIT_PCT:
@@ -323,15 +291,11 @@ def check_bot_protection(current_balance) -> bool:
 
 def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
     try:
-        if has_open_position(symbol):
-            logging.info(f"تجاوز {symbol}: توجد صفقة مفتوحة بالفعل.")
-            return
-
         setup_symbol(symbol)
 
         risk_amount = usdt_balance * RISK_PER_TRADE
-        notional = risk_amount * LEVERAGE
-        raw_qty = notional / entry_price
+        notional    = risk_amount * LEVERAGE
+        raw_qty     = notional / entry_price
 
         lot_size, _ = get_symbol_filters(symbol)
         if lot_size is None:
@@ -385,7 +349,7 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
             send_telegram(f"❌ فشل فتح صفقة {symbol} — الهامش غير كافٍ حتى بعد تقليل الكمية.")
             return
 
-        stop_loss_price  = adjust_price(symbol, entry_price * (1 - STOP_LOSS_PCT))
+        stop_loss_price   = adjust_price(symbol, entry_price * (1 - STOP_LOSS_PCT))
         take_profit_price = adjust_price(symbol, entry_price * (1 + TAKE_PROFIT_PCT))
 
         client.futures_create_order(
@@ -465,11 +429,9 @@ def main_loop():
     global bot_start_balance, daily_start_balance, daily_reset_date
 
     logging.info("تم الاتصال بـ Binance بنجاح!")
-    logging.info("Telegram جاهز")
     logging.info("بوت التداول الذكي v4 - محسن مع حماية البوت!")
 
-    # تهيئة أرصدة الحماية عند بدء التشغيل
-    initial_balance = get_futures_balance_usdt()
+    initial_balance     = get_futures_balance_usdt()
     bot_start_balance   = initial_balance
     daily_start_balance = initial_balance
     daily_reset_date    = datetime.utcnow().date()
@@ -489,7 +451,6 @@ def main_loop():
             usdt_balance = get_futures_balance_usdt()
             logging.info(f"رصيد USDT: {usdt_balance:.2f}")
 
-            # ===== فحص حماية البوت أولًا =====
             if not check_bot_protection(usdt_balance):
                 logging.info("التداول محظور — تخطي هذه الدورة.")
                 time.sleep(40)
@@ -497,6 +458,12 @@ def main_loop():
 
             candidates = []
             for symbol in TOP_SYMBOLS:
+
+                # استبعاد الأزواج ذات صفقات مفتوحة أولاً
+                if has_open_position(symbol):
+                    logging.info(f"{symbol}: متجاوز — صفقة مفتوحة بالفعل.")
+                    continue
+
                 pass_vol, qv = pass_volume_filter(symbol)
                 if not pass_vol:
                     logging.info(f"{symbol}: مرفوض — حجم تداول ضعيف ({qv:.0f})")
