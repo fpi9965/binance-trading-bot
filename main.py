@@ -104,9 +104,24 @@ def get_trend_filter(symbol):
     return last_price > ema200, last_price, ema200
 
 def pass_volume_filter(symbol):
-    tick = client.futures_ticker(symbol=symbol)
-    quote_volume = float(tick["quoteVolume"])
-    return quote_volume >= MIN_24H_QUOTE_VOLUME, quote_volume
+    try:
+        tick = client.futures_ticker(symbol=symbol)
+
+        # إذا Binance رجعت خطأ
+        if not isinstance(tick, dict):
+            return False, 0
+
+        if "code" in tick:
+            return False, 0
+
+        # إذا quoteVolume غير موجود
+        quote_volume = float(tick.get("quoteVolume", 0))
+
+        return quote_volume >= MIN_24H_QUOTE_VOLUME, quote_volume
+
+    except Exception as e:
+        print(f"⚠️ خطأ في pass_volume_filter لـ {symbol}: {e}")
+        return False, 0
 
 def analyze_symbol(symbol):
     closes, _ = get_klines(symbol, TIMEFRAME, 100)
