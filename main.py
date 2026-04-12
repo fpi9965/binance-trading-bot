@@ -72,11 +72,10 @@ def get_symbol_filters(symbol):
 def adjust_quantity(symbol, quantity):
     lot_size, _ = get_symbol_filters(symbol)
     if lot_size is None:
-        # fallback
         return float(f"{quantity:.3f}")
     precision = int(round(-math.log(lot_size, 10)))
     return float(f"{quantity:.{precision}f}")
-
+    
 def adjust_price(symbol, price):
     _, tick_size = get_symbol_filters(symbol)
     if tick_size is None:
@@ -84,12 +83,12 @@ def adjust_price(symbol, price):
     precision = int(round(-math.log(tick_size, 10)))
     return float(f"{price:.{precision}f}")
 
-def get_klines(symbol, interval, limit=100):
-    kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-    closes = [float(k[4]) for k in kl]
-    volumes = [float(k[7]) for k in kl]  # quote volume
-    return closes, volumes
-
+def get_trend_filter(symbol):
+    closes, _ = get_klines(symbol, "1h", 200)
+    last_price = closes[-1]
+    ema200 = ema(closes, 200)
+    return last_price > ema200, last_price, ema200
+    
 def ema(values, period):
     k = 2 / (period + 1)
     ema_val = values[0]
