@@ -17,13 +17,20 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
-RISK_PER_TRADE = 0.05        # 5% من الرصيد
+RISK_PER_TRADE = 0.10        # 10% من الرصيد
 LEVERAGE = 20                # 20x
 TIMEFRAME = "15m"            # الفريم المستخدم للتحليل
+
 TOP_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT",
-    "LTCUSDT", "DOGEUSDT", "MATICUSDT", "LINKUSDT", "SHIBUSDT"
+    "DOGEUSDT",
+    "SHIBUSDT",
+    "MATICUSDT",
+    "XRPUSDT",
+    "SOLUSDT",
+    "LTCUSDT",
+    "LINKUSDT"
 ]
+
 
 # فلتر حجم تداول (قيمة تقريبية – عدّلها لو حاب)
 MIN_24H_QUOTE_VOLUME = 50_000_000  # 50 مليون USDT
