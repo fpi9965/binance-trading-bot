@@ -18,6 +18,7 @@ class TelegramNotifier:
     
     def send_message(self, text):
         if not self.enabled:
+            print(f"📱 Telegram معطل")
             return False
         try:
             response = requests.post(self.api_url, data={
@@ -38,7 +39,7 @@ class TelegramNotifier:
     def send_position_closed(self, data, reason, pnl_pct):
         symbol = data.get('symbol', 'N/A')
         emoji = "🟢" if pnl_pct >= 0 else "🔴"
-        return self.send_message(f"🔴 *صفقة مغلقة!*\n📊 {symbol}\n📋 {reason}\n{emoji} النتيجة: {pnl_pct:+.2f}%")
+        return self.send_message(f"{emoji} *صفقة مغلقة!*\n📊 {symbol}\n📋 {reason}\n💰 {pnl_pct:+.2f}%")
     
     def send_error(self, msg):
         return self.send_message(f"⚠️ خطأ: {msg}")
