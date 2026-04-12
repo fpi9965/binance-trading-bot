@@ -191,35 +191,20 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
         # إذا الكمية صفر → نحاول استخدام أقل كمية مسموحة
         if quantity <= 0 and lot_size > 0:
             min_notional = lot_size * entry_price
-
             if min_notional <= notional:
                 quantity = adjust_quantity(symbol, lot_size)
             else:
-                msg = (
-                    f"⚠️ تم إلغاء صفقة {symbol} لأن الرصيد لا يسمح حتى بأقل كمية مسموحة.\n"
-                    f"الرصيد: {usdt_balance:.2f} USDT\n"
-                    f"المخاطرة: {RISK_PER_TRADE*100:.1f}% | الرافعة: {LEVERAGE}x\n"
-                    f"💡 الحل: زيادة الرصيد أو رفع نسبة المخاطرة أو اختيار عملات أرخص."
-                )
-                logging.warning(msg)
-                send_telegram(msg)
+                send_telegram(f"⚠️ لا يمكن فتح صفقة {symbol} — الكمية أقل من الحد الأدنى.")
                 return
 
-        # حماية أخيرة
         if quantity <= 0:
-            msg = (
-                f"⚠️ تم إلغاء صفقة {symbol} لأن الكمية بعد التقريب أصبحت صفر.\n"
-                f"الرصيد: {usdt_balance:.2f} USDT\n"
-                f"💡 الحل: زيادة الرصيد أو رفع نسبة المخاطرة."
-            )
-            logging.warning(msg)
-            send_telegram(msg)
+            send_telegram(f"⚠️ الكمية صفر بعد التقريب — إلغاء صفقة {symbol}.")
             return
 
         # ضبط السعر
         entry_price = adjust_price(symbol, entry_price)
 
-                # فتح صفقة السوق مع معالجة خطأ الهامش
+        # فتح صفقة السوق مع معالجة خطأ الهامش
         max_retries = 6
         attempt = 0
 
@@ -234,7 +219,6 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
                 break  # نجحت
             except Exception as e:
                 if "Margin is insufficient" in str(e):
-                    # تقليل الكمية 30%
                     quantity = adjust_quantity(symbol, quantity * 0.7)
                     attempt += 1
                     logging.warning(f"⚠️ الهامش غير كافٍ لـ {symbol} — تقليل الكمية إلى {quantity}")
@@ -243,29 +227,32 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
                     raise e
 
         if attempt == max_retries:
-            msg = f"❌ فشل فتح صفقة {symbol} — الهامش غير كافٍ حتى بعد تقليل الكمية."
-            logging.error(msg)
-            send_telegram(msg)
+            send_telegram(f"❌ فشل فتح صفقة {symbol} — الهامش غير كافٍ حتى بعد تقليل الكمية.")
             return
 
-        # أمر وقف خسارة (STOP)
+        # حساب SL و TP
+        stop_loss_price = adjust_price(symbol, entry_price * (1 - STOP_LOSS_PCT))
+        take_profit_price = adjust_price(symbol, entry_price * (1 + TAKE_PROFIT_PCT))
+
+        # SL
         client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
-            type="STOP",
+            type="STOP_MARKET",
             stopPrice=stop_loss_price,
-            closePosition=True
+            reduceOnly=True
         )
 
-        # أمر جني أرباح (TAKE_PROFIT)
+        # TP
         client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
-            type="TAKE_PROFIT",
+            type="TAKE_PROFIT_MARKET",
             stopPrice=take_profit_price,
-            closePosition=True
+            reduceOnly=True
         )
 
+        # رسالة نجاح
         msg = (
             f"🟢 تم فتح صفقة LONG\n"
             f"زوج: {symbol}\n"
@@ -280,7 +267,7 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
 
     except Exception as e:
         logging.error(f"Binance order error: {e}")
-        send_telegram(f"⚠️ خطأ في فتح الصفقة لـ {symbol}:\n{e}")       
+        send_telegram(f"⚠️ خطأ في فتح الصفقة لـ {symbol}:\n{e}")
         
 # ================== تقرير يومي ===============
 
