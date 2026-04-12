@@ -166,14 +166,32 @@ def analyze_symbol(symbol):
 
 def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
     try:
+        # حساب المبلغ المعرض للمخاطرة
         risk_amount = usdt_balance * RISK_PER_TRADE
         notional = risk_amount * LEVERAGE
+
+        # حساب الكمية
         quantity = notional / entry_price
 
+        # ضبط الكمية حسب فلاتر Binance
         quantity = adjust_quantity(symbol, quantity)
+
+        # حماية: إذا الكمية صفر أو أقل → لا تفتح صفقة
+        if quantity <= 0:
+            msg = (
+                f"⚠️ تم إلغاء صفقة {symbol} لأن الكمية بعد التقريب أصبحت صفر.\n"
+                f"الرصيد: {usdt_balance:.2f} USDT\n"
+                f"المخاطرة: {RISK_PER_TRADE*100:.1f}% | الرافعة: {LEVERAGE}x\n"
+                f"💡 الحل: زيادة الرصيد أو رفع نسبة المخاطرة."
+            )
+            logging.warning(msg)
+            send_telegram(msg)
+            return
+
+        # ضبط السعر
         entry_price = adjust_price(symbol, entry_price)
 
-        # أمر السوق لفتح صفقة
+        # فتح صفقة السوق
         order = client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY,
@@ -220,8 +238,8 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
     except Exception as e:
         logging.error(f"Binance order error: {e}")
         send_telegram(f"⚠️ خطأ في فتح الصفقة لـ {symbol}:\n{e}")
-
-# ================== تقرير يومي ==================
+        
+# ================== تقرير يومي ===============
 
 last_daily_report_date = None
 
