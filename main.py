@@ -33,7 +33,7 @@ TOP_SYMBOLS = [
 
 
 # فلتر حجم تداول (قيمة تقريبية – عدّلها لو حاب)
-MIN_24H_QUOTE_VOLUME = 1_000_000  # 50 مليون USDT
+MIN_24H_QUOTE_VOLUME = 1_000_000  # 1 مليون USDT
 
 # إعدادات وقف الخسارة وجني الأرباح (نِسَب من سعر الدخول)
 STOP_LOSS_PCT = 0.01   # 1% وقف خسارة
@@ -159,10 +159,10 @@ def analyze_symbol(symbol):
     score = 0
     if macd_bullish:
         score += 30
-    if rsi < 40:
-        score += 40
-    elif rsi < 50:
-        score += 20
+    if rsi < 60:
+        score += 30
+    elif rsi < 70:
+        score += 10
 
     return {
         "symbol": symbol,
