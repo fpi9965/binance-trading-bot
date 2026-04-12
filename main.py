@@ -33,7 +33,7 @@ TOP_SYMBOLS = [
 
 
 # فلتر حجم تداول (قيمة تقريبية – عدّلها لو حاب)
-MIN_24H_QUOTE_VOLUME = 50_000_000  # 50 مليون USDT
+MIN_24H_QUOTE_VOLUME = 1_000_000  # 50 مليون USDT
 
 # إعدادات وقف الخسارة وجني الأرباح (نِسَب من سعر الدخول)
 STOP_LOSS_PCT = 0.01   # 1% وقف خسارة
@@ -108,7 +108,7 @@ def get_trend_filter(symbol):
     last_price = closes[-1]
     ema200 = ema(closes, 200)
     # ترند صاعد إذا السعر فوق EMA200
-    return last_price > ema200, last_price, ema200
+    return last_price >= ema200 * 0.98, last_price, ema200
 
 def pass_volume_filter(symbol):
     try:
@@ -371,7 +371,7 @@ def main_loop():
             send_telegram(f"⚠️ خطأ في الدورة:\n{e}")
 
         # انتظر دقيقة بين كل دورة (عدّلها لو حاب)
-        time.sleep(60)
+        time.sleep(40)
 
 # ================== تشغيل Flask + البوت ==================
 
