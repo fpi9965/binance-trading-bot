@@ -170,18 +170,40 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
         risk_amount = usdt_balance * RISK_PER_TRADE
         notional = risk_amount * LEVERAGE
 
-        # حساب الكمية
-        quantity = notional / entry_price
+        # حساب الكمية المبدئية
+        raw_qty = notional / entry_price
+
+        # جلب أقل كمية مسموحة من Binance
+        lot_size, _ = get_symbol_filters(symbol)
+        if lot_size is None:
+            lot_size = 0.0
 
         # ضبط الكمية حسب فلاتر Binance
-        quantity = adjust_quantity(symbol, quantity)
+        quantity = adjust_quantity(symbol, raw_qty)
 
-        # حماية: إذا الكمية صفر أو أقل → لا تفتح صفقة
+        # إذا الكمية صفر → نحاول استخدام أقل كمية مسموحة
+        if quantity <= 0 and lot_size > 0:
+            min_notional = lot_size * entry_price
+
+            # هل الرصيد يسمح بأقل كمية؟
+            if min_notional <= notional:
+                quantity = adjust_quantity(symbol, lot_size)
+            else:
+                msg = (
+                    f"⚠️ تم إلغاء صفقة {symbol} لأن الرصيد لا يسمح حتى بأقل كمية مسموحة.\n"
+                    f"الرصيد: {usdt_balance:.2f} USDT\n"
+                    f"المخاطرة: {RISK_PER_TRADE*100:.1f}% | الرافعة: {LEVERAGE}x\n"
+                    f"💡 الحل: زيادة الرصيد أو رفع نسبة المخاطرة أو اختيار عملات أرخص."
+                )
+                logging.warning(msg)
+                send_telegram(msg)
+                return
+
+        # حماية أخيرة
         if quantity <= 0:
             msg = (
                 f"⚠️ تم إلغاء صفقة {symbol} لأن الكمية بعد التقريب أصبحت صفر.\n"
                 f"الرصيد: {usdt_balance:.2f} USDT\n"
-                f"المخاطرة: {RISK_PER_TRADE*100:.1f}% | الرافعة: {LEVERAGE}x\n"
                 f"💡 الحل: زيادة الرصيد أو رفع نسبة المخاطرة."
             )
             logging.warning(msg)
