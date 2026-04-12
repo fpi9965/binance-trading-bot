@@ -232,25 +232,23 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
         stop_loss_price = adjust_price(symbol, entry_price * (1 - STOP_LOSS_PCT))
         take_profit_price = adjust_price(symbol, entry_price * (1 + TAKE_PROFIT_PCT))
 
-        # أمر وقف خسارة
-        client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type=FUTURE_ORDER_TYPE_STOP_MARKET,
-            stopPrice=stop_loss_price,
-            closePosition=True,
-            timeInForce=TIME_IN_FORCE_GTC
-        )
+       # أمر وقف خسارة (STOP)
+client.futures_create_order(
+    symbol=symbol,
+    side=SIDE_SELL,
+    type="STOP",
+    stopPrice=stop_loss_price,
+    closePosition=True
+)
 
-        # أمر جني أرباح
-        client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-            stopPrice=take_profit_price,
-            closePosition=True,
-            timeInForce=TIME_IN_FORCE_GTC
-        )
+# أمر جني أرباح (TAKE_PROFIT)
+client.futures_create_order(
+    symbol=symbol,
+    side=SIDE_SELL,
+    type="TAKE_PROFIT",
+    stopPrice=take_profit_price,
+    closePosition=True
+)
 
         msg = (
             f"🟢 تم فتح صفقة LONG\n"
