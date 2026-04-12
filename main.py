@@ -192,7 +192,6 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
         if quantity <= 0 and lot_size > 0:
             min_notional = lot_size * entry_price
 
-            # هل الرصيد يسمح بأقل كمية؟
             if min_notional <= notional:
                 quantity = adjust_quantity(symbol, lot_size)
             else:
@@ -224,7 +223,7 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
         order = client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY,
-            type=FUTURE_ORDER_TYPE_MARKET,
+            type="MARKET",
             quantity=quantity
         )
 
@@ -232,23 +231,23 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
         stop_loss_price = adjust_price(symbol, entry_price * (1 - STOP_LOSS_PCT))
         take_profit_price = adjust_price(symbol, entry_price * (1 + TAKE_PROFIT_PCT))
 
-       # أمر وقف خسارة (STOP)
-client.futures_create_order(
-    symbol=symbol,
-    side=SIDE_SELL,
-    type="STOP",
-    stopPrice=stop_loss_price,
-    closePosition=True
-)
+        # أمر وقف خسارة (STOP)
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL,
+            type="STOP",
+            stopPrice=stop_loss_price,
+            closePosition=True
+        )
 
-# أمر جني أرباح (TAKE_PROFIT)
-client.futures_create_order(
-    symbol=symbol,
-    side=SIDE_SELL,
-    type="TAKE_PROFIT",
-    stopPrice=take_profit_price,
-    closePosition=True
-)
+        # أمر جني أرباح (TAKE_PROFIT)
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL,
+            type="TAKE_PROFIT",
+            stopPrice=take_profit_price,
+            closePosition=True
+        )
 
         msg = (
             f"🟢 تم فتح صفقة LONG\n"
@@ -264,7 +263,7 @@ client.futures_create_order(
 
     except Exception as e:
         logging.error(f"Binance order error: {e}")
-        send_telegram(f"⚠️ خطأ في فتح الصفقة لـ {symbol}:\n{e}")
+        send_telegram(f"⚠️ خطأ في فتح الصفقة لـ {symbol}:\n{e}")       
         
 # ================== تقرير يومي ===============
 
