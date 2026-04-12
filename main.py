@@ -17,7 +17,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
-RISK_PER_TRADE = 0.10        # 10% من الرصيد
+RISK_PER_TRADE = 0.03        # 3% من الرصيد
 LEVERAGE = 20                # 20x
 TIMEFRAME = "15m"            # الفريم المستخدم للتحليل
 
@@ -219,17 +219,34 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
         # ضبط السعر
         entry_price = adjust_price(symbol, entry_price)
 
-        # فتح صفقة السوق
-        order = client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_BUY,
-            type="MARKET",
-            quantity=quantity
-        )
+                # فتح صفقة السوق مع معالجة خطأ الهامش
+        max_retries = 6
+        attempt = 0
 
-        # حساب SL و TP
-        stop_loss_price = adjust_price(symbol, entry_price * (1 - STOP_LOSS_PCT))
-        take_profit_price = adjust_price(symbol, entry_price * (1 + TAKE_PROFIT_PCT))
+        while attempt < max_retries:
+            try:
+                client.futures_create_order(
+                    symbol=symbol,
+                    side=SIDE_BUY,
+                    type="MARKET",
+                    quantity=quantity
+                )
+                break  # نجحت
+            except Exception as e:
+                if "Margin is insufficient" in str(e):
+                    # تقليل الكمية 30%
+                    quantity = adjust_quantity(symbol, quantity * 0.7)
+                    attempt += 1
+                    logging.warning(f"⚠️ الهامش غير كافٍ لـ {symbol} — تقليل الكمية إلى {quantity}")
+                    continue
+                else:
+                    raise e
+
+        if attempt == max_retries:
+            msg = f"❌ فشل فتح صفقة {symbol} — الهامش غير كافٍ حتى بعد تقليل الكمية."
+            logging.error(msg)
+            send_telegram(msg)
+            return
 
         # أمر وقف خسارة (STOP)
         client.futures_create_order(
