@@ -97,7 +97,6 @@ def ema(values, period):
         ema_val = v * k + ema_val * (1 - k)
     return ema_val
 
-
 def get_trend_filter(symbol):
     closes, _ = get_klines(symbol, "1h", 200)
     last_price = closes[-1]
