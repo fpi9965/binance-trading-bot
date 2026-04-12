@@ -1,5 +1,5 @@
 """
-بوت التداول الآلي
+بوت التداول الآلي الذكي
 """
 import time
 import threading
@@ -14,59 +14,74 @@ import config
 app = Flask(__name__)
 
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
-TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
-
 API_KEY = os.getenv("BINANCE_API_KEY", "")
 API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 binance = BinanceClient(API_KEY, API_SECRET, testnet=TEST_MODE)
-telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, enabled=TELEGRAM_ENABLED)
+telegram = TelegramNotifier()
 ta = TechnicalAnalysis(binance)
 trading_manager = TradingManager(binance, telegram)
 
-print("=" * 50)
-print("بوت التداول الآلي")
-print("=" * 50)
+print("=" * 60)
+print("🤖 بوت التداول الآلي الذكي")
+print("=" * 60)
 
-TARGET_SYMBOLS = ["ADAUSDT", "DOGEUSDT", "SHIBUSDT", "1000SHIBUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "LTCUSDT", "ETHUSDT", "BTCUSDT"]
+TARGET_SYMBOLS = ["ADAUSDT", "DOGEUSDT", "SHIBUSDT", "1000SHIBUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "LTCUSDT", "ETHUSDT", "BTCUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT", "LINKUSDT", "ATOMUSDT", "UNIUSDT"]
 
 def scan_and_trade():
+    cycle = 0
     while True:
+        cycle += 1
+        print(f"\n🔄 الدورة #{cycle}")
+        
         try:
-            print("\n🔍 جاري المسح...")
-            for symbol in TARGET_SYMBOLS:
-                try:
-                    print(f"\n📊 تحليل {symbol}...")
-                    market_open, _ = binance.check_market_status(symbol)
-                    if not market_open:
-                        print(f"⚠️ {symbol} - السوق مغلق")
+            positions = trading_manager.get_all_positions()
+            if positions:
+                for pos in positions:
+                    trading_manager.monitor_position(pos)
+            else:
+                print("🔍 البحث عن فرص...")
+                best = None
+                best_score = 0
+                
+                for symbol in TARGET_SYMBOLS:
+                    try:
+                        market_open, price = binance.check_market_status(symbol)
+                        if not market_open:
+                            continue
+                        signal = ta.analyze(symbol)
+                        if signal and signal['action'] == 'buy':
+                            score = signal.get('score', 0)
+                            print(f"  ✅ {symbol}: {score}")
+                            if score > best_score:
+                                best_score = score
+                                best = (symbol, signal)
+                        time.sleep(0.5)
+                    except:
                         continue
-                    signal = ta.analyze(symbol)
-                    if signal and signal['action'] == 'buy':
-                        print(f"✅ إشارة شراء في {symbol}!")
-                        trading_manager.open_position(symbol)
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"خطأ في {symbol}: {e}")
-                    continue
-            print(f"\n⏰ انتظار 60 ثانية...")
+                
+                if best and best_score >= 50:
+                    symbol, _ = best
+                    print(f"🏆 أفضل فرصة: {symbol}")
+                    trading_manager.open_position(symbol)
+            
+            if cycle % 5 == 0:
+                trading_manager.clear_failed_symbols()
+            
             time.sleep(60)
         except Exception as e:
-            print(f"خطأ عام: {e}")
+            print(f"خطأ: {e}")
             time.sleep(30)
 
 @app.route('/')
 def home():
-    return {'status': 'running'}
+    return {'status': 'running', 'bot': 'Smart v2.0'}
 
 @app.route('/health')
 def health():
     return {'status': 'healthy'}
 
 if __name__ == "__main__":
-    print("🚀 بدء التشغيل...")
     t = threading.Thread(target=scan_and_trade, daemon=True)
     t.start()
     port = int(os.environ.get('PORT', 5000))
