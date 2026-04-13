@@ -11,15 +11,15 @@ import telebot
 
 # ================== الإعدادات العامة ==================
 
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "YOUR_BINANCE_API_KEY")
+BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY",    "YOUR_BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_BINANCE_API_SECRET")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
 RISK_PER_TRADE = 0.05
-LEVERAGE = 20
-TIMEFRAME = "15m"
+LEVERAGE       = 20
+TIMEFRAME      = "15m"
 
 TOP_SYMBOLS = [
     "DOGEUSDT",
@@ -32,6 +32,7 @@ TOP_SYMBOLS = [
 ]
 
 MIN_24H_QUOTE_VOLUME = 1_000_000
+MIN_SCORE            = 30        # ✅ إصلاح: حد أدنى للنقاط
 
 STOP_LOSS_PCT   = 0.01
 TAKE_PROFIT_PCT = 0.02
@@ -44,8 +45,8 @@ TOTAL_LOSS_LIMIT_PCT = 0.15
 # ================== تهيئة العملاء ==================
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-app = Flask(__name__)
+bot    = telebot.TeleBot(TELEGRAM_TOKEN)
+app    = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -68,7 +69,6 @@ def send_telegram(msg: str):
         logging.error(f"Telegram error: {e}")
 
 def get_futures_balance_usdt():
-    """الرصيد الكلي — للحماية والتقارير"""
     acc = client.futures_account_balance()
     for b in acc:
         if b["asset"] == "USDT":
@@ -76,7 +76,6 @@ def get_futures_balance_usdt():
     return 0.0
 
 def get_available_balance_usdt():
-    """الهامش الحر فقط — لحساب حجم الصفقة الجديدة"""
     acc = client.futures_account_balance()
     for b in acc:
         if b["asset"] == "USDT":
@@ -84,29 +83,34 @@ def get_available_balance_usdt():
     return 0.0
 
 def get_symbol_filters(symbol):
-    """يُعيد (lot_size, tick_size, min_notional)"""
+    """
+    ✅ إصلاح: يجلب exchange_info مرة واحدة فقط ويخزّن الكل في الـ cache
+    بدلاً من جلبه في كل استدعاء لرمز جديد
+    """
     if symbol in _symbol_filters_cache:
         return _symbol_filters_cache[symbol]
 
-    info = client.futures_exchange_info()
-    for s in info["symbols"]:
-        sym = s["symbol"]
-        lot_size     = None
-        tick_size    = None
-        min_notional = 5.0
-        for f in s["filters"]:
-            if f["filterType"] == "LOT_SIZE":
-                lot_size = float(f["stepSize"])
-            if f["filterType"] == "PRICE_FILTER":
-                tick_size = float(f["tickSize"])
-            if f["filterType"] == "MIN_NOTIONAL":
-                min_notional = float(f["notional"])
-        _symbol_filters_cache[sym] = (lot_size, tick_size, min_notional)
+    # إذا الـ cache فارغ → جلب كل الرموز دفعة واحدة
+    if not _symbol_filters_cache:
+        info = client.futures_exchange_info()
+        for s in info["symbols"]:
+            sym          = s["symbol"]
+            lot_size     = None
+            tick_size    = None
+            min_notional = 5.0
+            for f in s["filters"]:
+                if f["filterType"] == "LOT_SIZE":
+                    lot_size = float(f["stepSize"])
+                if f["filterType"] == "PRICE_FILTER":
+                    tick_size = float(f["tickSize"])
+                if f["filterType"] == "MIN_NOTIONAL":
+                    min_notional = float(f["notional"])
+            _symbol_filters_cache[sym] = (lot_size, tick_size, min_notional)
 
     return _symbol_filters_cache.get(symbol, (None, None, 5.0))
 
 def get_klines(symbol, interval, limit=100):
-    kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    kl      = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
     closes  = [float(k[4]) for k in kl]
     volumes = [float(k[7]) for k in kl]
     return closes, volumes
@@ -153,7 +157,7 @@ def compute_macd(closes, fast=12, slow=26, signal=9):
 def get_trend_filter(symbol):
     closes, _ = get_klines(symbol, "1h", 210)
     last_price = closes[-1]
-    ema200 = ema(closes, 200)
+    ema200     = ema(closes, 200)
     return last_price >= ema200 * 0.98, last_price, ema200
 
 def pass_volume_filter(symbol):
@@ -210,11 +214,23 @@ def analyze_symbol(symbol):
     elif rsi < 70:
         score += 10
     return {
-        "symbol": symbol,
-        "score": score,
-        "rsi": round(rsi, 1),
+        "symbol":       symbol,
+        "score":        score,
+        "rsi":          round(rsi, 1),
         "macd_bullish": macd_bullish
     }
+
+# ================== حساب قيمة الصفقة المتوقعة ==================
+
+def estimate_notional(symbol, price, available_balance):
+    """
+    ✅ جديد: يحسب قيمة الصفقة المتوقعة قبل محاولة الفتح
+    لتجنب تضييع الدورات على رموز لا يكفي الهامش لها
+    """
+    _, _, min_notional = get_symbol_filters(symbol)
+    risk_amount = available_balance * RISK_PER_TRADE
+    notional    = risk_amount * LEVERAGE
+    return notional, min_notional
 
 # ================== حماية البوت ==================
 
@@ -268,7 +284,6 @@ def check_bot_protection(current_balance) -> bool:
     if daily_reset_date != today:
         reset_daily_state(current_balance)
 
-    # حماية من القسمة على صفر
     if daily_start_balance and daily_start_balance > 0:
         daily_loss_pct = (daily_start_balance - current_balance) / daily_start_balance
         if daily_loss_pct >= DAILY_LOSS_LIMIT_PCT:
@@ -323,24 +338,25 @@ def open_long_with_sl_tp(symbol, entry_price, available_balance):
             msg = f"قيمة الصفقة لـ {symbol} أقل من {min_notional} USDT — إلغاء الصفقة."
             logging.warning(msg)
             send_telegram(f"⚠️ {msg}")
-            return
+            return False   # ✅ إصلاح: يُعيد False ليعرف الـ caller أن الصفقة فشلت
 
         if quantity <= 0 and lot_size > 0:
             if lot_size * entry_price <= notional:
                 quantity = adjust_quantity(symbol, lot_size)
             else:
                 send_telegram(f"⚠️ لا يمكن فتح صفقة {symbol} — الكمية أقل من الحد الأدنى.")
-                return
+                return False
 
         if quantity <= 0:
             send_telegram(f"⚠️ الكمية صفر بعد التقريب — إلغاء صفقة {symbol}.")
-            return
+            return False
 
-        entry_price = adjust_price(symbol, entry_price)
+        entry_price_adjusted = adjust_price(symbol, entry_price)
 
+        # ✅ إصلاح: منطق retry مُصحَّح بالكامل
         max_retries = 6
-        attempt = 0
-        while attempt < max_retries:
+        order_placed = False
+        for attempt in range(max_retries):
             try:
                 client.futures_create_order(
                     symbol=symbol,
@@ -348,47 +364,62 @@ def open_long_with_sl_tp(symbol, entry_price, available_balance):
                     type="MARKET",
                     quantity=quantity
                 )
+                order_placed = True
                 break
             except Exception as e:
-                if "Margin is insufficient" in str(e):
+                err_str = str(e)
+                if "Margin is insufficient" in err_str:
                     quantity = adjust_quantity(symbol, quantity * 0.7)
-                    attempt += 1
-                    logging.warning(f"الهامش غير كافٍ لـ {symbol} — تقليل الكمية إلى {quantity}")
-                    if quantity * entry_price < min_notional:
+                    logging.warning(
+                        f"الهامش غير كافٍ لـ {symbol} — تقليل الكمية إلى {quantity} "
+                        f"(محاولة {attempt + 1}/{max_retries})"
+                    )
+                    if quantity * entry_price_adjusted < min_notional:
                         send_telegram(
                             f"❌ فشل فتح صفقة {symbol} — الكمية وصلت للحد الأدنى ({min_notional} USDT)."
                         )
-                        return
+                        return False
                 else:
+                    # خطأ غير متوقع → رفع مباشر
                     raise e
 
-        if attempt == max_retries:
-            send_telegram(f"❌ فشل فتح صفقة {symbol} — الهامش غير كافٍ حتى بعد تقليل الكمية.")
-            return
+        # ✅ إصلاح: التحقق من نجاح أمر الدخول قبل وضع SL/TP
+        if not order_placed:
+            send_telegram(f"❌ فشل فتح صفقة {symbol} — استُنفدت كل المحاولات.")
+            return False
 
-        stop_loss_price   = adjust_price(symbol, entry_price * (1 - STOP_LOSS_PCT))
-        take_profit_price = adjust_price(symbol, entry_price * (1 + TAKE_PROFIT_PCT))
+        # ✅ SL/TP بعد تأكيد الدخول فقط
+        stop_loss_price   = adjust_price(symbol, entry_price_adjusted * (1 - STOP_LOSS_PCT))
+        take_profit_price = adjust_price(symbol, entry_price_adjusted * (1 + TAKE_PROFIT_PCT))
 
-        client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type="STOP_MARKET",
-            stopPrice=stop_loss_price,
-            closePosition=True
-        )
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                type="STOP_MARKET",
+                stopPrice=stop_loss_price,
+                closePosition=True
+            )
+        except Exception as e:
+            logging.error(f"فشل وضع Stop Loss لـ {symbol}: {e}")
+            send_telegram(f"⚠️ تحذير: تم فتح صفقة {symbol} لكن فشل وضع Stop Loss!\nيرجى المتابعة يدوياً.")
 
-        client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type="TAKE_PROFIT_MARKET",
-            stopPrice=take_profit_price,
-            closePosition=True
-        )
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=take_profit_price,
+                closePosition=True
+            )
+        except Exception as e:
+            logging.error(f"فشل وضع Take Profit لـ {symbol}: {e}")
+            send_telegram(f"⚠️ تحذير: تم فتح صفقة {symbol} لكن فشل وضع Take Profit!\nيرجى المتابعة يدوياً.")
 
         msg = (
             f"🟢 تم فتح صفقة LONG\n"
             f"زوج: {symbol}\n"
-            f"السعر: {entry_price}\n"
+            f"السعر: {entry_price_adjusted}\n"
             f"الكمية: {quantity}\n"
             f"وقف الخسارة: {stop_loss_price}\n"
             f"جني الأرباح: {take_profit_price}\n"
@@ -396,10 +427,12 @@ def open_long_with_sl_tp(symbol, entry_price, available_balance):
         )
         logging.info(msg)
         send_telegram(msg)
+        return True
 
     except Exception as e:
         logging.error(f"Binance order error: {e}")
         send_telegram(f"⚠️ خطأ في فتح الصفقة لـ {symbol}:\n{e}")
+        return False
 
 # ================== تقرير يومي ==================
 
@@ -414,8 +447,16 @@ def send_daily_report(total_balance):
     positions      = client.futures_position_information()
     open_positions = [p for p in positions if float(p["positionAmt"]) != 0]
 
-    daily_loss = ((daily_start_balance or total_balance) - total_balance) / (daily_start_balance or total_balance) * 100 if (daily_start_balance or total_balance) > 0 else 0
-    total_loss = ((bot_start_balance  or total_balance) - total_balance) / (bot_start_balance  or total_balance) * 100 if (bot_start_balance  or total_balance) > 0 else 0
+    daily_loss = (
+        ((daily_start_balance or total_balance) - total_balance)
+        / (daily_start_balance or total_balance) * 100
+        if (daily_start_balance or total_balance) > 0 else 0
+    )
+    total_loss = (
+        ((bot_start_balance or total_balance) - total_balance)
+        / (bot_start_balance or total_balance) * 100
+        if (bot_start_balance or total_balance) > 0 else 0
+    )
 
     msg  = "📊 تقرير يومي لبوت التداول\n"
     msg += f"التاريخ (UTC): {today}\n"
@@ -445,7 +486,7 @@ def main_loop():
     global bot_start_balance, daily_start_balance, daily_reset_date
 
     logging.info("تم الاتصال بـ Binance بنجاح!")
-    logging.info("بوت التداول الذكي v4 - محسن مع حماية البوت!")
+    logging.info("بوت التداول الذكي v4.1 - محسن مع إصلاح أخطاء الـ logs!")
 
     initial_balance     = get_futures_balance_usdt()
     bot_start_balance   = initial_balance
@@ -453,7 +494,7 @@ def main_loop():
     daily_reset_date    = datetime.utcnow().date()
 
     send_telegram(
-        f"🤖 بوت التداول الذكي v4 بدأ العمل بنجاح على Render ✅\n"
+        f"🤖 بوت التداول الذكي v4.1 بدأ العمل بنجاح ✅\n"
         f"رصيد البداية: {initial_balance:.2f} USDT\n"
         f"حد خسارة يومي: {DAILY_LOSS_LIMIT_PCT*100:.0f}% | حد خسارة إجمالي: {TOTAL_LOSS_LIMIT_PCT*100:.0f}%"
     )
@@ -464,8 +505,8 @@ def main_loop():
         logging.info(f"الدورة #{cycle} — البحث عن فرص شراء...")
 
         try:
-            total_balance     = get_futures_balance_usdt()      # للحماية
-            available_balance = get_available_balance_usdt()    # لحساب الصفقة
+            total_balance     = get_futures_balance_usdt()
+            available_balance = get_available_balance_usdt()
 
             logging.info(f"رصيد USDT: {total_balance:.2f} | متاح: {available_balance:.2f}")
 
@@ -474,12 +515,12 @@ def main_loop():
                 time.sleep(40)
                 continue
 
-            # إذا لا يوجد هامش متاح — تخطي دون خطأ
             if available_balance <= 0:
                 logging.info("لا يوجد هامش متاح للتداول — جميع الصفقات مفتوحة.")
                 time.sleep(40)
                 continue
 
+            # ================== جمع المرشحين ==================
             candidates = []
             for symbol in TOP_SYMBOLS:
 
@@ -494,30 +535,71 @@ def main_loop():
 
                 uptrend, last_price, ema200 = get_trend_filter(symbol)
                 if not uptrend:
-                    logging.info(f"{symbol}: مرفوض — ليس في ترند صاعد (السعر={last_price:.4f}, EMA200={ema200:.4f})")
+                    logging.info(
+                        f"{symbol}: مرفوض — ليس في ترند صاعد "
+                        f"(السعر={last_price:.4f}, EMA200={ema200:.4f})"
+                    )
                     continue
 
                 info = analyze_symbol(symbol)
+
+                # ✅ إصلاح: فلتر الحد الأدنى للنقاط
+                if info["score"] < MIN_SCORE:
+                    logging.info(
+                        f"{symbol}: مرفوض — نقاط ضعيفة ({info['score']} < {MIN_SCORE})"
+                    )
+                    continue
+
+                # ✅ إصلاح: فلتر مسبق لقيمة الصفقة قبل إضافته للمرشحين
+                ticker   = client.futures_symbol_ticker(symbol=symbol)
+                price    = float(ticker["price"])
+                notional, min_notional = estimate_notional(symbol, price, available_balance)
+                if notional < min_notional:
+                    logging.info(
+                        f"{symbol}: مرفوض — قيمة الصفقة المتوقعة {notional:.2f} USDT "
+                        f"أقل من الحد الأدنى {min_notional} USDT"
+                    )
+                    continue
+
+                info["price"] = price
                 candidates.append(info)
                 logging.info(
-                    f"{symbol}: {info['score']} نقطة — RSI={info['rsi']} | MACD={'صاعد' if info['macd_bullish'] else 'هابط'}"
+                    f"{symbol}: {info['score']} نقطة — "
+                    f"RSI={info['rsi']} | MACD={'صاعد' if info['macd_bullish'] else 'هابط'}"
                 )
+
+            # ================== اختيار الأفضل ==================
 
             if not candidates:
                 logging.info("لا توجد فرص مناسبة في هذه الدورة.")
-            else:
-                best   = max(candidates, key=lambda x: x["score"])
+                time.sleep(40)
+                continue
+
+            # ✅ إصلاح: ترتيب عند تعادل النقاط → يُفضَّل RSI الأقل (أقل تشبعاً بالشراء)
+            candidates.sort(key=lambda x: (-x["score"], x["rsi"]))
+
+            # ✅ إصلاح: تجربة المرشحين بالترتيب حتى ينجح واحد
+            order_opened = False
+            for best in candidates:
                 symbol = best["symbol"]
-                logging.info(f"أفضل فرصة: {symbol} ({best['score']} نقطة)")
+                price  = best["price"]
+                logging.info(
+                    f"محاولة فتح صفقة: {symbol} ({best['score']} نقطة | RSI={best['rsi']})"
+                )
+                success = open_long_with_sl_tp(symbol, price, available_balance)
+                if success:
+                    order_opened = True
+                    break
+                else:
+                    logging.info(f"{symbol}: فشل فتح الصفقة — الانتقال للمرشح التالي...")
 
-                ticker = client.futures_symbol_ticker(symbol=symbol)
-                price  = float(ticker["price"])
+            if not order_opened:
+                logging.info("فشلت كل المحاولات في هذه الدورة.")
 
-                logging.info(f"جاري فتح صفقة: {symbol} بسعر {price}")
-                open_long_with_sl_tp(symbol, price, available_balance)
-
+            # ================== التقرير اليومي ==================
             now_utc = datetime.utcnow()
-            if now_utc.hour >= 23:
+            # ✅ إصلاح: التقرير عند الساعة 23:00 فقط (بدقيقة واحدة تحمل)
+            if now_utc.hour == 23 and now_utc.minute == 0:
                 send_daily_report(total_balance)
 
         except Exception as e:
