@@ -71,7 +71,7 @@ def get_futures_balance_usdt():
     acc = client.futures_account_balance()
     for b in acc:
         if b["asset"] == "USDT":
-            return float(b["balance"])
+            return float(b["availableBalance"])  # الهامش الحر فقط
     return 0.0
 
 def get_symbol_filters(symbol):
