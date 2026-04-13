@@ -68,26 +68,32 @@ def send_telegram(msg: str):
         logging.error(f"Telegram error: {e}")
 
 def get_futures_balance_usdt():
+    """الرصيد الكلي — للحماية والتقارير"""
     acc = client.futures_account_balance()
     for b in acc:
         if b["asset"] == "USDT":
-            return float(b["availableBalance"])  # الهامش الحر فقط
+            return float(b["balance"])
+    return 0.0
+
+def get_available_balance_usdt():
+    """الهامش الحر فقط — لحساب حجم الصفقة الجديدة"""
+    acc = client.futures_account_balance()
+    for b in acc:
+        if b["asset"] == "USDT":
+            return float(b["availableBalance"])
     return 0.0
 
 def get_symbol_filters(symbol):
-    """
-    يُعيد (lot_size, tick_size, min_notional)
-    min_notional: الحد الأدنى لقيمة الصفقة بـ USDT — يختلف من زوج لآخر.
-    """
+    """يُعيد (lot_size, tick_size, min_notional)"""
     if symbol in _symbol_filters_cache:
         return _symbol_filters_cache[symbol]
 
     info = client.futures_exchange_info()
     for s in info["symbols"]:
         sym = s["symbol"]
-        lot_size    = None
-        tick_size   = None
-        min_notional = 5.0   # قيمة افتراضية آمنة
+        lot_size     = None
+        tick_size    = None
+        min_notional = 5.0
         for f in s["filters"]:
             if f["filterType"] == "LOT_SIZE":
                 lot_size = float(f["stepSize"])
@@ -210,7 +216,7 @@ def analyze_symbol(symbol):
         "macd_bullish": macd_bullish
     }
 
-# ================== حماية البوت — الدوال ==================
+# ================== حماية البوت ==================
 
 def close_all_positions():
     try:
@@ -262,21 +268,23 @@ def check_bot_protection(current_balance) -> bool:
     if daily_reset_date != today:
         reset_daily_state(current_balance)
 
-    daily_loss_pct = (daily_start_balance - current_balance) / daily_start_balance
-    if daily_loss_pct >= DAILY_LOSS_LIMIT_PCT:
-        if not bot_halted_daily:
-            bot_halted_daily = True
-            close_all_positions()
-            msg = (
-                f"🛑 تم تفعيل وقف الخسارة اليومي!\n"
-                f"الخسارة اليومية: {daily_loss_pct*100:.2f}% (الحد: {DAILY_LOSS_LIMIT_PCT*100:.0f}%)\n"
-                f"رصيد البداية اليوم: {daily_start_balance:.2f} USDT\n"
-                f"الرصيد الحالي: {current_balance:.2f} USDT\n"
-                f"سيستأنف البوت تلقائيًا غدًا."
-            )
-            logging.warning(msg)
-            send_telegram(msg)
-        return False
+    # حماية من القسمة على صفر
+    if daily_start_balance and daily_start_balance > 0:
+        daily_loss_pct = (daily_start_balance - current_balance) / daily_start_balance
+        if daily_loss_pct >= DAILY_LOSS_LIMIT_PCT:
+            if not bot_halted_daily:
+                bot_halted_daily = True
+                close_all_positions()
+                msg = (
+                    f"🛑 تم تفعيل وقف الخسارة اليومي!\n"
+                    f"الخسارة اليومية: {daily_loss_pct*100:.2f}% (الحد: {DAILY_LOSS_LIMIT_PCT*100:.0f}%)\n"
+                    f"رصيد البداية اليوم: {daily_start_balance:.2f} USDT\n"
+                    f"الرصيد الحالي: {current_balance:.2f} USDT\n"
+                    f"سيستأنف البوت تلقائيًا غدًا."
+                )
+                logging.warning(msg)
+                send_telegram(msg)
+            return False
 
     if bot_start_balance and bot_start_balance > 0:
         total_loss_pct = (bot_start_balance - current_balance) / bot_start_balance
@@ -298,21 +306,19 @@ def check_bot_protection(current_balance) -> bool:
 
 # ================== فتح الصفقات ==================
 
-def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
+def open_long_with_sl_tp(symbol, entry_price, available_balance):
     try:
         setup_symbol(symbol)
 
-        # جلب فلاتر الزوج بما فيها الحد الأدنى للقيمة
         lot_size, _, min_notional = get_symbol_filters(symbol)
         if lot_size is None:
             lot_size = 0.0
 
-        risk_amount = usdt_balance * RISK_PER_TRADE
+        risk_amount = available_balance * RISK_PER_TRADE
         notional    = risk_amount * LEVERAGE
         raw_qty     = notional / entry_price
         quantity    = adjust_quantity(symbol, raw_qty)
 
-        # فحص الحد الأدنى للقيمة الخاص بكل زوج
         if quantity * entry_price < min_notional:
             msg = f"قيمة الصفقة لـ {symbol} أقل من {min_notional} USDT — إلغاء الصفقة."
             logging.warning(msg)
@@ -320,8 +326,7 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
             return
 
         if quantity <= 0 and lot_size > 0:
-            min_qty_notional = lot_size * entry_price
-            if min_qty_notional <= notional:
+            if lot_size * entry_price <= notional:
                 quantity = adjust_quantity(symbol, lot_size)
             else:
                 send_telegram(f"⚠️ لا يمكن فتح صفقة {symbol} — الكمية أقل من الحد الأدنى.")
@@ -349,11 +354,9 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
                     quantity = adjust_quantity(symbol, quantity * 0.7)
                     attempt += 1
                     logging.warning(f"الهامش غير كافٍ لـ {symbol} — تقليل الكمية إلى {quantity}")
-                    # فحص الحد الأدنى بعد كل تقليل
                     if quantity * entry_price < min_notional:
                         send_telegram(
-                            f"❌ فشل فتح صفقة {symbol} — الكمية وصلت للحد الأدنى ({min_notional} USDT).\n"
-                            f"الرصيد المتاح غير كافٍ لهذا الزوج."
+                            f"❌ فشل فتح صفقة {symbol} — الكمية وصلت للحد الأدنى ({min_notional} USDT)."
                         )
                         return
                 else:
@@ -402,22 +405,21 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
 
 last_daily_report_date = None
 
-def send_daily_report():
+def send_daily_report(total_balance):
     global last_daily_report_date
     today = datetime.utcnow().date()
     if last_daily_report_date == today:
         return
 
-    balance        = get_futures_balance_usdt()
     positions      = client.futures_position_information()
     open_positions = [p for p in positions if float(p["positionAmt"]) != 0]
 
-    daily_loss = ((daily_start_balance or balance) - balance) / (daily_start_balance or balance) * 100
-    total_loss = ((bot_start_balance  or balance) - balance) / (bot_start_balance  or balance) * 100
+    daily_loss = ((daily_start_balance or total_balance) - total_balance) / (daily_start_balance or total_balance) * 100 if (daily_start_balance or total_balance) > 0 else 0
+    total_loss = ((bot_start_balance  or total_balance) - total_balance) / (bot_start_balance  or total_balance) * 100 if (bot_start_balance  or total_balance) > 0 else 0
 
     msg  = "📊 تقرير يومي لبوت التداول\n"
     msg += f"التاريخ (UTC): {today}\n"
-    msg += f"رصيد العقود الآجلة (USDT): {balance:.2f}\n"
+    msg += f"رصيد العقود الآجلة (USDT): {total_balance:.2f}\n"
     msg += f"خسارة اليوم: {daily_loss:.2f}% | خسارة إجمالية: {total_loss:.2f}%\n"
     msg += "الصفقات المفتوحة:\n"
     if not open_positions:
@@ -462,11 +464,19 @@ def main_loop():
         logging.info(f"الدورة #{cycle} — البحث عن فرص شراء...")
 
         try:
-            usdt_balance = get_futures_balance_usdt()
-            logging.info(f"رصيد USDT: {usdt_balance:.2f}")
+            total_balance     = get_futures_balance_usdt()      # للحماية
+            available_balance = get_available_balance_usdt()    # لحساب الصفقة
 
-            if not check_bot_protection(usdt_balance):
+            logging.info(f"رصيد USDT: {total_balance:.2f} | متاح: {available_balance:.2f}")
+
+            if not check_bot_protection(total_balance):
                 logging.info("التداول محظور — تخطي هذه الدورة.")
+                time.sleep(40)
+                continue
+
+            # إذا لا يوجد هامش متاح — تخطي دون خطأ
+            if available_balance <= 0:
+                logging.info("لا يوجد هامش متاح للتداول — جميع الصفقات مفتوحة.")
                 time.sleep(40)
                 continue
 
@@ -504,11 +514,11 @@ def main_loop():
                 price  = float(ticker["price"])
 
                 logging.info(f"جاري فتح صفقة: {symbol} بسعر {price}")
-                open_long_with_sl_tp(symbol, price, usdt_balance)
+                open_long_with_sl_tp(symbol, price, available_balance)
 
             now_utc = datetime.utcnow()
             if now_utc.hour >= 23:
-                send_daily_report()
+                send_daily_report(total_balance)
 
         except Exception as e:
             logging.error(f"خطأ في الدورة: {e}")
