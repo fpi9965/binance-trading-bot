@@ -17,8 +17,8 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
-RISK_PER_TRADE = 0.05        # 5% من الرصيد
-LEVERAGE = 20                # 20x
+RISK_PER_TRADE = 0.05
+LEVERAGE = 20
 TIMEFRAME = "15m"
 
 TOP_SYMBOLS = [
@@ -75,20 +75,29 @@ def get_futures_balance_usdt():
     return 0.0
 
 def get_symbol_filters(symbol):
+    """
+    يُعيد (lot_size, tick_size, min_notional)
+    min_notional: الحد الأدنى لقيمة الصفقة بـ USDT — يختلف من زوج لآخر.
+    """
     if symbol in _symbol_filters_cache:
         return _symbol_filters_cache[symbol]
+
     info = client.futures_exchange_info()
     for s in info["symbols"]:
         sym = s["symbol"]
-        lot_size = None
-        price_filter = None
+        lot_size    = None
+        tick_size   = None
+        min_notional = 5.0   # قيمة افتراضية آمنة
         for f in s["filters"]:
             if f["filterType"] == "LOT_SIZE":
                 lot_size = float(f["stepSize"])
             if f["filterType"] == "PRICE_FILTER":
-                price_filter = float(f["tickSize"])
-        _symbol_filters_cache[sym] = (lot_size, price_filter)
-    return _symbol_filters_cache.get(symbol, (None, None))
+                tick_size = float(f["tickSize"])
+            if f["filterType"] == "MIN_NOTIONAL":
+                min_notional = float(f["notional"])
+        _symbol_filters_cache[sym] = (lot_size, tick_size, min_notional)
+
+    return _symbol_filters_cache.get(symbol, (None, None, 5.0))
 
 def get_klines(symbol, interval, limit=100):
     kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
@@ -97,14 +106,14 @@ def get_klines(symbol, interval, limit=100):
     return closes, volumes
 
 def adjust_quantity(symbol, quantity):
-    lot_size, _ = get_symbol_filters(symbol)
+    lot_size, _, _ = get_symbol_filters(symbol)
     if lot_size is None or lot_size == 0:
         return float(f"{quantity:.3f}")
     precision = int(round(-math.log(lot_size, 10)))
     return float(f"{quantity:.{precision}f}")
 
 def adjust_price(symbol, price):
-    _, tick_size = get_symbol_filters(symbol)
+    _, tick_size, _ = get_symbol_filters(symbol)
     if tick_size is None or tick_size == 0:
         return float(f"{price:.2f}")
     precision = int(round(-math.log(tick_size, 10)))
@@ -211,8 +220,8 @@ def close_all_positions():
             amt = float(p["positionAmt"])
             if amt == 0:
                 continue
-            symbol = p["symbol"]
-            side   = SIDE_SELL if amt > 0 else SIDE_BUY
+            symbol   = p["symbol"]
+            side     = SIDE_SELL if amt > 0 else SIDE_BUY
             quantity = abs(amt)
             try:
                 client.futures_create_order(
@@ -293,25 +302,26 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
     try:
         setup_symbol(symbol)
 
-        risk_amount = usdt_balance * RISK_PER_TRADE
-        notional    = risk_amount * LEVERAGE
-        raw_qty     = notional / entry_price
-
-        lot_size, _ = get_symbol_filters(symbol)
+        # جلب فلاتر الزوج بما فيها الحد الأدنى للقيمة
+        lot_size, _, min_notional = get_symbol_filters(symbol)
         if lot_size is None:
             lot_size = 0.0
 
-        quantity = adjust_quantity(symbol, raw_qty)
+        risk_amount = usdt_balance * RISK_PER_TRADE
+        notional    = risk_amount * LEVERAGE
+        raw_qty     = notional / entry_price
+        quantity    = adjust_quantity(symbol, raw_qty)
 
-        if quantity * entry_price < 5:
-            msg = f"قيمة الصفقة لـ {symbol} أقل من 5 USDT — إلغاء الصفقة."
+        # فحص الحد الأدنى للقيمة الخاص بكل زوج
+        if quantity * entry_price < min_notional:
+            msg = f"قيمة الصفقة لـ {symbol} أقل من {min_notional} USDT — إلغاء الصفقة."
             logging.warning(msg)
             send_telegram(f"⚠️ {msg}")
             return
 
         if quantity <= 0 and lot_size > 0:
-            min_notional = lot_size * entry_price
-            if min_notional <= notional:
+            min_qty_notional = lot_size * entry_price
+            if min_qty_notional <= notional:
                 quantity = adjust_quantity(symbol, lot_size)
             else:
                 send_telegram(f"⚠️ لا يمكن فتح صفقة {symbol} — الكمية أقل من الحد الأدنى.")
@@ -339,8 +349,12 @@ def open_long_with_sl_tp(symbol, entry_price, usdt_balance):
                     quantity = adjust_quantity(symbol, quantity * 0.7)
                     attempt += 1
                     logging.warning(f"الهامش غير كافٍ لـ {symbol} — تقليل الكمية إلى {quantity}")
-                    if quantity * entry_price < 5:
-                        send_telegram(f"❌ فشل فتح صفقة {symbol} — الكمية وصلت للحد الأدنى.")
+                    # فحص الحد الأدنى بعد كل تقليل
+                    if quantity * entry_price < min_notional:
+                        send_telegram(
+                            f"❌ فشل فتح صفقة {symbol} — الكمية وصلت للحد الأدنى ({min_notional} USDT).\n"
+                            f"الرصيد المتاح غير كافٍ لهذا الزوج."
+                        )
                         return
                 else:
                     raise e
@@ -394,12 +408,12 @@ def send_daily_report():
     if last_daily_report_date == today:
         return
 
-    balance = get_futures_balance_usdt()
-    positions = client.futures_position_information()
+    balance        = get_futures_balance_usdt()
+    positions      = client.futures_position_information()
     open_positions = [p for p in positions if float(p["positionAmt"]) != 0]
 
     daily_loss = ((daily_start_balance or balance) - balance) / (daily_start_balance or balance) * 100
-    total_loss = ((bot_start_balance or balance) - balance) / (bot_start_balance or balance) * 100
+    total_loss = ((bot_start_balance  or balance) - balance) / (bot_start_balance  or balance) * 100
 
     msg  = "📊 تقرير يومي لبوت التداول\n"
     msg += f"التاريخ (UTC): {today}\n"
@@ -459,7 +473,6 @@ def main_loop():
             candidates = []
             for symbol in TOP_SYMBOLS:
 
-                # استبعاد الأزواج ذات صفقات مفتوحة أولاً
                 if has_open_position(symbol):
                     logging.info(f"{symbol}: متجاوز — صفقة مفتوحة بالفعل.")
                     continue
