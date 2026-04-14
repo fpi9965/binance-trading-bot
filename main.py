@@ -863,3 +863,19 @@ def main_loop():
             send_telegram(f"⚠️ خطأ في الدورة:\n{e}")
 
         time.sleep(40)
+import threading
+
+if __name__ == "__main__":
+    # 1. تشغيل حلقة التداول في "خلفية" التطبيق (Thread)
+    # لكي لا تتعارض مع خادم Flask
+    trading_thread = threading.Thread(target=main_loop)
+    trading_thread.daemon = True  # ليغلق عند إغلاق التطبيق الرئيسي
+    trading_thread.start()
+
+    # 2. تشغيل خادم Flask (ضروري جداً لاستضافة Render)
+    # Render يعطي تطبيقك "Port" معين، يجب استخدامه
+    port = int(os.environ.get("PORT", 10000))
+    
+    logging.info(f"Starting Flask server on port {port}...")
+    # استخدام 0.0.0.0 ليتمكن Render من الوصول للتطبيق
+    app.run(host="0.0.0.0", port=port)
