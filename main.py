@@ -32,10 +32,15 @@ TOP_SYMBOLS = [
 ]
 
 MIN_24H_QUOTE_VOLUME = 1_000_000
-MIN_SCORE            = 30        # ✅ إصلاح: حد أدنى للنقاط
+MIN_SCORE            = 30
 
-STOP_LOSS_PCT   = 0.01
-TAKE_PROFIT_PCT = 0.02
+# ✅ Trailing Stop: نسبة التراجع المسموح قبل الإغلاق (1% = 1.0)
+# بايننس يقبل من 0.1 إلى 5.0
+TRAILING_CALLBACK_RATE = 1.0   # 1%
+
+# ✅ Activation Price: تُفعَّل الـ Trailing فقط بعد ارتفاع السعر بهذه النسبة
+# 0 = تُفعَّل فوراً من سعر الدخول
+TRAILING_ACTIVATION_PCT = 0.005  # 0.5% فوق سعر الدخول
 
 # ================== حماية البوت ==================
 
@@ -60,6 +65,10 @@ daily_reset_date    = None
 bot_halted_total    = False
 bot_halted_daily    = False
 
+# ================== متغيرات تتبع الصفقات المفتوحة ==================
+# { symbol: { "entry_price": float, "quantity": float, "open_time": datetime } }
+open_trades = {}
+
 # ================== دوال مساعدة ==================
 
 def send_telegram(msg: str):
@@ -83,14 +92,10 @@ def get_available_balance_usdt():
     return 0.0
 
 def get_symbol_filters(symbol):
-    """
-    ✅ إصلاح: يجلب exchange_info مرة واحدة فقط ويخزّن الكل في الـ cache
-    بدلاً من جلبه في كل استدعاء لرمز جديد
-    """
+    """يجلب exchange_info مرة واحدة فقط ويخزّن الكل في الـ cache"""
     if symbol in _symbol_filters_cache:
         return _symbol_filters_cache[symbol]
 
-    # إذا الـ cache فارغ → جلب كل الرموز دفعة واحدة
     if not _symbol_filters_cache:
         info = client.futures_exchange_info()
         for s in info["symbols"]:
@@ -220,17 +225,150 @@ def analyze_symbol(symbol):
         "macd_bullish": macd_bullish
     }
 
-# ================== حساب قيمة الصفقة المتوقعة ==================
-
 def estimate_notional(symbol, price, available_balance):
-    """
-    ✅ جديد: يحسب قيمة الصفقة المتوقعة قبل محاولة الفتح
-    لتجنب تضييع الدورات على رموز لا يكفي الهامش لها
-    """
     _, _, min_notional = get_symbol_filters(symbol)
     risk_amount = available_balance * RISK_PER_TRADE
     notional    = risk_amount * LEVERAGE
     return notional, min_notional
+
+# ================== إلغاء أوامر الحماية القديمة ==================
+
+def cancel_existing_sl_tp(symbol):
+    """
+    يلغي أي أوامر STOP_MARKET أو TAKE_PROFIT_MARKET أو TRAILING_STOP_MARKET
+    مفتوحة لرمز معين — ضروري قبل وضع trailing جديد
+    """
+    try:
+        orders = client.futures_get_open_orders(symbol=symbol)
+        cancelled = 0
+        for order in orders:
+            if order["type"] in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"):
+                try:
+                    client.futures_cancel_order(symbol=symbol, orderId=order["orderId"])
+                    cancelled += 1
+                    logging.info(f"تم إلغاء أمر {order['type']} لـ {symbol} (ID: {order['orderId']})")
+                except Exception as e:
+                    logging.warning(f"فشل إلغاء أمر {symbol}: {e}")
+        if cancelled > 0:
+            logging.info(f"تم إلغاء {cancelled} أمر قديم لـ {symbol}")
+    except Exception as e:
+        logging.error(f"خطأ في cancel_existing_sl_tp لـ {symbol}: {e}")
+
+# ================== وضع Trailing Stop ==================
+
+def place_trailing_stop(symbol, entry_price, quantity):
+    """
+    ✅ الجوهر: يضع TRAILING_STOP_MARKET
+    - callbackRate: نسبة التراجع المسموح (مثلاً 1%)
+    - activationPrice: السعر الذي تبدأ منه المتابعة (0.5% فوق الدخول)
+    بايننس يتكفل بتحريك الـ SL تلقائياً مع كل ارتفاع في السعر
+    """
+    activation_price = adjust_price(
+        symbol,
+        entry_price * (1 + TRAILING_ACTIVATION_PCT)
+    )
+
+    try:
+        client.futures_create_order(
+            symbol        = symbol,
+            side          = SIDE_SELL,
+            type          = "TRAILING_STOP_MARKET",
+            quantity      = quantity,
+            callbackRate  = TRAILING_CALLBACK_RATE,
+            activationPrice = activation_price,
+            reduceOnly    = True,
+            workingType   = "MARK_PRICE"
+        )
+        logging.info(
+            f"✅ Trailing Stop وُضع لـ {symbol} | "
+            f"تفعيل عند: {activation_price} | "
+            f"Callback: {TRAILING_CALLBACK_RATE}%"
+        )
+        return True
+    except Exception as e:
+        logging.error(f"فشل وضع Trailing Stop لـ {symbol}: {e}")
+        send_telegram(
+            f"⚠️ تحذير: تم فتح صفقة {symbol} لكن فشل وضع Trailing Stop!\n"
+            f"الخطأ: {e}\n"
+            f"يرجى المتابعة يدوياً."
+        )
+        return False
+
+# ================== مراقبة الصفقات المفتوحة ==================
+
+def monitor_open_trades():
+    """
+    ✅ جديد: يراقب الصفقات المفتوحة ويتحقق من:
+    1. هل الصفقة أُغلقت (بواسطة الـ Trailing Stop)؟ → يُنظّف open_trades ويُرسل إشعاراً
+    2. هل الـ Trailing Stop لا يزال موجوداً؟ → إذا اختفى يُعيد وضعه
+    """
+    global open_trades
+
+    closed_symbols = []
+
+    for symbol, trade_info in list(open_trades.items()):
+        try:
+            # فحص الوضعية الحالية
+            positions = client.futures_position_information(symbol=symbol)
+            position_amt = 0.0
+            for p in positions:
+                position_amt = float(p["positionAmt"])
+                break
+
+            # الصفقة أُغلقت
+            if position_amt == 0:
+                entry_price = trade_info["entry_price"]
+                open_time   = trade_info["open_time"]
+                duration    = datetime.utcnow() - open_time
+
+                # جلب آخر سعر لحساب الربح/الخسارة التقريبي
+                ticker    = client.futures_symbol_ticker(symbol=symbol)
+                exit_price = float(ticker["price"])
+                pnl_pct    = ((exit_price - entry_price) / entry_price) * 100 * LEVERAGE
+
+                msg = (
+                    f"{'🟢' if pnl_pct >= 0 else '🔴'} صفقة مُغلقة بواسطة Trailing Stop\n"
+                    f"زوج: {symbol}\n"
+                    f"سعر الدخول: {entry_price}\n"
+                    f"السعر الحالي: {exit_price}\n"
+                    f"تقدير الربح/الخسارة: {pnl_pct:+.2f}% (رافعة {LEVERAGE}x)\n"
+                    f"مدة الصفقة: {str(duration).split('.')[0]}"
+                )
+                logging.info(msg)
+                send_telegram(msg)
+                closed_symbols.append(symbol)
+                continue
+
+            # الصفقة مفتوحة — تحقق من وجود Trailing Stop
+            orders = client.futures_get_open_orders(symbol=symbol)
+            has_trailing = any(
+                o["type"] == "TRAILING_STOP_MARKET" for o in orders
+            )
+
+            if not has_trailing:
+                logging.warning(f"⚠️ {symbol}: Trailing Stop مفقود! جاري إعادة وضعه...")
+                send_telegram(f"⚠️ {symbol}: Trailing Stop مفقود — جاري إعادة وضعه...")
+
+                ticker      = client.futures_symbol_ticker(symbol=symbol)
+                current_price = float(ticker["price"])
+                quantity    = abs(position_amt)
+
+                # إلغاء أي أوامر قديمة أولاً
+                cancel_existing_sl_tp(symbol)
+                placed = place_trailing_stop(symbol, current_price, quantity)
+
+                if placed:
+                    send_telegram(f"✅ {symbol}: تم إعادة وضع Trailing Stop بنجاح.")
+                    # تحديث سعر الدخول في السجل
+                    open_trades[symbol]["entry_price"] = current_price
+
+        except Exception as e:
+            logging.error(f"خطأ في مراقبة {symbol}: {e}")
+
+    # تنظيف الصفقات المُغلقة
+    for symbol in closed_symbols:
+        open_trades.pop(symbol, None)
+        logging.info(f"تم حذف {symbol} من سجل الصفقات المفتوحة.")
 
 # ================== حماية البوت ==================
 
@@ -245,6 +383,8 @@ def close_all_positions():
             symbol   = p["symbol"]
             side     = SIDE_SELL if amt > 0 else SIDE_BUY
             quantity = abs(amt)
+            # إلغاء الـ Trailing Stop أولاً
+            cancel_existing_sl_tp(symbol)
             try:
                 client.futures_create_order(
                     symbol=symbol,
@@ -254,6 +394,7 @@ def close_all_positions():
                     reduceOnly=True
                 )
                 closed += 1
+                open_trades.pop(symbol, None)
                 logging.info(f"تم إغلاق صفقة {symbol} (الكمية: {quantity})")
             except Exception as e:
                 logging.error(f"فشل إغلاق {symbol}: {e}")
@@ -321,7 +462,11 @@ def check_bot_protection(current_balance) -> bool:
 
 # ================== فتح الصفقات ==================
 
-def open_long_with_sl_tp(symbol, entry_price, available_balance):
+def open_long_with_trailing(symbol, entry_price, available_balance):
+    """
+    ✅ v5: فتح صفقة LONG + Trailing Stop فوراً
+    لا يوجد Take Profit ثابت — البوت يُدير الصفقة بالـ Trailing
+    """
     try:
         setup_symbol(symbol)
 
@@ -338,7 +483,7 @@ def open_long_with_sl_tp(symbol, entry_price, available_balance):
             msg = f"قيمة الصفقة لـ {symbol} أقل من {min_notional} USDT — إلغاء الصفقة."
             logging.warning(msg)
             send_telegram(f"⚠️ {msg}")
-            return False   # ✅ إصلاح: يُعيد False ليعرف الـ caller أن الصفقة فشلت
+            return False
 
         if quantity <= 0 and lot_size > 0:
             if lot_size * entry_price <= notional:
@@ -353,8 +498,8 @@ def open_long_with_sl_tp(symbol, entry_price, available_balance):
 
         entry_price_adjusted = adjust_price(symbol, entry_price)
 
-        # ✅ إصلاح: منطق retry مُصحَّح بالكامل
-        max_retries = 6
+        # ================== أمر الدخول مع retry ==================
+        max_retries  = 6
         order_placed = False
         for attempt in range(max_retries):
             try:
@@ -380,50 +525,34 @@ def open_long_with_sl_tp(symbol, entry_price, available_balance):
                         )
                         return False
                 else:
-                    # خطأ غير متوقع → رفع مباشر
                     raise e
 
-        # ✅ إصلاح: التحقق من نجاح أمر الدخول قبل وضع SL/TP
         if not order_placed:
             send_telegram(f"❌ فشل فتح صفقة {symbol} — استُنفدت كل المحاولات.")
             return False
 
-        # ✅ SL/TP بعد تأكيد الدخول فقط
-        stop_loss_price   = adjust_price(symbol, entry_price_adjusted * (1 - STOP_LOSS_PCT))
-        take_profit_price = adjust_price(symbol, entry_price_adjusted * (1 + TAKE_PROFIT_PCT))
+        # ================== Trailing Stop بعد تأكيد الدخول ==================
+        # إلغاء أي أوامر قديمة أولاً (احتياط)
+        cancel_existing_sl_tp(symbol)
 
-        try:
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_SELL,
-                type="STOP_MARKET",
-                stopPrice=stop_loss_price,
-                closePosition=True
-            )
-        except Exception as e:
-            logging.error(f"فشل وضع Stop Loss لـ {symbol}: {e}")
-            send_telegram(f"⚠️ تحذير: تم فتح صفقة {symbol} لكن فشل وضع Stop Loss!\nيرجى المتابعة يدوياً.")
+        trailing_placed = place_trailing_stop(symbol, entry_price_adjusted, quantity)
 
-        try:
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_SELL,
-                type="TAKE_PROFIT_MARKET",
-                stopPrice=take_profit_price,
-                closePosition=True
-            )
-        except Exception as e:
-            logging.error(f"فشل وضع Take Profit لـ {symbol}: {e}")
-            send_telegram(f"⚠️ تحذير: تم فتح صفقة {symbol} لكن فشل وضع Take Profit!\nيرجى المتابعة يدوياً.")
+        # ================== تسجيل الصفقة في الذاكرة ==================
+        open_trades[symbol] = {
+            "entry_price": entry_price_adjusted,
+            "quantity":    quantity,
+            "open_time":   datetime.utcnow()
+        }
 
         msg = (
-            f"🟢 تم فتح صفقة LONG\n"
+            f"🟢 تم فتح صفقة LONG (v5 - Trailing)\n"
             f"زوج: {symbol}\n"
-            f"السعر: {entry_price_adjusted}\n"
+            f"سعر الدخول: {entry_price_adjusted}\n"
             f"الكمية: {quantity}\n"
-            f"وقف الخسارة: {stop_loss_price}\n"
-            f"جني الأرباح: {take_profit_price}\n"
-            f"المخاطرة: {RISK_PER_TRADE*100:.1f}% | الرافعة: {LEVERAGE}x"
+            f"Trailing Stop: {TRAILING_CALLBACK_RATE}% | يُفعَّل عند: "
+            f"+{TRAILING_ACTIVATION_PCT*100:.1f}% من الدخول\n"
+            f"المخاطرة: {RISK_PER_TRADE*100:.1f}% | الرافعة: {LEVERAGE}x\n"
+            f"{'✅ Trailing Stop وُضع بنجاح' if trailing_placed else '⚠️ فشل وضع Trailing Stop!'}"
         )
         logging.info(msg)
         send_telegram(msg)
@@ -458,20 +587,21 @@ def send_daily_report(total_balance):
         if (bot_start_balance or total_balance) > 0 else 0
     )
 
-    msg  = "📊 تقرير يومي لبوت التداول\n"
+    msg  = "📊 تقرير يومي — بوت التداول v5\n"
     msg += f"التاريخ (UTC): {today}\n"
-    msg += f"رصيد العقود الآجلة (USDT): {total_balance:.2f}\n"
+    msg += f"رصيد USDT: {total_balance:.2f}\n"
     msg += f"خسارة اليوم: {daily_loss:.2f}% | خسارة إجمالية: {total_loss:.2f}%\n"
+    msg += f"Trailing Stop: {TRAILING_CALLBACK_RATE}%\n"
     msg += "الصفقات المفتوحة:\n"
     if not open_positions:
         msg += "لا توجد صفقات مفتوحة حاليًا.\n"
     else:
         for p in open_positions:
-            symbol = p["symbol"]
-            amt    = float(p["positionAmt"])
-            entry  = float(p["entryPrice"])
-            upnl   = float(p["unRealizedProfit"])
-            msg += f"- {symbol} | كمية: {amt} | سعر الدخول: {entry} | ربح/خسارة: {upnl:.2f}\n"
+            sym   = p["symbol"]
+            amt   = float(p["positionAmt"])
+            entry = float(p["entryPrice"])
+            upnl  = float(p["unRealizedProfit"])
+            msg  += f"- {sym} | كمية: {amt} | دخول: {entry} | ر/خ: {upnl:.2f} USDT\n"
 
     send_telegram(msg)
     last_daily_report_date = today
@@ -480,13 +610,13 @@ def send_daily_report(total_balance):
 
 @app.route("/")
 def home():
-    return "Binance Trading Bot is running."
+    return "Binance Trailing Bot v5 is running."
 
 def main_loop():
     global bot_start_balance, daily_start_balance, daily_reset_date
 
     logging.info("تم الاتصال بـ Binance بنجاح!")
-    logging.info("بوت التداول الذكي v4.1 - محسن مع إصلاح أخطاء الـ logs!")
+    logging.info("بوت التداول الذكي v5 — Trailing Stop")
 
     initial_balance     = get_futures_balance_usdt()
     bot_start_balance   = initial_balance
@@ -494,15 +624,18 @@ def main_loop():
     daily_reset_date    = datetime.utcnow().date()
 
     send_telegram(
-        f"🤖 بوت التداول الذكي v4.1 بدأ العمل بنجاح ✅\n"
+        f"🤖 بوت التداول v5 (Trailing Stop) بدأ العمل ✅\n"
         f"رصيد البداية: {initial_balance:.2f} USDT\n"
-        f"حد خسارة يومي: {DAILY_LOSS_LIMIT_PCT*100:.0f}% | حد خسارة إجمالي: {TOTAL_LOSS_LIMIT_PCT*100:.0f}%"
+        f"Trailing Callback: {TRAILING_CALLBACK_RATE}% | "
+        f"Activation: +{TRAILING_ACTIVATION_PCT*100:.1f}%\n"
+        f"حد خسارة يومي: {DAILY_LOSS_LIMIT_PCT*100:.0f}% | "
+        f"حد خسارة إجمالي: {TOTAL_LOSS_LIMIT_PCT*100:.0f}%"
     )
 
     cycle = 0
     while True:
         cycle += 1
-        logging.info(f"الدورة #{cycle} — البحث عن فرص شراء...")
+        logging.info(f"الدورة #{cycle} — البحث عن فرص + مراقبة الصفقات...")
 
         try:
             total_balance     = get_futures_balance_usdt()
@@ -510,13 +643,17 @@ def main_loop():
 
             logging.info(f"رصيد USDT: {total_balance:.2f} | متاح: {available_balance:.2f}")
 
+            # ================== مراقبة الصفقات المفتوحة أولاً ==================
+            if open_trades:
+                monitor_open_trades()
+
             if not check_bot_protection(total_balance):
                 logging.info("التداول محظور — تخطي هذه الدورة.")
                 time.sleep(40)
                 continue
 
             if available_balance <= 0:
-                logging.info("لا يوجد هامش متاح للتداول — جميع الصفقات مفتوحة.")
+                logging.info("لا يوجد هامش متاح — جميع الصفقات مفتوحة.")
                 time.sleep(40)
                 continue
 
@@ -543,21 +680,19 @@ def main_loop():
 
                 info = analyze_symbol(symbol)
 
-                # ✅ إصلاح: فلتر الحد الأدنى للنقاط
                 if info["score"] < MIN_SCORE:
                     logging.info(
                         f"{symbol}: مرفوض — نقاط ضعيفة ({info['score']} < {MIN_SCORE})"
                     )
                     continue
 
-                # ✅ إصلاح: فلتر مسبق لقيمة الصفقة قبل إضافته للمرشحين
+                # فلتر مسبق لقيمة الصفقة
                 ticker   = client.futures_symbol_ticker(symbol=symbol)
                 price    = float(ticker["price"])
                 notional, min_notional = estimate_notional(symbol, price, available_balance)
                 if notional < min_notional:
                     logging.info(
-                        f"{symbol}: مرفوض — قيمة الصفقة المتوقعة {notional:.2f} USDT "
-                        f"أقل من الحد الأدنى {min_notional} USDT"
+                        f"{symbol}: مرفوض — قيمة الصفقة {notional:.2f} < {min_notional} USDT"
                     )
                     continue
 
@@ -568,37 +703,33 @@ def main_loop():
                     f"RSI={info['rsi']} | MACD={'صاعد' if info['macd_bullish'] else 'هابط'}"
                 )
 
-            # ================== اختيار الأفضل ==================
-
+            # ================== اختيار الأفضل وفتح الصفقة ==================
             if not candidates:
                 logging.info("لا توجد فرص مناسبة في هذه الدورة.")
-                time.sleep(40)
-                continue
+            else:
+                # ترتيب: النقاط أولاً، ثم RSI الأقل عند التعادل
+                candidates.sort(key=lambda x: (-x["score"], x["rsi"]))
 
-            # ✅ إصلاح: ترتيب عند تعادل النقاط → يُفضَّل RSI الأقل (أقل تشبعاً بالشراء)
-            candidates.sort(key=lambda x: (-x["score"], x["rsi"]))
+                order_opened = False
+                for best in candidates:
+                    symbol = best["symbol"]
+                    price  = best["price"]
+                    logging.info(
+                        f"محاولة فتح صفقة: {symbol} "
+                        f"({best['score']} نقطة | RSI={best['rsi']})"
+                    )
+                    success = open_long_with_trailing(symbol, price, available_balance)
+                    if success:
+                        order_opened = True
+                        break
+                    else:
+                        logging.info(f"{symbol}: فشل — الانتقال للمرشح التالي...")
 
-            # ✅ إصلاح: تجربة المرشحين بالترتيب حتى ينجح واحد
-            order_opened = False
-            for best in candidates:
-                symbol = best["symbol"]
-                price  = best["price"]
-                logging.info(
-                    f"محاولة فتح صفقة: {symbol} ({best['score']} نقطة | RSI={best['rsi']})"
-                )
-                success = open_long_with_sl_tp(symbol, price, available_balance)
-                if success:
-                    order_opened = True
-                    break
-                else:
-                    logging.info(f"{symbol}: فشل فتح الصفقة — الانتقال للمرشح التالي...")
-
-            if not order_opened:
-                logging.info("فشلت كل المحاولات في هذه الدورة.")
+                if not order_opened:
+                    logging.info("فشلت كل المحاولات في هذه الدورة.")
 
             # ================== التقرير اليومي ==================
             now_utc = datetime.utcnow()
-            # ✅ إصلاح: التقرير عند الساعة 23:00 فقط (بدقيقة واحدة تحمل)
             if now_utc.hour == 23 and now_utc.minute == 0:
                 send_daily_report(total_balance)
 
