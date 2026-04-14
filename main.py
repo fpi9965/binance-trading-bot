@@ -3,67 +3,50 @@ import time
 import math
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 from binance.client import Client
 from binance.enums import *
 from flask import Flask
 import telebot
 
-# ==============================================================================
-# 1. إعدادات النظام والبيئة
-# ==============================================================================
+# ================== 1. الإعدادات العامة ==================
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY",    "YOUR_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",   "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
-# إعدادات التداول الأساسية
-RISK_PER_TRADE = 0.05      # 5% من الرصيد المتاح لكل صفقة
-LEVERAGE       = 20        # الرافعة المالية
-TIMEFRAME      = "15m"     # الفريم الرئيسي للتحليل
+RISK_PER_TRADE = 0.05  # 5% من الرصيد
+LEVERAGE       = 20
+TIMEFRAME      = "15m"
 
-# 🛡️ إعدادات الحماية المزدوجة (تعديلات v6.6)
-STOP_LOSS_PCT   = 0.02         # وقف خسارة ثابت 2% (لحماية رأس المال)
-TRAILING_CALLBACK_RATE = 1.0   # ملاحقة الربح (إغلاق عند ارتداد 1%)
-TRAILING_ACTIVATION_PCT = 0.005 # تفعيل الملاحقة بعد ربح 0.5% (تأمين الربح مبكراً)
+# 🛡️ إعدادات الحماية المزدوجة
+STOP_LOSS_PCT   = 0.02         
+TRAILING_CALLBACK_RATE = 1.0   
+TRAILING_ACTIVATION_PCT = 0.005 
 
-# فلاتر العملات
-TOP_SYMBOLS = [
-    "DOGEUSDT", "1000SHIBUSDT", "POLUSDT", "XRPUSDT", "SOLUSDT", 
-    "LTCUSDT", "LINKUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT"
-]
-MIN_24H_QUOTE_VOLUME = 1_500_000  # الحد الأدنى للسيولة
-MIN_SCORE_TO_ENTRY   = 40         # الحد الأدنى من النقاط للدخول
+TOP_SYMBOLS = ["DOGEUSDT", "1000SHIBUSDT", "POLUSDT", "XRPUSDT", "SOLUSDT", "LTCUSDT", "LINKUSDT"]
+MIN_24H_QUOTE_VOLUME = 1_000_000
+MIN_SCORE            = 35
 
-# إعدادات حماية المحفظة الكلية
-DAILY_LOSS_LIMIT_PCT = 0.05       # التوقف إذا خسر الحساب 5% في يوم
-TOTAL_LOSS_LIMIT_PCT = 0.15       # التوقف النهائي إذا خسر الحساب 15%
-
-# ==============================================================================
-# 2. تهيئة العملاء والمخازن المؤقتة
-# ==============================================================================
+# ================== 2. تهيئة النظام ==================
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 bot    = telebot.TeleBot(TELEGRAM_TOKEN)
 app    = Flask(__name__)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 _symbol_filters_cache = {}
-open_trades = {}  # لتتبع الصفقات الحالية
+open_trades = {}
 
-# متغيرات الرقابة المالية
-bot_start_balance    = None
+# متغيرات الرقابة
 daily_start_balance  = None
 daily_reset_date     = None
-bot_halted_total     = False
 bot_halted_daily     = False
 
-# ==============================================================================
-# 3. الدوال الحسابية والمؤشرات الفنية (النسخة الموسعة)
-# ==============================================================================
+# ================== 3. الدوال الحسابية والمؤشرات ==================
 
 def ema(values, period):
     if len(values) < period: return sum(values) / len(values)
@@ -74,7 +57,7 @@ def ema(values, period):
     return ema_val
 
 def compute_macd(closes, fast=12, slow=26, signal=9):
-    if len(closes) < slow + signal: return 0, 0, 0
+    if len(closes) < slow + signal: return 0, 0, False
     k_fast, k_slow = 2/(fast+1), 2/(slow+1)
     ema_f, ema_s = closes[0], closes[0]
     macd_line = []
@@ -83,48 +66,7 @@ def compute_macd(closes, fast=12, slow=26, signal=9):
         ema_s = c * k_slow + ema_s * (1 - k_slow)
         macd_line.append(ema_f - ema_s)
     sig_val = ema(macd_line, signal)
-    hist = macd_line[-1] - sig_val
-    return macd_line[-1], sig_val, hist
-
-def compute_rsi(closes, period=14):
-    if len(closes) < period: return 50
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0: return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def compute_atr(klines, period=14):
-    if len(klines) < period + 1: return 0
-    tr_list = []
-    for i in range(1, len(klines)):
-        h, l, pc = float(klines[i][2]), float(klines[i][3]), float(klines[i-1][4])
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        tr_list.append(tr)
-    return sum(tr_list[-period:]) / period
-
-def analyze_candles_multi(symbol):
-    results = {}
-    intervals = ["1m", "5m", "15m", "1h"]
-    for inv in intervals:
-        kl = client.futures_klines(symbol=symbol, interval=inv, limit=5)
-        o, h, l, c = float(kl[-1][1]), float(kl[-1][2]), float(kl[-1][3]), float(kl[-1][4])
-        body = abs(c - o)
-        range_t = h - l
-        if range_t == 0: results[inv] = "Neutral"
-        elif body <= range_t * 0.1: results[inv] = "Doji"
-        elif c > o: results[inv] = "Bullish"
-        else: results[inv] = "Bearish"
-    return results
-
-# ==============================================================================
-# 4. إدارة أوامر المنصة (الضبط الدقيق)
-# ==============================================================================
+    return macd_line[-1], sig_val, macd_line[-1] > sig_val
 
 def get_symbol_filters(symbol):
     if symbol in _symbol_filters_cache: return _symbol_filters_cache[symbol]
@@ -151,169 +93,119 @@ def adjust_price(symbol, price):
     precision = int(round(-math.log(tick, 10)))
     return float(f"{price:.{precision}f}")
 
-# ==============================================================================
-# 5. منطق الدخول والحماية المزدوجة (The Core Logic)
-# ==============================================================================
+# ================== 4. دالة فتح الصفقة (النسخة المصححة) ==================
 
 def open_long_position(symbol, entry_price, balance):
     try:
-        # 1. حد أقصى للصفقات لعدم تشتيت المحفظة
-        if len(open_trades) >= 3:
-            return False
+        # 1. فحص العدد الأقصى
+        if len(open_trades) >= 3: return False
 
-        # 2. الحصول على الرصيد المتاح الفعلي "الآن" من المحفظة
-        # نستخدم الطلب المباشر للمنصة لضمان أدق رقم
+        # 2. فحص الرصيد والكمية
         acc_info = client.futures_account()
-        available_balance = float(acc_info['availableBalance'])
+        avail_bal = float(acc_info['availableBalance'])
         
-        # أ- حساب الهامش المطلوب للصفقة
         lot, tick, min_notional = get_symbol_filters(symbol)
-        qty = adjust_quantity(symbol, (balance * RISK_PER_TRADE * LEVERAGE) / entry_price)
         
-        required_margin = (qty * entry_price) / LEVERAGE
+        raw_qty = (balance * RISK_PER_TRADE * LEVERAGE) / entry_price
+        qty = adjust_quantity(symbol, raw_qty)
 
-        # ب- فحص الأمان قبل إرسال أي أمر
-        if required_margin > available_balance:
-            # نطبع في السجل مرة واحدة بهدوء
-            logging.info(f"⚠️ الرصيد لا يكفي لـ {symbol} (المطلوب: {required_margin:.2f}, المتاح: {available_balance:.2f})")
+        # 🛑 حل مشكلة Quantity less than zero
+        if qty <= 0:
+            logging.warning(f"⚠️ {symbol}: الكمية ضئيلة جداً ({raw_qty}). تخطي الصفقة.")
             return False
 
-        # ج- ضبط الرافعة المالية
-        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+        # 🛑 حل مشكلة الهامش
+        required_margin = (qty * entry_price) / LEVERAGE
+        if required_margin > avail_bal:
+            logging.info(f"⚠️ رصيد غير كافٍ لـ {symbol}: متاح {avail_bal:.2f}, مطلوب {required_margin:.2f}")
+            return False
 
-        # د- تنفيذ أمر الشراء الرئيسي
+        if qty * entry_price < min_notional: return False
+
+        # 3. التنفيذ
+        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+        
         try:
             client.futures_create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty)
         except Exception as e:
-            if "Margin is insufficient" in str(e):
-                logging.warning(f"🚫 فشل نهائي في الهامش لـ {symbol} - يرجى فحص الأوامر المعلقة يدوياً.")
+            if "Margin is insufficient" in str(e) or "Quantity" in str(e):
                 return False
-            raise e # إذا كان خطأ آخر غير الهامش، أظهره
+            raise e
 
-        # هـ- جلب السعر الفعلي وإلغاء المعلقات
-        time.sleep(0.5)
-        pos_data = client.futures_position_information(symbol=symbol)[0]
-        actual_entry = float(pos_data['entryPrice'])
-        if actual_entry == 0: actual_entry = entry_price
+        # 4. إعداد الحماية
+        time.sleep(0.8)
+        pos = client.futures_position_information(symbol=symbol)[0]
+        actual_entry = float(pos['entryPrice']) or entry_price
 
         client.futures_cancel_all_open_orders(symbol=symbol)
 
-        # و- الدرع المزدوج (الوقف والملاحقة)
+        # الوقف الثابت
         sl_price = adjust_price(symbol, actual_entry * (1 - STOP_LOSS_PCT))
-        client.futures_create_order(
-            symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_STOP_MARKET,
-            stopPrice=sl_price, quantity=qty, reduceOnly=True
-        )
+        client.futures_create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_STOP_MARKET, stopPrice=sl_price, quantity=qty, reduceOnly=True)
 
+        # الملاحقة (Trailing)
         activation = adjust_price(symbol, actual_entry * (1 + TRAILING_ACTIVATION_PCT))
-        client.futures_create_order(
-            symbol=symbol, side=SIDE_SELL, type="TRAILING_STOP_MARKET",
-            quantity=qty, callbackRate=TRAILING_CALLBACK_RATE,
-            activationPrice=activation, reduceOnly=True, workingType="MARK_PRICE"
-        )
+        client.futures_create_order(symbol=symbol, side=SIDE_SELL, type="TRAILING_STOP_MARKET", quantity=qty, callbackRate=TRAILING_CALLBACK_RATE, activationPrice=activation, reduceOnly=True)
 
-        # ح- تليجرام
-        msg = (f"✅ **تم فتح صفقة {symbol}**\nدخول: {actual_entry}\nوقف: {sl_price}")
-        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
-        
+        bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **دخول صفقة {symbol}**\nسعر: {actual_entry}\nكمية: {qty}\nوقف: {sl_price}")
         open_trades[symbol] = {"entry": actual_entry, "qty": qty}
         return True
 
     except Exception as e:
-        # إذا استمر الخطأ رغم الفحص، سيتم طباعته هنا مرة واحدة فقط
-        logging.error(f"❌ خطأ غير متوقع في {symbol}: {e}")
+        logging.error(f"❌ خطأ فتح صفقة {symbol}: {e}")
         return False
 
-    except Exception as e:
-        logging.error(f"Error opening position for {symbol}: {e}")
-        return False
-
-# ==============================================================================
-# 6. نظام الفحص والتقييم (Score System)
-# ==============================================================================
-
-def scan_market():
-    global daily_start_balance, daily_reset_date, bot_halted_daily
-
-    try:
-        # فحص حماية الحساب اليومية
-        total_bal = float(next(b["balance"] for b in client.futures_account_balance() if b["asset"] == "USDT"))
-        avail_bal = float(next(b["availableBalance"] for b in client.futures_account_balance() if b["asset"] == "USDT"))
-
-        # تحديث رصيد البداية اليومي
-        today = datetime.utcnow().date()
-        if daily_reset_date != today:
-            daily_start_balance = total_bal
-            daily_reset_date = today
-            bot_halted_daily = False
-
-        if (daily_start_balance - total_bal) / daily_start_balance >= DAILY_LOSS_LIMIT_PCT:
-            if not bot_halted_daily:
-                bot_halted_daily = True
-                bot.send_message(TELEGRAM_CHAT_ID, "⚠️ تم بلوغ حد الخسارة اليومي. توقف التداول.")
-            return
-
-        for symbol in TOP_SYMBOLS:
-            if symbol in open_trades:
-                # التحقق إذا كانت الصفقة أغلقت من المنصة
-                pos = client.futures_position_information(symbol=symbol)[0]
-                if float(pos["positionAmt"]) == 0:
-                    bot.send_message(TELEGRAM_CHAT_ID, f"🏁 تم إغلاق صفقة {symbol} (ضرب الوقف أو جني الربح).")
-                    open_trades.pop(symbol)
-                continue
-
-            # تحليل البيانات الفنية
-            klines = client.futures_klines(symbol=symbol, interval=TIMEFRAME, limit=100)
-            closes = [float(k[4]) for k in klines]
-            
-            # حساب المؤشرات
-            macd_l, sig_l, hist = compute_macd(closes)
-            rsi_val = compute_rsi(closes)
-            candles = analyze_candles_multi(symbol)
-            
-            # نظام النقاط (The Scoring)
-            score = 0
-            if hist > 0: score += 20
-            if rsi_val < 65: score += 15
-            if candles["15m"] == "Bullish": score += 10
-            if candles["5m"] == "Bullish": score += 5
-            
-            # فحص الاتجاه العام (EMA 200)
-            ema200 = ema(closes, 200)
-            if closes[-1] > ema200: score += 20
-            
-            # فحص السيولة
-            ticker = client.futures_ticker(symbol=symbol)
-            volume = float(ticker['quoteVolume'])
-
-            if score >= MIN_SCORE_TO_ENTRY and volume >= MIN_24H_QUOTE_VOLUME:
-                open_long_position(symbol, float(ticker['lastPrice']), avail_bal)
-
-    except Exception as e:
-        logging.error(f"Scan error: {e}")
-
-# ==============================================================================
-# 7. تشغيل البوت والسيرفر
-# ==============================================================================
+# ================== 5. الحلقة الرئيسية ==================
 
 def main_loop():
-    global bot_start_balance, daily_start_balance, daily_reset_date
-    bot_start_balance = float(next(b["balance"] for b in client.futures_account_balance() if b["asset"] == "USDT"))
-    daily_start_balance = bot_start_balance
-    daily_reset_date = datetime.utcnow().date()
+    global daily_start_balance, daily_reset_date, bot_halted_daily
     
-    bot.send_message(TELEGRAM_CHAT_ID, f"🤖 تم تشغيل بوت التداول v6.6\nالرصيد: {bot_start_balance} USDT")
-    
+    initial_bal = float(next(b["balance"] for b in client.futures_account_balance() if b["asset"] == "USDT"))
+    daily_start_balance = initial_bal
+    daily_reset_date = datetime.now(timezone.utc).date()
+
     while True:
-        scan_market()
-        time.sleep(40) # فحص السوق كل 40 ثانية
+        try:
+            # تحديث يومي للوقت
+            now_utc = datetime.now(timezone.utc)
+            if now_utc.date() != daily_reset_date:
+                daily_reset_date = now_utc.date()
+                daily_start_balance = float(next(b["balance"] for b in client.futures_account_balance() if b["asset"] == "USDT"))
+                bot_halted_daily = False
+
+            # مراقبة الصفقات المفتوحة
+            for sym in list(open_trades.keys()):
+                pos = client.futures_position_information(symbol=sym)[0]
+                if float(pos["positionAmt"]) == 0:
+                    bot.send_message(TELEGRAM_CHAT_ID, f"🏁 تم إغلاق {sym}")
+                    open_trades.pop(sym)
+
+            # فحص السوق
+            current_total = float(next(b["balance"] for b in client.futures_account_balance() if b["asset"] == "USDT"))
+            for symbol in TOP_SYMBOLS:
+                if symbol in open_trades: continue
+                
+                klines = client.futures_klines(symbol=symbol, interval=TIMEFRAME, limit=100)
+                closes = [float(k[4]) for k in klines]
+                _, _, macd_bull = compute_macd(closes)
+                
+                if macd_bull:
+                    ticker = client.futures_ticker(symbol=symbol)
+                    if float(ticker['quoteVolume']) >= MIN_24H_QUOTE_VOLUME:
+                        open_long_position(symbol, float(ticker['lastPrice']), current_total)
+                        time.sleep(2) # تأخير بسيط لتحديث الرصيد
+
+            time.sleep(30)
+        except Exception as e:
+            logging.error(f"Main Loop Error: {e}")
+            time.sleep(10)
+
+# ================== 6. السيرفر ==================
 
 @app.route('/')
-def index(): return "Trading Bot is running..."
+def home(): return "Bot v6.8 is LIVE"
 
 if __name__ == "__main__":
-    # تشغيل منطق التداول في خيط منفصل
     threading.Thread(target=main_loop, daemon=True).start()
-    # تشغيل Flask للتوافق مع Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
