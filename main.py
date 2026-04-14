@@ -157,52 +157,54 @@ def adjust_price(symbol, price):
 
 def open_long_position(symbol, entry_price, balance):
     try:
-        # 1. فحص عدد الصفقات المفتوحة (تعديل لمنع استنزاف الهامش)
-        MAX_OPEN_TRADES = 3 # يمكنك تغيير الرقم حسب رغبتك
-        if len(open_trades) >= MAX_OPEN_TRADES:
-            logging.info(f"⏭️ تخطي {symbol}: تم الوصول للحد الأقصى من الصفقات ({MAX_OPEN_TRADES})")
+        # 1. حد أقصى للصفقات لعدم تشتيت المحفظة
+        if len(open_trades) >= 3:
             return False
 
-        # أ- ضبط الرافعة
-        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
-        lot, tick, min_notional = get_symbol_filters(symbol)
-
-        # ب- حساب الكمية وفحص الرصيد المتاح (التعديل الجوهري هنا) 🛡️
-        # نجلب الرصيد المتاح الفعلي من المنصة الآن
-        available_balance = float(next(b["availableBalance"] for b in client.futures_account_balance() if b["asset"] == "USDT"))
+        # 2. الحصول على الرصيد المتاح الفعلي "الآن" من المحفظة
+        # نستخدم الطلب المباشر للمنصة لضمان أدق رقم
+        acc_info = client.futures_account()
+        available_balance = float(acc_info['availableBalance'])
         
-        # حساب التكلفة المطلوبة (الهامش) لهذه الصفقة
+        # أ- حساب الهامش المطلوب للصفقة
+        lot, tick, min_notional = get_symbol_filters(symbol)
         qty = adjust_quantity(symbol, (balance * RISK_PER_TRADE * LEVERAGE) / entry_price)
+        
         required_margin = (qty * entry_price) / LEVERAGE
 
-        # إذا كان الهامش المطلوب أكبر من المتاح، نلغي العملية فوراً
+        # ب- فحص الأمان قبل إرسال أي أمر
         if required_margin > available_balance:
-            logging.warning(f"❌ رصيد غير كافٍ لفتح {symbol}: المطلوب {required_margin:.2f}, المتاح {available_balance:.2f}")
+            # نطبع في السجل مرة واحدة بهدوء
+            logging.info(f"⚠️ الرصيد لا يكفي لـ {symbol} (المطلوب: {required_margin:.2f}, المتاح: {available_balance:.2f})")
             return False
 
-        if qty * entry_price < min_notional:
-            return False
+        # ج- ضبط الرافعة المالية
+        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
 
-        # ج- تنفيذ أمر الشراء (Market)
-        client.futures_create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty)
-        
-        # د- الحصول على سعر الدخول الفعلي
+        # د- تنفيذ أمر الشراء الرئيسي
+        try:
+            client.futures_create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty)
+        except Exception as e:
+            if "Margin is insufficient" in str(e):
+                logging.warning(f"🚫 فشل نهائي في الهامش لـ {symbol} - يرجى فحص الأوامر المعلقة يدوياً.")
+                return False
+            raise e # إذا كان خطأ آخر غير الهامش، أظهره
+
+        # هـ- جلب السعر الفعلي وإلغاء المعلقات
         time.sleep(0.5)
-        pos = client.futures_position_information(symbol=symbol)[0]
-        actual_entry = float(pos['entryPrice'])
+        pos_data = client.futures_position_information(symbol=symbol)[0]
+        actual_entry = float(pos_data['entryPrice'])
         if actual_entry == 0: actual_entry = entry_price
 
-        # هـ- إلغاء أي أوامر قديمة عالقة لهذا الرمز
         client.futures_cancel_all_open_orders(symbol=symbol)
 
-        # و- وضع الدرع 1: Stop Loss ثابت
+        # و- الدرع المزدوج (الوقف والملاحقة)
         sl_price = adjust_price(symbol, actual_entry * (1 - STOP_LOSS_PCT))
         client.futures_create_order(
             symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_STOP_MARKET,
             stopPrice=sl_price, quantity=qty, reduceOnly=True
         )
 
-        # ز- وضع الدرع 2: Trailing Stop
         activation = adjust_price(symbol, actual_entry * (1 + TRAILING_ACTIVATION_PCT))
         client.futures_create_order(
             symbol=symbol, side=SIDE_SELL, type="TRAILING_STOP_MARKET",
@@ -210,17 +212,17 @@ def open_long_position(symbol, entry_price, balance):
             activationPrice=activation, reduceOnly=True, workingType="MARK_PRICE"
         )
 
-        # ح- إرسال تقرير تليجرام
-        msg = (f"✅ **صفقة LONG جديدة**\n"
-               f"الزوج: `{symbol}`\n"
-               f"الدخول: `{actual_entry}`\n"
-               f"الوقف الثابت: `{sl_price}`\n"
-               f"تفعيل الملاحقة: `{activation}`\n"
-               f"الكمية: `{qty}`")
+        # ح- تليجرام
+        msg = (f"✅ **تم فتح صفقة {symbol}**\nدخول: {actual_entry}\nوقف: {sl_price}")
         bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
         
         open_trades[symbol] = {"entry": actual_entry, "qty": qty}
         return True
+
+    except Exception as e:
+        # إذا استمر الخطأ رغم الفحص، سيتم طباعته هنا مرة واحدة فقط
+        logging.error(f"❌ خطأ غير متوقع في {symbol}: {e}")
+        return False
 
     except Exception as e:
         logging.error(f"Error opening position for {symbol}: {e}")
