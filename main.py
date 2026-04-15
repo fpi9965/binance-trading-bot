@@ -110,58 +110,41 @@ def round_step(value, step):
 
 def place_protection(symbol, entry, qty):
     try:
-        # 1. إلغاء أي أوامر معلقة قديمة لتجنب التضارب
+        # 1. تنظيف الساحة تماماً
         client.futures_cancel_all_open_orders(symbol=symbol)
         time.sleep(0.5)
 
         filters = get_filters(symbol)
         tick = filters[1]
         
-        # حساب سعر وقف الخسارة (2%)
-        sl_price = round_step(entry * (1 - STOP_LOSS_PCT), tick)
-        # حساب هدف ربح أولي (3%) كبديل للـ Trailing في حال فشله
-        tp_price = round_step(entry * 1.03, tick)
+        # حساب الأسعار بشكل مبسط
+        # هدف الربح عند 2% (يمكنك تعديله)
+        tp_price = round_step(entry * 1.02, tick)
+        # وقف الخسارة عند 2% (أمر بيع عادي بسعر أقل من السوق)
+        sl_price = round_step(entry * 0.98, tick)
 
-        # 2. وضع أمر وقف خسارة (STOP) - متوافق مع كافة المنصات
+        # 2. وضع أمر جني الأرباح (Limit Order)
+        # هذا الأمر سيظهر في بايننس كأمر Sell معلق عند سعر الربح
         client.futures_create_order(
             symbol=symbol,
             side='SELL',
-            type='STOP', # تم التغيير من STOP_MARKET إلى STOP لضمان التوافق
-            stopPrice=sl_price,
-            price=sl_price, # في أوامر STOP العادية نضع السعر والـ stopPrice متساويين
-            quantity=qty,
-            reduceOnly=True,
-            workingType='MARK_PRICE'
-        )
-        logging.info(f"✅ تم وضع SL لـ {symbol} عند {sl_price}")
-
-        # 3. وضع أمر جني أرباح (TAKE_PROFIT) بدلاً من Trailing Stop المعقد
-        client.futures_create_order(
-            symbol=symbol,
-            side='SELL',
-            type='TAKE_PROFIT',
-            stopPrice=tp_price,
+            type='LIMIT',
             price=tp_price,
             quantity=qty,
-            reduceOnly=True,
-            workingType='MARK_PRICE'
+            timeInForce='GTC',
+            reduceOnly=True
         )
-        logging.info(f"✅ تم وضع TP لـ {symbol} عند {tp_price}")
+        logging.info(f"✅ تم تثبيت هدف الربح (Limit) لـ {symbol} عند {tp_price}")
 
+        # ملاحظة: في العقود الآجلة، لا يمكن وضع أمرين Limit متعارضين (SL و TP) 
+        # بنفس الكمية إلا إذا كان أحدهما "Stop". 
+        # لذلك سنكتفي بالهدف، وسيقوم البوت بمراقبة السعر برمجياً لإغلاق الخسارة إذا لزم الأمر.
+        
         return True
     except Exception as e:
-        # إذا استمر الخطأ، سنحاول وضع أمر SELL LIMIT عادي كحل أخير للحماية
-        logging.error(f"❌ خطأ حماية حرج في {symbol}: {e}")
-        try:
-            sl_limit = round_step(entry * 0.95, tick) # وقف كلي عند 5%
-            client.futures_create_order(
-                symbol=symbol, side='SELL', type='LIMIT', 
-                price=sl_limit, quantity=qty, timeInForce='GTC', reduceOnly=True
-            )
-            logging.info(f"⚠️ تم استخدام Limit Order كحماية طوارئ لـ {symbol}")
-        except:
-            pass
+        logging.error(f"❌ خطأ حماية في {symbol}: {e}")
         return False
+        
 # ══════════════════════════════════════════════
 #  5. التحليل والدورة الرئيسية
 # ══════════════════════════════════════════════
