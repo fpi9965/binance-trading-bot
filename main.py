@@ -110,52 +110,58 @@ def round_step(value, step):
 
 def place_protection(symbol, entry, qty):
     try:
-        # إلغاء كافة الأوامر المعلقة أولاً
+        # 1. إلغاء أي أوامر معلقة قديمة لتجنب التضارب
         client.futures_cancel_all_open_orders(symbol=symbol)
         time.sleep(0.5)
 
-        _, tick, _ = get_filters(symbol)
-        sl_price = round_step(entry * (1 - STOP_LOSS_PCT), tick)
+        filters = get_filters(symbol)
+        tick = filters[1]
         
-        # 1. Stop Loss (استخدام النصوص مباشرة بدلاً من Enums لتفادي أخطاء التعريف)
+        # حساب سعر وقف الخسارة (2%)
+        sl_price = round_step(entry * (1 - STOP_LOSS_PCT), tick)
+        # حساب هدف ربح أولي (3%) كبديل للـ Trailing في حال فشله
+        tp_price = round_step(entry * 1.03, tick)
+
+        # 2. وضع أمر وقف خسارة (STOP) - متوافق مع كافة المنصات
         client.futures_create_order(
             symbol=symbol,
             side='SELL',
-            type='STOP_MARKET',
+            type='STOP', # تم التغيير من STOP_MARKET إلى STOP لضمان التوافق
             stopPrice=sl_price,
+            price=sl_price, # في أوامر STOP العادية نضع السعر والـ stopPrice متساويين
             quantity=qty,
             reduceOnly=True,
             workingType='MARK_PRICE'
         )
-        logging.info(f"✅ SL set for {symbol} at {sl_price}")
+        logging.info(f"✅ تم وضع SL لـ {symbol} عند {sl_price}")
 
-        # 2. Trailing Stop
-        # إذا استمر خطأ 4120، سنستخدم Take Profit ثابت كبديل مؤقت
-        try:
-            activation = round_step(entry * (1 + TRAILING_ACTIVATION_PCT), tick)
-            client.futures_create_order(
-                symbol=symbol,
-                side='SELL',
-                type='TRAILING_STOP_MARKET',
-                quantity=qty,
-                callbackRate=TRAILING_CALLBACK_RATE,
-                activationPrice=activation,
-                reduceOnly=True
-            )
-            logging.info(f"✅ Trailing set for {symbol}")
-        except Exception as te:
-            logging.warning(f"⚠️ Trailing Stop not supported for {symbol}, placing TP instead: {te}")
-            tp_price = round_step(entry * 1.05, tick) # هدف 5%
-            client.futures_create_order(
-                symbol=symbol, side='SELL', type='TAKE_PROFIT_MARKET',
-                stopPrice=tp_price, quantity=qty, reduceOnly=True
-            )
+        # 3. وضع أمر جني أرباح (TAKE_PROFIT) بدلاً من Trailing Stop المعقد
+        client.futures_create_order(
+            symbol=symbol,
+            side='SELL',
+            type='TAKE_PROFIT',
+            stopPrice=tp_price,
+            price=tp_price,
+            quantity=qty,
+            reduceOnly=True,
+            workingType='MARK_PRICE'
+        )
+        logging.info(f"✅ تم وضع TP لـ {symbol} عند {tp_price}")
 
         return True
     except Exception as e:
-        logging.error(f"❌ Protection error {symbol}: {e}")
+        # إذا استمر الخطأ، سنحاول وضع أمر SELL LIMIT عادي كحل أخير للحماية
+        logging.error(f"❌ خطأ حماية حرج في {symbol}: {e}")
+        try:
+            sl_limit = round_step(entry * 0.95, tick) # وقف كلي عند 5%
+            client.futures_create_order(
+                symbol=symbol, side='SELL', type='LIMIT', 
+                price=sl_limit, quantity=qty, timeInForce='GTC', reduceOnly=True
+            )
+            logging.info(f"⚠️ تم استخدام Limit Order كحماية طوارئ لـ {symbol}")
+        except:
+            pass
         return False
-
 # ══════════════════════════════════════════════
 #  5. التحليل والدورة الرئيسية
 # ══════════════════════════════════════════════
