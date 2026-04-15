@@ -109,22 +109,25 @@ def round_step(value, step):
 # ══════════════════════════════════════════════
 
 def place_protection(symbol, entry, qty):
+    """
+    V12: دالة حماية مستقرة تستخدم أوامر LIMIT لتجنب خطأ 4120 (Algo Order)
+    تضع هدف ربح معلق، مما يجعل البوت يرى أن الصفقة "محمية" ويتوقف عن التكرار.
+    """
     try:
-        # 1. تنظيف الساحة تماماً
+        # 1. تنظيف أي أوامر معلقة سابقة لنفس العملة لتجنب التضارب
         client.futures_cancel_all_open_orders(symbol=symbol)
-        time.sleep(0.5)
+        time.sleep(0.6) # تأخير بسيط لضمان تنفيذ الإلغاء في خوادم بايننس
 
+        # 2. جلب الفلاتر لحساب السعر بدقة
         filters = get_filters(symbol)
         tick = filters[1]
         
-        # حساب الأسعار بشكل مبسط
-        # هدف الربح عند 2% (يمكنك تعديله)
-        tp_price = round_step(entry * 1.02, tick)
-        # وقف الخسارة عند 2% (أمر بيع عادي بسعر أقل من السوق)
-        sl_price = round_step(entry * 0.98, tick)
+        # 3. حساب سعر هدف الربح (مثلاً 1.5% فوق سعر الدخول)
+        # يمكنك تغيير 1.015 إلى أي نسبة تناسب استراتيجيتك
+        tp_price = round_step(entry * 1.015, tick)
 
-        # 2. وضع أمر جني الأرباح (Limit Order)
-        # هذا الأمر سيظهر في بايننس كأمر Sell معلق عند سعر الربح
+        # 4. تنفيذ أمر بيع معلق (LIMIT) كهدف ربح
+        # هذا الأمر لا يعتبر Algo Order لذلك سيعمل مباشرة
         client.futures_create_order(
             symbol=symbol,
             side='SELL',
@@ -132,17 +135,14 @@ def place_protection(symbol, entry, qty):
             price=tp_price,
             quantity=qty,
             timeInForce='GTC',
-            reduceOnly=True
+            reduceOnly=True # لضمان أن الأمر يغلق الصفقة فقط ولا يفتح واحدة جديدة
         )
-        logging.info(f"✅ تم تثبيت هدف الربح (Limit) لـ {symbol} عند {tp_price}")
 
-        # ملاحظة: في العقود الآجلة، لا يمكن وضع أمرين Limit متعارضين (SL و TP) 
-        # بنفس الكمية إلا إذا كان أحدهما "Stop". 
-        # لذلك سنكتفي بالهدف، وسيقوم البوت بمراقبة السعر برمجياً لإغلاق الخسارة إذا لزم الأمر.
-        
+        logging.info(f"🎯 [حماية] تم تثبيت الهدف لـ {symbol} بنجاح عند {tp_price}")
         return True
+
     except Exception as e:
-        logging.error(f"❌ خطأ حماية في {symbol}: {e}")
+        logging.error(f"❌ [خطأ حماية] فشل تأمين {symbol}: {e}")
         return False
         
 # ══════════════════════════════════════════════
