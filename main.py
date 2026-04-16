@@ -14,10 +14,6 @@ from binance.enums import *
 from flask import Flask
 import telebot
 
-# ══════════════════════════════════════════════
-#  1. الإعدادات
-# ══════════════════════════════════════════════
-
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY",    "YOUR_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
@@ -28,7 +24,6 @@ LEVERAGE        = 20
 TIMEFRAME       = "15m"
 MAX_OPEN_TRADES = 3
 
-# 🛡️ الحماية
 STOP_LOSS_PCT           = 0.02
 TRAILING_CALLBACK_RATE  = 1.0
 TRAILING_ACTIVATION_PCT = 0.005
@@ -40,12 +35,8 @@ TOP_SYMBOLS = [
     "DOGEUSDT", "XRPUSDT", "SOLUSDT",
     "LTCUSDT",  "LINKUSDT", "POLUSDT"
 ]
-MIN_24H_QUOTE_VOLUME = 500_000   # خُفِّض من 1M
-MIN_SCORE            = 20        # خُفِّض من 35 — MACD صاعد يكفي
-
-# ══════════════════════════════════════════════
-#  2. تهيئة النظام
-# ══════════════════════════════════════════════
+MIN_24H_QUOTE_VOLUME = 500_000
+MIN_SCORE            = 20
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 bot    = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -68,10 +59,12 @@ def algo_create_order(side: str, order_type: str, symbol: str, **kwargs) -> dict
     params.update(kwargs)
     qs = _sign_algo(params)
     r = requests.post(f"{ALGO_URL}?{qs}", headers=headers, timeout=10)
-    data = r.json()
     if r.status_code != 200:
-        raise Exception(data)
-    return data
+        raise Exception(f"HTTP {r.status_code}: {r.text[:200]}")
+    try:
+        return r.json()
+    except Exception:
+        raise Exception(f"Invalid JSON: {r.text[:200]}")
 
 logging.basicConfig(
     level  = logging.INFO,
@@ -79,7 +72,7 @@ logging.basicConfig(
 )
 
 _filters_cache: dict = {}
-open_trades:    dict = {}   # { symbol: {entry, qty, open_time} }
+open_trades:    dict = {}
 
 bot_start_balance:   float = 0.0
 daily_start_balance: float = 0.0
@@ -87,10 +80,6 @@ daily_reset_date           = None
 bot_halted_total           = False
 bot_halted_daily           = False
 _last_report_date          = None
-
-# ══════════════════════════════════════════════
-#  3. دوال مساعدة
-# ══════════════════════════════════════════════
 
 def utcnow():
     return datetime.now(timezone.utc)
@@ -118,7 +107,6 @@ def get_available_margin() -> float:
     return 0.0
 
 def get_filters(symbol: str) -> tuple:
-    """(lot_size, tick_size, min_notional) — يُجلب مرة واحدة لكل الرموز"""
     if symbol in _filters_cache:
         return _filters_cache[symbol]
     if not _filters_cache:
@@ -156,19 +144,14 @@ def round_price(symbol: str, price: float) -> float:
     return float(f"{price:.{prec}f}")
 
 def get_actual_position(symbol: str) -> tuple:
-    """يُعيد (positionAmt, entryPrice)"""
     try:
         for p in client.futures_position_information(symbol=symbol):
             amt   = float(p["positionAmt"])
             entry = float(p["entryPrice"])
-            return amt, entry   # يُعيد أول سجل دائماً
+            return amt, entry
     except Exception as e:
         logging.warning(f"get_actual_position {symbol}: {e}")
     return 0.0, 0.0
-
-# ══════════════════════════════════════════════
-#  4. إدارة الحماية
-# ══════════════════════════════════════════════
 
 PROTECTION_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"}
 
@@ -185,9 +168,6 @@ def cancel_protection_orders(symbol: str):
         logging.error(f"cancel_protection_orders {symbol}: {e}")
 
 def place_protection(symbol: str, entry: float, qty: float) -> bool:
-    """
-    SL ثابت + Trailing Stop — بالكمية الفعلية للوضعية
-    """
     if qty <= 0:
         logging.error(f"place_protection: qty=0 لـ {symbol}")
         return False
@@ -197,7 +177,6 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
 
     ok_sl = ok_tr = False
 
-    # — Stop Loss ثابت (Algo API) —
     sl_price = round_price(symbol, entry * (1 - STOP_LOSS_PCT))
     try:
         algo_create_order(
@@ -211,7 +190,6 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
         logging.error(f"❌ SL فشل {symbol}: {e}")
         send_telegram(f"⚠️ *فشل SL* لـ `{symbol}`\n`{e}`")
 
-    # — Trailing Stop (Algo API) —
     activation = round_price(symbol, entry * (1 + TRAILING_ACTIVATION_PCT))
     try:
         algo_create_order(
@@ -227,21 +205,10 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
 
     return ok_sl or ok_tr
 
-# ══════════════════════════════════════════════
-#  5. تبنّي الوضعيات الحالية
-# ══════════════════════════════════════════════
-
 def adopt_existing_positions():
-    """
-    ✅ إصلاح v9:
-    يجلب كل الوضعيات بطريقتين:
-    1. futures_position_information() بدون symbol — يُعيد كل الرموز
-    2. يفلتر أي positionAmt != 0
-    """
     logging.info("🔍 جلب كل الوضعيات المفتوحة...")
     adopted = 0
     try:
-        # ✅ جلب الكل دفعة واحدة بدون تحديد رمز
         all_positions = client.futures_position_information()
         logging.info(f"إجمالي الرموز في الحساب: {len(all_positions)}")
 
@@ -251,7 +218,7 @@ def adopt_existing_positions():
             entry = float(p["entryPrice"])
 
             if abs(amt) < 1e-8 or entry == 0:
-                continue   # وضعية فارغة
+                continue
 
             logging.info(f"وضعية موجودة: {sym} | كمية={amt} | دخول={entry}")
 
@@ -262,14 +229,12 @@ def adopt_existing_positions():
                 )
                 continue
 
-            # LONG — أضفها للسجل
             open_trades[sym] = {
                 "entry":     entry,
                 "qty":       abs(amt),
                 "open_time": utcnow()
             }
 
-            # فحص الحماية الحالية
             try:
                 orders    = client.futures_get_open_orders(symbol=sym)
                 has_sl    = any(o["type"] == "STOP_MARKET"          for o in orders)
@@ -289,7 +254,6 @@ def adopt_existing_positions():
         logging.error(f"adopt_existing_positions: {e}")
         send_telegram(f"⚠️ خطأ في قراءة الوضعيات:\n`{e}`")
 
-    # تقرير التبنّي
     msg = f"🔄 *تبنّي الوضعيات — v9*\nعقود LONG مفتوحة: `{adopted}`\n"
     if open_trades:
         for sym, t in open_trades.items():
@@ -299,16 +263,11 @@ def adopt_existing_positions():
     send_telegram(msg)
     logging.info(f"تبنّي: {adopted} وضعية")
 
-# ══════════════════════════════════════════════
-#  6. مراقبة الصفقات
-# ══════════════════════════════════════════════
-
 def monitor_trades():
     for symbol in list(open_trades.keys()):
         try:
             amt, _ = get_actual_position(symbol)
 
-            # الصفقة أُغلقت
             if abs(amt) < 1e-8:
                 trade    = open_trades.pop(symbol)
                 duration = utcnow() - trade["open_time"]
@@ -327,7 +286,6 @@ def monitor_trades():
                 logging.info(f"صفقة مُغلقة: {symbol}")
                 continue
 
-            # الصفقة مفتوحة — فحص الحماية
             orders    = client.futures_get_open_orders(symbol=symbol)
             has_sl    = any(o["type"] == "STOP_MARKET"          for o in orders)
             has_trail = any(o["type"] == "TRAILING_STOP_MARKET"  for o in orders)
@@ -363,10 +321,6 @@ def monitor_trades():
 
         except Exception as e:
             logging.error(f"monitor_trades {symbol}: {e}")
-
-# ══════════════════════════════════════════════
-#  7. حماية الرصيد
-# ══════════════════════════════════════════════
 
 def close_all_futures(reason: str):
     send_telegram(f"🚨 *إغلاق إجباري*\nالسبب: {reason}")
@@ -422,10 +376,6 @@ def check_protection(balance: float) -> bool:
 
     return True
 
-# ══════════════════════════════════════════════
-#  8. المؤشرات الفنية
-# ══════════════════════════════════════════════
-
 def ema_calc(values, period):
     if len(values) < period:
         return sum(values) / len(values)
@@ -458,28 +408,21 @@ def compute_macd_bull(closes, fast=12, slow=26, signal=9) -> bool:
     return line[-1] > ema_calc(line, signal)
 
 def score_symbol(symbol: str) -> dict | None:
-    """
-    ✅ v9: لوق تفصيلي لكل رمز لمعرفة سبب الرفض
-    """
     try:
-        # بيانات 15m
         klines = client.futures_klines(symbol=symbol, interval=TIMEFRAME, limit=150)
         closes = [float(k[4]) for k in klines]
         macd_bull = compute_macd_bull(closes)
         rsi       = compute_rsi(closes)
 
-        # فلتر الترند EMA200 ساعية
         h_klines = client.futures_klines(symbol=symbol, interval="1h", limit=210)
         h_closes = [float(k[4]) for k in h_klines]
         ema200   = ema_calc(h_closes, 200)
         uptrend  = h_closes[-1] >= ema200 * 0.98
 
-        # حجم التداول
         ticker       = client.futures_ticker(symbol=symbol)
         quote_volume = float(ticker.get("quoteVolume", 0))
         price        = float(ticker["lastPrice"])
 
-        # ✅ لوق تفصيلي لكل رمز
         logging.info(
             f"{symbol}: MACD={'✅صاعد' if macd_bull else '❌هابط'} | "
             f"RSI={rsi:.1f} | "
@@ -506,10 +449,6 @@ def score_symbol(symbol: str) -> dict | None:
     except Exception as e:
         logging.warning(f"score_symbol {symbol}: {e}")
         return None
-
-# ══════════════════════════════════════════════
-#  9. فتح صفقة
-# ══════════════════════════════════════════════
 
 def open_long(symbol: str, price: float, total_balance: float) -> bool:
     if len(open_trades) >= MAX_OPEN_TRADES:
@@ -541,19 +480,16 @@ def open_long(symbol: str, price: float, total_balance: float) -> bool:
             logging.info(f"⚠️ {symbol}: هامش مطلوب {req_margin:.2f} > متاح {avail:.2f}")
             return False
 
-        # ضبط الرافعة
         try:
             client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
         except Exception as e:
             logging.warning(f"رافعة {symbol}: {e}")
 
-        # أمر الدخول
         client.futures_create_order(
             symbol=symbol, side=SIDE_BUY,
             type=ORDER_TYPE_MARKET, quantity=qty
         )
 
-        # انتظار التأكيد
         time.sleep(1.5)
         actual_amt, actual_entry = get_actual_position(symbol)
 
@@ -565,7 +501,6 @@ def open_long(symbol: str, price: float, total_balance: float) -> bool:
         actual_qty   = abs(actual_amt)
         actual_entry = actual_entry or price
 
-        # ✅ الحماية بالكمية الفعلية دائماً
         ok = place_protection(symbol, actual_entry, actual_qty)
 
         open_trades[symbol] = {
@@ -586,10 +521,6 @@ def open_long(symbol: str, price: float, total_balance: float) -> bool:
     except Exception as e:
         logging.error(f"open_long {symbol}: {e}")
         return False
-
-# ══════════════════════════════════════════════
-#  10. التقرير اليومي
-# ══════════════════════════════════════════════
 
 def send_daily_report(balance: float):
     global _last_report_date
@@ -612,10 +543,6 @@ def send_daily_report(balance: float):
     except Exception as e:
         logging.error(f"send_daily_report: {e}")
 
-# ══════════════════════════════════════════════
-#  11. الحلقة الرئيسية
-# ══════════════════════════════════════════════
-
 def main_loop():
     global bot_start_balance, daily_start_balance, daily_reset_date
 
@@ -632,7 +559,6 @@ def main_loop():
         f"أقصى صفقات: `{MAX_OPEN_TRADES}` | حد الدخول: `{MIN_SCORE}` نقطة"
     )
 
-    # ✅ تبنّي الوضعيات أول شيء
     adopt_existing_positions()
 
     cycle = 0
@@ -644,27 +570,22 @@ def main_loop():
             avail   = get_available_margin()
             logging.info(f"رصيد: {balance:.2f} | متاح: {avail:.2f} | صفقات: {len(open_trades)}")
 
-            # 1. مراقبة الصفقات
             monitor_trades()
 
-            # 2. حماية الرصيد
             if not check_protection(balance):
                 time.sleep(40)
                 continue
 
-            # 3. فحص الهامش
             if avail < 1.0:
                 logging.info("هامش < 1 USDT — تخطي")
                 time.sleep(40)
                 continue
 
-            # 4. حد الصفقات
             if len(open_trades) >= MAX_OPEN_TRADES:
                 logging.info(f"الحد الأقصى {MAX_OPEN_TRADES} — لا دخول جديد")
                 time.sleep(40)
                 continue
 
-            # 5. تقييم الفرص
             candidates = []
             seen = set()
             for symbol in TOP_SYMBOLS:
@@ -689,7 +610,6 @@ def main_loop():
 
                 candidates.append(r)
 
-            # 6. فتح الأفضل
             if candidates:
                 candidates.sort(key=lambda x: (-x["score"], x["rsi"]))
                 logging.info(f"المرشحون: {[(c['symbol'], c['score']) for c in candidates]}")
@@ -700,7 +620,6 @@ def main_loop():
             else:
                 logging.info("لا فرص — السوق لا يستوفي شروط الدخول.")
 
-            # 7. تقرير يومي
             now = utcnow()
             if now.hour == 23 and now.minute == 0:
                 send_daily_report(balance)
@@ -710,10 +629,6 @@ def main_loop():
             send_telegram(f"⚠️ خطأ:\n`{e}`")
 
         time.sleep(30)
-
-# ══════════════════════════════════════════════
-#  12. السيرفر
-# ══════════════════════════════════════════════
 
 @app.route("/")
 def home():
