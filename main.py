@@ -1,8 +1,12 @@
 import os
 import time
 import math
+import hmac
+import hashlib
+import urllib.parse
 import logging
 import threading
+import requests
 from datetime import datetime, timezone
 
 from binance.client import Client
@@ -46,6 +50,28 @@ MIN_SCORE            = 20        # خُفِّض من 35 — MACD صاعد يكف
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 bot    = telebot.TeleBot(TELEGRAM_TOKEN)
 app    = Flask(__name__)
+
+ALGO_URL = "https://fapi.binance.com/fapi/v1/algo/futures"
+
+def _sign_algo(params: dict) -> dict:
+    ts = int(time.time() * 1000)
+    params["timestamp"] = ts
+    qs = urllib.parse.urlencode(params)
+    sig = hmac.new(
+        BINANCE_API_SECRET.encode(), qs.encode(), hashlib.sha256
+    ).hexdigest()
+    return f"{qs}&signature={sig}"
+
+def algo_create_order(side: str, order_type: str, symbol: str, **kwargs) -> dict:
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    params = {"symbol": symbol, "side": side, "orderType": order_type, "recvWindow": 5000}
+    params.update(kwargs)
+    qs = _sign_algo(params)
+    r = requests.post(f"{ALGO_URL}?{qs}", headers=headers, timeout=10)
+    data = r.json()
+    if r.status_code != 200:
+        raise Exception(data)
+    return data
 
 logging.basicConfig(
     level  = logging.INFO,
@@ -174,14 +200,10 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
     # — Stop Loss ثابت (Algo API) —
     sl_price = round_price(symbol, entry * (1 - STOP_LOSS_PCT))
     try:
-        client.futures_algo_create_order(
-            symbol      = symbol,
-            side        = "SELL",
-            orderType   = "STOP_MARKET",
-            stopPrice   = str(sl_price),
-            quantity    = str(qty),
-            workingType = "MARK_PRICE",
-            reduceOnly  = True
+        algo_create_order(
+            side="SELL", order_type="STOP_MARKET", symbol=symbol,
+            stopPrice=str(sl_price), quantity=str(qty),
+            workingType="MARK_PRICE", reduceOnly=True
         )
         ok_sl = True
         logging.info(f"✅ SL={sl_price} qty={qty} لـ {symbol}")
@@ -192,15 +214,10 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
     # — Trailing Stop (Algo API) —
     activation = round_price(symbol, entry * (1 + TRAILING_ACTIVATION_PCT))
     try:
-        client.futures_algo_create_order(
-            symbol          = symbol,
-            side            = "SELL",
-            orderType       = "TRAILING_STOP_MARKET",
-            quantity        = str(qty),
-            callbackRate    = str(TRAILING_CALLBACK_RATE),
-            activationPrice = str(activation),
-            workingType     = "MARK_PRICE",
-            reduceOnly      = True
+        algo_create_order(
+            side="SELL", order_type="TRAILING_STOP_MARKET", symbol=symbol,
+            quantity=str(qty), callbackRate=str(TRAILING_CALLBACK_RATE),
+            activationPrice=str(activation), workingType="MARK_PRICE", reduceOnly=True
         )
         ok_tr = True
         logging.info(f"✅ Trailing {TRAILING_CALLBACK_RATE}% @{activation} لـ {symbol}")
@@ -323,8 +340,8 @@ def monitor_trades():
             elif not has_sl:
                 sl_price = round_price(symbol, open_trades[symbol]["entry"] * (1 - STOP_LOSS_PCT))
                 try:
-                    client.futures_algo_create_order(
-                        symbol=symbol, side="SELL", orderType="STOP_MARKET",
+                    algo_create_order(
+                        side="SELL", order_type="STOP_MARKET", symbol=symbol,
                         stopPrice=str(sl_price), quantity=str(abs(amt)),
                         reduceOnly=True, workingType="MARK_PRICE"
                     )
@@ -335,8 +352,8 @@ def monitor_trades():
             elif not has_trail:
                 activation = round_price(symbol, open_trades[symbol]["entry"] * (1 + TRAILING_ACTIVATION_PCT))
                 try:
-                    client.futures_algo_create_order(
-                        symbol=symbol, side="SELL", orderType="TRAILING_STOP_MARKET",
+                    algo_create_order(
+                        side="SELL", order_type="TRAILING_STOP_MARKET", symbol=symbol,
                         quantity=str(abs(amt)), callbackRate=str(TRAILING_CALLBACK_RATE),
                         activationPrice=str(activation), reduceOnly=True, workingType="MARK_PRICE"
                     )
