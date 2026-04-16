@@ -171,17 +171,17 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
 
     ok_sl = ok_tr = False
 
-    # — Stop Loss ثابت —
+    # — Stop Loss ثابت (Algo API) —
     sl_price = round_price(symbol, entry * (1 - STOP_LOSS_PCT))
     try:
-        client.futures_create_order(
+        client.futures_algo_create_order(
             symbol      = symbol,
-            side        = SIDE_SELL,
-            type        = ORDER_TYPE_STOP_MARKET,
-            stopPrice   = sl_price,
-            quantity    = qty,
-            reduceOnly  = True,
-            workingType = "MARK_PRICE"
+            side        = "SELL",
+            orderType   = "STOP_MARKET",
+            stopPrice   = str(sl_price),
+            quantity    = str(qty),
+            workingType = "MARK_PRICE",
+            reduceOnly  = True
         )
         ok_sl = True
         logging.info(f"✅ SL={sl_price} qty={qty} لـ {symbol}")
@@ -189,18 +189,18 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
         logging.error(f"❌ SL فشل {symbol}: {e}")
         send_telegram(f"⚠️ *فشل SL* لـ `{symbol}`\n`{e}`")
 
-    # — Trailing Stop —
+    # — Trailing Stop (Algo API) —
     activation = round_price(symbol, entry * (1 + TRAILING_ACTIVATION_PCT))
     try:
-        client.futures_create_order(
+        client.futures_algo_create_order(
             symbol          = symbol,
-            side            = SIDE_SELL,
-            type            = "TRAILING_STOP_MARKET",
-            quantity        = qty,
-            callbackRate    = TRAILING_CALLBACK_RATE,
-            activationPrice = activation,
-            reduceOnly      = True,
-            workingType     = "MARK_PRICE"
+            side            = "SELL",
+            orderType       = "TRAILING_STOP_MARKET",
+            quantity        = str(qty),
+            callbackRate    = str(TRAILING_CALLBACK_RATE),
+            activationPrice = str(activation),
+            workingType     = "MARK_PRICE",
+            reduceOnly      = True
         )
         ok_tr = True
         logging.info(f"✅ Trailing {TRAILING_CALLBACK_RATE}% @{activation} لـ {symbol}")
@@ -323,9 +323,9 @@ def monitor_trades():
             elif not has_sl:
                 sl_price = round_price(symbol, open_trades[symbol]["entry"] * (1 - STOP_LOSS_PCT))
                 try:
-                    client.futures_create_order(
-                        symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_STOP_MARKET,
-                        stopPrice=sl_price, quantity=abs(amt),
+                    client.futures_algo_create_order(
+                        symbol=symbol, side="SELL", orderType="STOP_MARKET",
+                        stopPrice=str(sl_price), quantity=str(abs(amt)),
                         reduceOnly=True, workingType="MARK_PRICE"
                     )
                     logging.info(f"✅ SL أُعيد: {symbol}")
@@ -335,10 +335,10 @@ def monitor_trades():
             elif not has_trail:
                 activation = round_price(symbol, open_trades[symbol]["entry"] * (1 + TRAILING_ACTIVATION_PCT))
                 try:
-                    client.futures_create_order(
-                        symbol=symbol, side=SIDE_SELL, type="TRAILING_STOP_MARKET",
-                        quantity=abs(amt), callbackRate=TRAILING_CALLBACK_RATE,
-                        activationPrice=activation, reduceOnly=True, workingType="MARK_PRICE"
+                    client.futures_algo_create_order(
+                        symbol=symbol, side="SELL", orderType="TRAILING_STOP_MARKET",
+                        quantity=str(abs(amt)), callbackRate=str(TRAILING_CALLBACK_RATE),
+                        activationPrice=str(activation), reduceOnly=True, workingType="MARK_PRICE"
                     )
                     logging.info(f"✅ Trailing أُعيد: {symbol}")
                 except Exception as e:
