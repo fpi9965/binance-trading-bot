@@ -19,17 +19,16 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
-RISK_PER_TRADE  = 0.05   # 5% من الرصيد لكل صفقة جديدة
+RISK_PER_TRADE  = 0.05
 LEVERAGE        = 20
 TIMEFRAME       = "15m"
-MAX_OPEN_TRADES = 3      # أقصى عدد عقود آجلة في نفس الوقت
+MAX_OPEN_TRADES = 3
 
-# 🛡️ إعدادات الحماية
-STOP_LOSS_PCT           = 0.02    # 2%  وقف خسارة ثابت (شبكة أمان)
-TRAILING_CALLBACK_RATE  = 1.0     # 1%  trailing
-TRAILING_ACTIVATION_PCT = 0.005   # +0.5% من الدخول لتفعيل الـ trailing
+# 🛡️ الحماية
+STOP_LOSS_PCT           = 0.02
+TRAILING_CALLBACK_RATE  = 1.0
+TRAILING_ACTIVATION_PCT = 0.005
 
-# حماية الرصيد
 DAILY_LOSS_LIMIT_PCT = 0.05
 TOTAL_LOSS_LIMIT_PCT = 0.15
 
@@ -37,8 +36,8 @@ TOP_SYMBOLS = [
     "DOGEUSDT", "XRPUSDT", "SOLUSDT",
     "LTCUSDT",  "LINKUSDT", "POLUSDT"
 ]
-MIN_24H_QUOTE_VOLUME = 1_000_000
-MIN_SCORE            = 35
+MIN_24H_QUOTE_VOLUME = 500_000   # خُفِّض من 1M
+MIN_SCORE            = 20        # خُفِّض من 35 — MACD صاعد يكفي
 
 # ══════════════════════════════════════════════
 #  2. تهيئة النظام
@@ -54,18 +53,14 @@ logging.basicConfig(
 )
 
 _filters_cache: dict = {}
+open_trades:    dict = {}   # { symbol: {entry, qty, open_time} }
 
-# سجل العقود الآجلة المفتوحة فقط
-# { symbol: { "entry": float, "qty": float, "open_time": datetime } }
-open_trades: dict = {}
-
-# حماية الرصيد
-bot_start_balance:   float | None = None
-daily_start_balance: float | None = None
-daily_reset_date                  = None
-bot_halted_total  = False
-bot_halted_daily  = False
-_last_report_date = None
+bot_start_balance:   float = 0.0
+daily_start_balance: float = 0.0
+daily_reset_date           = None
+bot_halted_total           = False
+bot_halted_daily           = False
+_last_report_date          = None
 
 # ══════════════════════════════════════════════
 #  3. دوال مساعدة
@@ -78,10 +73,9 @@ def send_telegram(msg: str):
     try:
         bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
     except Exception as e:
-        logging.error(f"Telegram error: {e}")
+        logging.error(f"Telegram: {e}")
 
 def get_futures_balance() -> float:
-    """الرصيد الكلي في حساب العقود الآجلة فقط — لا يمس الـ Spot"""
     try:
         for b in client.futures_account_balance():
             if b["asset"] == "USDT":
@@ -91,16 +85,14 @@ def get_futures_balance() -> float:
     return 0.0
 
 def get_available_margin() -> float:
-    """الهامش الحر في العقود الآجلة"""
     try:
-        acc = client.futures_account()
-        return float(acc["availableBalance"])
+        return float(client.futures_account()["availableBalance"])
     except Exception as e:
         logging.error(f"get_available_margin: {e}")
     return 0.0
 
-def get_filters(symbol: str) -> tuple[float, float, float]:
-    """(lot_size, tick_size, min_notional) — يُجلَب مرة واحدة لكل الرموز"""
+def get_filters(symbol: str) -> tuple:
+    """(lot_size, tick_size, min_notional) — يُجلب مرة واحدة لكل الرموز"""
     if symbol in _filters_cache:
         return _filters_cache[symbol]
     if not _filters_cache:
@@ -120,7 +112,7 @@ def get_filters(symbol: str) -> tuple[float, float, float]:
                 if lot and tick:
                     _filters_cache[sym] = (lot, tick, notional)
         except Exception as e:
-            logging.error(f"get_filters exchange_info: {e}")
+            logging.error(f"get_filters: {e}")
     return _filters_cache.get(symbol, (0.001, 0.01, 5.0))
 
 def round_qty(symbol: str, qty: float) -> float:
@@ -137,26 +129,24 @@ def round_price(symbol: str, price: float) -> float:
     prec = max(0, round(-math.log10(tick)))
     return float(f"{price:.{prec}f}")
 
-def get_actual_position(symbol: str) -> tuple[float, float]:
-    """يُعيد (positionAmt, entryPrice) من الوضعية الفعلية"""
+def get_actual_position(symbol: str) -> tuple:
+    """يُعيد (positionAmt, entryPrice)"""
     try:
         for p in client.futures_position_information(symbol=symbol):
             amt   = float(p["positionAmt"])
             entry = float(p["entryPrice"])
-            if abs(amt) > 0:
-                return amt, entry
+            return amt, entry   # يُعيد أول سجل دائماً
     except Exception as e:
         logging.warning(f"get_actual_position {symbol}: {e}")
     return 0.0, 0.0
 
 # ══════════════════════════════════════════════
-#  4. إدارة أوامر الحماية
+#  4. إدارة الحماية
 # ══════════════════════════════════════════════
 
 PROTECTION_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"}
 
 def cancel_protection_orders(symbol: str):
-    """يلغي SL / TP / Trailing فقط — لا يمس أوامر الدخول"""
     try:
         for o in client.futures_get_open_orders(symbol=symbol):
             if o["type"] in PROTECTION_TYPES:
@@ -164,25 +154,24 @@ def cancel_protection_orders(symbol: str):
                     client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
                     logging.info(f"إلغاء {o['type']} لـ {symbol}")
                 except Exception as e:
-                    logging.warning(f"فشل إلغاء {o['type']} {symbol}: {e}")
+                    logging.warning(f"فشل إلغاء {symbol}: {e}")
     except Exception as e:
         logging.error(f"cancel_protection_orders {symbol}: {e}")
 
 def place_protection(symbol: str, entry: float, qty: float) -> bool:
     """
-    يضع SL ثابت + Trailing Stop بالكمية الفعلية للوضعية.
-    ✅ الكمية تُقرأ من الوضعية الحالية وليس من الحساب
+    SL ثابت + Trailing Stop — بالكمية الفعلية للوضعية
     """
     if qty <= 0:
-        logging.error(f"place_protection: qty=0 لـ {symbol} — تخطي")
+        logging.error(f"place_protection: qty=0 لـ {symbol}")
         return False
 
     cancel_protection_orders(symbol)
-    time.sleep(0.4)
+    time.sleep(0.5)
 
     ok_sl = ok_tr = False
 
-    # — وقف خسارة ثابت —
+    # — Stop Loss ثابت —
     sl_price = round_price(symbol, entry * (1 - STOP_LOSS_PCT))
     try:
         client.futures_create_order(
@@ -195,10 +184,10 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
             workingType = "MARK_PRICE"
         )
         ok_sl = True
-        logging.info(f"✅ SL={sl_price} لـ {symbol} (qty={qty})")
+        logging.info(f"✅ SL={sl_price} qty={qty} لـ {symbol}")
     except Exception as e:
-        logging.error(f"❌ SL فشل لـ {symbol}: {e}")
-        send_telegram(f"⚠️ *فشل Stop Loss* لـ `{symbol}`!\n`{e}`")
+        logging.error(f"❌ SL فشل {symbol}: {e}")
+        send_telegram(f"⚠️ *فشل SL* لـ `{symbol}`\n`{e}`")
 
     # — Trailing Stop —
     activation = round_price(symbol, entry * (1 + TRAILING_ACTIVATION_PCT))
@@ -214,79 +203,87 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
             workingType     = "MARK_PRICE"
         )
         ok_tr = True
-        logging.info(f"✅ Trailing={TRAILING_CALLBACK_RATE}% (تفعيل@{activation}) لـ {symbol}")
+        logging.info(f"✅ Trailing {TRAILING_CALLBACK_RATE}% @{activation} لـ {symbol}")
     except Exception as e:
-        logging.error(f"❌ Trailing فشل لـ {symbol}: {e}")
-        send_telegram(f"⚠️ *فشل Trailing Stop* لـ `{symbol}`!\n`{e}`")
+        logging.error(f"❌ Trailing فشل {symbol}: {e}")
+        send_telegram(f"⚠️ *فشل Trailing* لـ `{symbol}`\n`{e}`")
 
     return ok_sl or ok_tr
 
 # ══════════════════════════════════════════════
-#  5. تبنّي الصفقات المفتوحة عند البدء
+#  5. تبنّي الوضعيات الحالية
 # ══════════════════════════════════════════════
 
 def adopt_existing_positions():
     """
-    ✅ عند تشغيل البوت:
-    يقرأ كل وضعية مفتوحة في العقود الآجلة
-    ويضع لها SL + Trailing فوراً إذا لم تكن موجودة
-    يضيفها لـ open_trades حتى يُراقبها
-    لا يمس الـ Spot
+    ✅ إصلاح v9:
+    يجلب كل الوضعيات بطريقتين:
+    1. futures_position_information() بدون symbol — يُعيد كل الرموز
+    2. يفلتر أي positionAmt != 0
     """
-    logging.info("🔍 فحص الوضعيات المفتوحة الحالية...")
+    logging.info("🔍 جلب كل الوضعيات المفتوحة...")
+    adopted = 0
     try:
-        positions = client.futures_position_information()
-        adopted = 0
-        for p in positions:
+        # ✅ جلب الكل دفعة واحدة بدون تحديد رمز
+        all_positions = client.futures_position_information()
+        logging.info(f"إجمالي الرموز في الحساب: {len(all_positions)}")
+
+        for p in all_positions:
+            sym   = p["symbol"]
             amt   = float(p["positionAmt"])
             entry = float(p["entryPrice"])
-            sym   = p["symbol"]
 
-            if abs(amt) == 0 or entry == 0:
-                continue
+            if abs(amt) < 1e-8 or entry == 0:
+                continue   # وضعية فارغة
+
+            logging.info(f"وضعية موجودة: {sym} | كمية={amt} | دخول={entry}")
 
             if amt < 0:
-                # صفقة SHORT — البوت لا يديرها، فقط يُرسل إشعاراً
                 send_telegram(
-                    f"⚠️ وُجدت صفقة SHORT في `{sym}` (كمية: {amt})\n"
-                    f"البوت لا يدير الـ SHORT — يرجى مراجعتها يدوياً."
+                    f"⚠️ وضعية SHORT في `{sym}` (كمية: {amt})\n"
+                    f"البوت لا يدير الـ SHORT — راجعها يدوياً."
                 )
                 continue
 
-            # LONG
+            # LONG — أضفها للسجل
             open_trades[sym] = {
                 "entry":     entry,
                 "qty":       abs(amt),
                 "open_time": utcnow()
             }
 
-            # فحص هل الحماية موجودة
-            orders      = client.futures_get_open_orders(symbol=sym)
-            has_sl      = any(o["type"] == "STOP_MARKET"         for o in orders)
-            has_trail   = any(o["type"] == "TRAILING_STOP_MARKET" for o in orders)
+            # فحص الحماية الحالية
+            try:
+                orders    = client.futures_get_open_orders(symbol=sym)
+                has_sl    = any(o["type"] == "STOP_MARKET"          for o in orders)
+                has_trail = any(o["type"] == "TRAILING_STOP_MARKET"  for o in orders)
 
-            if not has_sl or not has_trail:
-                logging.warning(f"⚠️ {sym}: حماية ناقصة (SL={has_sl}, Trailing={has_trail}) — وضع الحماية...")
-                place_protection(sym, entry, abs(amt))
-                adopted += 1
-            else:
-                logging.info(f"✅ {sym}: حماية موجودة — تبنّي بدون تغيير")
-                adopted += 1
+                if not has_sl or not has_trail:
+                    logging.warning(f"⚠️ {sym}: حماية ناقصة SL={has_sl} Trail={has_trail} — وضع حماية جديدة")
+                    place_protection(sym, entry, abs(amt))
+                else:
+                    logging.info(f"✅ {sym}: حماية موجودة")
+            except Exception as e:
+                logging.error(f"فحص حماية {sym}: {e}")
 
-        msg = (
-            f"🔄 *تبنّي الوضعيات الحالية*\n"
-            f"عدد العقود الآجلة المفتوحة: `{adopted}`\n"
-        )
-        for sym, t in open_trades.items():
-            msg += f"  • `{sym}`: دخول `{t['entry']}` | كمية `{t['qty']}`\n"
-        send_telegram(msg)
-        logging.info(f"تم تبنّي {adopted} وضعية.")
+            adopted += 1
 
     except Exception as e:
         logging.error(f"adopt_existing_positions: {e}")
+        send_telegram(f"⚠️ خطأ في قراءة الوضعيات:\n`{e}`")
+
+    # تقرير التبنّي
+    msg = f"🔄 *تبنّي الوضعيات — v9*\nعقود LONG مفتوحة: `{adopted}`\n"
+    if open_trades:
+        for sym, t in open_trades.items():
+            msg += f"  • `{sym}`: دخول `{t['entry']}` | كمية `{t['qty']}`\n"
+    else:
+        msg += "لا توجد وضعيات مفتوحة."
+    send_telegram(msg)
+    logging.info(f"تبنّي: {adopted} وضعية")
 
 # ══════════════════════════════════════════════
-#  6. مراقبة الصفقات المفتوحة
+#  6. مراقبة الصفقات
 # ══════════════════════════════════════════════
 
 def monitor_trades():
@@ -294,15 +291,16 @@ def monitor_trades():
         try:
             amt, _ = get_actual_position(symbol)
 
-            # ——— الصفقة أُغلقت ———
-            if abs(amt) == 0:
+            # الصفقة أُغلقت
+            if abs(amt) < 1e-8:
                 trade    = open_trades.pop(symbol)
                 duration = utcnow() - trade["open_time"]
                 try:
                     exit_p  = float(client.futures_symbol_ticker(symbol=symbol)["price"])
                     pnl_pct = ((exit_p - trade["entry"]) / trade["entry"]) * 100 * LEVERAGE
+                    emoji   = "🟢" if pnl_pct >= 0 else "🔴"
                     send_telegram(
-                        f"{'🟢' if pnl_pct >= 0 else '🔴'} *مُغلقة: {symbol}*\n"
+                        f"{emoji} *مُغلقة: {symbol}*\n"
                         f"دخول: `{trade['entry']}` → خروج: `{exit_p}`\n"
                         f"P&L: `{pnl_pct:+.2f}%` (رافعة {LEVERAGE}x)\n"
                         f"المدة: `{str(duration).split('.')[0]}`"
@@ -312,14 +310,14 @@ def monitor_trades():
                 logging.info(f"صفقة مُغلقة: {symbol}")
                 continue
 
-            # ——— الصفقة مفتوحة — فحص الحماية ———
+            # الصفقة مفتوحة — فحص الحماية
             orders    = client.futures_get_open_orders(symbol=symbol)
             has_sl    = any(o["type"] == "STOP_MARKET"          for o in orders)
             has_trail = any(o["type"] == "TRAILING_STOP_MARKET"  for o in orders)
 
             if not has_sl and not has_trail:
-                logging.warning(f"🚨 {symbol}: لا SL ولا Trailing! إعادة وضع الحماية...")
-                send_telegram(f"🚨 *{symbol}*: الحماية مفقودة كلياً! إعادة وضعها...")
+                logging.warning(f"🚨 {symbol}: لا حماية! إعادة وضعها...")
+                send_telegram(f"🚨 *{symbol}*: الحماية مفقودة كلياً!")
                 place_protection(symbol, open_trades[symbol]["entry"], abs(amt))
 
             elif not has_sl:
@@ -330,9 +328,9 @@ def monitor_trades():
                         stopPrice=sl_price, quantity=abs(amt),
                         reduceOnly=True, workingType="MARK_PRICE"
                     )
-                    logging.info(f"✅ SL أُعيد لـ {symbol}")
+                    logging.info(f"✅ SL أُعيد: {symbol}")
                 except Exception as e:
-                    logging.error(f"إعادة SL فشلت {symbol}: {e}")
+                    logging.error(f"إعادة SL {symbol}: {e}")
 
             elif not has_trail:
                 activation = round_price(symbol, open_trades[symbol]["entry"] * (1 + TRAILING_ACTIVATION_PCT))
@@ -342,9 +340,9 @@ def monitor_trades():
                         quantity=abs(amt), callbackRate=TRAILING_CALLBACK_RATE,
                         activationPrice=activation, reduceOnly=True, workingType="MARK_PRICE"
                     )
-                    logging.info(f"✅ Trailing أُعيد لـ {symbol}")
+                    logging.info(f"✅ Trailing أُعيد: {symbol}")
                 except Exception as e:
-                    logging.error(f"إعادة Trailing فشلت {symbol}: {e}")
+                    logging.error(f"إعادة Trailing {symbol}: {e}")
 
         except Exception as e:
             logging.error(f"monitor_trades {symbol}: {e}")
@@ -354,12 +352,11 @@ def monitor_trades():
 # ══════════════════════════════════════════════
 
 def close_all_futures(reason: str):
-    """يُغلق فقط العقود الآجلة — لا يمس الـ Spot"""
-    send_telegram(f"🚨 *إغلاق إجباري للعقود الآجلة*\nالسبب: {reason}")
+    send_telegram(f"🚨 *إغلاق إجباري*\nالسبب: {reason}")
     try:
         for p in client.futures_position_information():
             amt = float(p["positionAmt"])
-            if abs(amt) == 0:
+            if abs(amt) < 1e-8:
                 continue
             sym  = p["symbol"]
             side = SIDE_SELL if amt > 0 else SIDE_BUY
@@ -376,7 +373,7 @@ def close_all_futures(reason: str):
     except Exception as e:
         logging.error(f"close_all_futures: {e}")
 
-def check_protection(current_balance: float) -> bool:
+def check_protection(balance: float) -> bool:
     global bot_halted_total, bot_halted_daily
     global daily_start_balance, daily_reset_date
 
@@ -385,25 +382,25 @@ def check_protection(current_balance: float) -> bool:
 
     today = utcnow().date()
     if daily_reset_date != today:
-        daily_start_balance = current_balance
+        daily_start_balance = balance
         daily_reset_date    = today
         bot_halted_daily    = False
-        send_telegram(f"✅ يوم جديد — رصيد: `{current_balance:.2f}` USDT")
+        send_telegram(f"✅ يوم جديد — رصيد: `{balance:.2f}` USDT")
 
-    if daily_start_balance and daily_start_balance > 0:
-        d_loss = (daily_start_balance - current_balance) / daily_start_balance
-        if d_loss >= DAILY_LOSS_LIMIT_PCT:
+    if daily_start_balance > 0:
+        d = (daily_start_balance - balance) / daily_start_balance
+        if d >= DAILY_LOSS_LIMIT_PCT:
             if not bot_halted_daily:
                 bot_halted_daily = True
-                close_all_futures(f"خسارة يومية {d_loss*100:.1f}% ≥ {DAILY_LOSS_LIMIT_PCT*100:.0f}%")
+                close_all_futures(f"خسارة يومية {d*100:.1f}% ≥ {DAILY_LOSS_LIMIT_PCT*100:.0f}%")
             return False
 
-    if bot_start_balance and bot_start_balance > 0:
-        t_loss = (bot_start_balance - current_balance) / bot_start_balance
-        if t_loss >= TOTAL_LOSS_LIMIT_PCT:
+    if bot_start_balance > 0:
+        t = (bot_start_balance - balance) / bot_start_balance
+        if t >= TOTAL_LOSS_LIMIT_PCT:
             bot_halted_total = True
-            close_all_futures(f"خسارة إجمالية {t_loss*100:.1f}% ≥ {TOTAL_LOSS_LIMIT_PCT*100:.0f}%")
-            send_telegram("🚨 *البوت متوقف نهائياً* — مراجعة يدوية مطلوبة.")
+            close_all_futures(f"خسارة إجمالية {t*100:.1f}% ≥ {TOTAL_LOSS_LIMIT_PCT*100:.0f}%")
+            send_telegram("🚨 *البوت متوقف نهائياً* — مراجعة يدوية.")
             return False
 
     return True
@@ -412,7 +409,7 @@ def check_protection(current_balance: float) -> bool:
 #  8. المؤشرات الفنية
 # ══════════════════════════════════════════════
 
-def ema(values, period):
+def ema_calc(values, period):
     if len(values) < period:
         return sum(values) / len(values)
     k = 2 / (period + 1)
@@ -422,7 +419,6 @@ def ema(values, period):
     return v
 
 def compute_rsi(closes, period=14):
-    gains = losses = []
     gains, losses = [], []
     for i in range(1, len(closes)):
         d = closes[i] - closes[i-1]
@@ -432,36 +428,51 @@ def compute_rsi(closes, period=14):
     al = sum(losses[-period:]) / period or 1e-9
     return 100 - 100 / (1 + ag / al)
 
-def compute_macd(closes, fast=12, slow=26, signal=9):
+def compute_macd_bull(closes, fast=12, slow=26, signal=9) -> bool:
     if len(closes) < slow + signal:
         return False
-    k_f, k_s = 2/(fast+1), 2/(slow+1)
+    kf, ks = 2/(fast+1), 2/(slow+1)
     ef = es = closes[0]
-    macd_line = []
+    line = []
     for c in closes:
-        ef = c * k_f + ef * (1 - k_f)
-        es = c * k_s + es * (1 - k_s)
-        macd_line.append(ef - es)
-    sig = ema(macd_line, signal)
-    return macd_line[-1] > sig
+        ef = c*kf + ef*(1-kf)
+        es = c*ks + es*(1-ks)
+        line.append(ef - es)
+    return line[-1] > ema_calc(line, signal)
 
 def score_symbol(symbol: str) -> dict | None:
+    """
+    ✅ v9: لوق تفصيلي لكل رمز لمعرفة سبب الرفض
+    """
     try:
         # بيانات 15m
         klines = client.futures_klines(symbol=symbol, interval=TIMEFRAME, limit=150)
         closes = [float(k[4]) for k in klines]
-        macd_bull = compute_macd(closes)
+        macd_bull = compute_macd_bull(closes)
         rsi       = compute_rsi(closes)
 
-        # فلتر الترند (EMA200 ساعية)
+        # فلتر الترند EMA200 ساعية
         h_klines = client.futures_klines(symbol=symbol, interval="1h", limit=210)
         h_closes = [float(k[4]) for k in h_klines]
-        if h_closes[-1] < ema(h_closes, 200) * 0.98:
-            return None
+        ema200   = ema_calc(h_closes, 200)
+        uptrend  = h_closes[-1] >= ema200 * 0.98
 
-        # فلتر الحجم
-        ticker = client.futures_ticker(symbol=symbol)
-        if float(ticker.get("quoteVolume", 0)) < MIN_24H_QUOTE_VOLUME:
+        # حجم التداول
+        ticker       = client.futures_ticker(symbol=symbol)
+        quote_volume = float(ticker.get("quoteVolume", 0))
+        price        = float(ticker["lastPrice"])
+
+        # ✅ لوق تفصيلي لكل رمز
+        logging.info(
+            f"{symbol}: MACD={'✅صاعد' if macd_bull else '❌هابط'} | "
+            f"RSI={rsi:.1f} | "
+            f"Trend={'✅' if uptrend else f'❌ سعر={h_closes[-1]:.4f}<EMA={ema200:.4f}'} | "
+            f"Vol={quote_volume/1e6:.1f}M"
+        )
+
+        if not uptrend:
+            return None
+        if quote_volume < MIN_24H_QUOTE_VOLUME:
             return None
 
         sc = 0
@@ -469,29 +480,27 @@ def score_symbol(symbol: str) -> dict | None:
         if rsi < 60:   sc += 30
         elif rsi < 70: sc += 10
 
-        return {
-            "symbol": symbol,
-            "score":  sc,
-            "rsi":    round(rsi, 1),
-            "price":  float(ticker["lastPrice"])
-        }
+        if sc < MIN_SCORE:
+            logging.info(f"{symbol}: نقاط {sc} < {MIN_SCORE} — مرفوض")
+            return None
+
+        return {"symbol": symbol, "score": sc, "rsi": round(rsi, 1), "price": price}
+
     except Exception as e:
         logging.warning(f"score_symbol {symbol}: {e}")
         return None
 
 # ══════════════════════════════════════════════
-#  9. فتح صفقة جديدة
+#  9. فتح صفقة
 # ══════════════════════════════════════════════
 
 def open_long(symbol: str, price: float, total_balance: float) -> bool:
-    # ✅ فحص الحد الأقصى قبل أي شيء
     if len(open_trades) >= MAX_OPEN_TRADES:
         return False
 
-    # ✅ تحقق من عدم وجود وضعية فعلية في بايننس
     amt, _ = get_actual_position(symbol)
-    if abs(amt) > 0:
-        logging.info(f"{symbol}: وضعية موجودة بالفعل — تخطي")
+    if abs(amt) > 1e-8:
+        logging.info(f"{symbol}: وضعية موجودة — تخطي")
         return False
 
     try:
@@ -502,7 +511,7 @@ def open_long(symbol: str, price: float, total_balance: float) -> bool:
         qty     = round_qty(symbol, raw_qty)
 
         if qty <= 0:
-            logging.warning(f"⚠️ {symbol}: qty=0 بعد التقريب (raw={raw_qty:.6f})")
+            logging.warning(f"⚠️ {symbol}: qty=0 (raw={raw_qty:.6f})")
             return False
 
         notional = qty * price
@@ -527,21 +536,19 @@ def open_long(symbol: str, price: float, total_balance: float) -> bool:
             type=ORDER_TYPE_MARKET, quantity=qty
         )
 
-        # انتظار التأكيد ثم قراءة الكمية الفعلية
-        time.sleep(1.2)
+        # انتظار التأكيد
+        time.sleep(1.5)
         actual_amt, actual_entry = get_actual_position(symbol)
 
-        if abs(actual_amt) == 0:
-            logging.error(f"❌ {symbol}: أمر أُرسل لكن لا وضعية! تحقق يدوياً.")
-            send_telegram(f"⚠️ `{symbol}`: أُرسل أمر دخول لكن لا وضعية ظهرت!")
+        if abs(actual_amt) < 1e-8:
+            logging.error(f"❌ {symbol}: أمر أُرسل لكن لا وضعية ظهرت!")
+            send_telegram(f"⚠️ `{symbol}`: أُرسل أمر دخول لكن لا وضعية!")
             return False
 
         actual_qty   = abs(actual_amt)
         actual_entry = actual_entry or price
 
-        logging.info(f"✅ دخول {symbol}: entry={actual_entry}, qty={actual_qty}")
-
-        # ✅ الحماية بالكمية الفعلية
+        # ✅ الحماية بالكمية الفعلية دائماً
         ok = place_protection(symbol, actual_entry, actual_qty)
 
         open_trades[symbol] = {
@@ -553,7 +560,7 @@ def open_long(symbol: str, price: float, total_balance: float) -> bool:
         send_telegram(
             f"🚀 *دخول {symbol}*\n"
             f"سعر: `{actual_entry}` | كمية: `{actual_qty}`\n"
-            f"SL ثابت: `{round_price(symbol, actual_entry*(1-STOP_LOSS_PCT))}`\n"
+            f"SL: `{round_price(symbol, actual_entry*(1-STOP_LOSS_PCT))}`\n"
             f"Trailing: `{TRAILING_CALLBACK_RATE}%` ← يبدأ عند `+{TRAILING_ACTIVATION_PCT*100:.1f}%`\n"
             f"{'✅ الحماية وُضعت' if ok else '⚠️ راجع الحماية يدوياً!'}"
         )
@@ -574,17 +581,16 @@ def send_daily_report(balance: float):
         return
     _last_report_date = today
     try:
-        positions = [p for p in client.futures_position_information() if abs(float(p["positionAmt"])) > 0]
-        d = ((daily_start_balance or balance) - balance) / (daily_start_balance or balance) * 100
-        t = ((bot_start_balance   or balance) - balance) / (bot_start_balance   or balance) * 100
-        msg  = f"📊 *تقرير يومي — v8*\n"
-        msg += f"التاريخ: `{today}` UTC\n"
+        positions = [p for p in client.futures_position_information() if abs(float(p["positionAmt"])) > 1e-8]
+        d = (daily_start_balance - balance) / daily_start_balance * 100 if daily_start_balance else 0
+        t = (bot_start_balance  - balance) / bot_start_balance  * 100 if bot_start_balance  else 0
+        msg  = f"📊 *تقرير يومي — v9*\nالتاريخ: `{today}` UTC\n"
         msg += f"الرصيد: `{balance:.2f}` USDT\n"
-        msg += f"خسارة اليوم: `{d:.2f}%` | إجمالي: `{t:.2f}%`\n"
+        msg += f"اليوم: `{d:.2f}%` | إجمالي: `{t:.2f}%`\n"
         msg += f"عقود مفتوحة: `{len(positions)}`\n"
         for p in positions:
             upnl = float(p["unRealizedProfit"])
-            msg += f"  • `{p['symbol']}`: `{p['entryPrice']}` | P&L `{upnl:+.2f}$`\n"
+            msg += f"  • `{p['symbol']}` دخول:`{p['entryPrice']}` P&L:`{upnl:+.2f}$`\n"
         send_telegram(msg)
     except Exception as e:
         logging.error(f"send_daily_report: {e}")
@@ -602,14 +608,14 @@ def main_loop():
     daily_reset_date    = utcnow().date()
 
     send_telegram(
-        f"🤖 *بوت v8 يبدأ* ✅\n"
-        f"رصيد الآجلة: `{initial:.2f}` USDT\n"
+        f"🤖 *بوت v9 يبدأ* ✅\n"
+        f"رصيد: `{initial:.2f}` USDT\n"
         f"SL: `{STOP_LOSS_PCT*100:.0f}%` | Trailing: `{TRAILING_CALLBACK_RATE}%`\n"
         f"حد يومي: `{DAILY_LOSS_LIMIT_PCT*100:.0f}%` | إجمالي: `{TOTAL_LOSS_LIMIT_PCT*100:.0f}%`\n"
-        f"الحد الأقصى للصفقات: `{MAX_OPEN_TRADES}`"
+        f"أقصى صفقات: `{MAX_OPEN_TRADES}` | حد الدخول: `{MIN_SCORE}` نقطة"
     )
 
-    # ✅ تبنّي الوضعيات الحالية فوراً
+    # ✅ تبنّي الوضعيات أول شيء
     adopt_existing_positions()
 
     cycle = 0
@@ -621,7 +627,7 @@ def main_loop():
             avail   = get_available_margin()
             logging.info(f"رصيد: {balance:.2f} | متاح: {avail:.2f} | صفقات: {len(open_trades)}")
 
-            # 1. مراقبة الصفقات المفتوحة
+            # 1. مراقبة الصفقات
             monitor_trades()
 
             # 2. حماية الرصيد
@@ -631,17 +637,17 @@ def main_loop():
 
             # 3. فحص الهامش
             if avail < 1.0:
-                logging.info("هامش أقل من 1 USDT — تخطي")
+                logging.info("هامش < 1 USDT — تخطي")
                 time.sleep(40)
                 continue
 
             # 4. حد الصفقات
             if len(open_trades) >= MAX_OPEN_TRADES:
-                logging.info(f"الحد الأقصى {MAX_OPEN_TRADES} — لا صفقات جديدة")
+                logging.info(f"الحد الأقصى {MAX_OPEN_TRADES} — لا دخول جديد")
                 time.sleep(40)
                 continue
 
-            # 5. تقييم الفرص (العقود الآجلة فقط)
+            # 5. تقييم الفرص
             candidates = []
             seen = set()
             for symbol in TOP_SYMBOLS:
@@ -649,17 +655,15 @@ def main_loop():
                     continue
                 seen.add(symbol)
 
-                # تحقق من بايننس مباشرة
                 amt, _ = get_actual_position(symbol)
-                if abs(amt) > 0:
+                if abs(amt) > 1e-8:
                     logging.info(f"{symbol}: وضعية فعلية موجودة — تخطي")
                     continue
 
                 r = score_symbol(symbol)
-                if r is None or r["score"] < MIN_SCORE:
+                if r is None:
                     continue
 
-                # فلتر مسبق للقيمة
                 est_notional = balance * RISK_PER_TRADE * LEVERAGE
                 _, _, min_n  = get_filters(symbol)
                 if est_notional < min_n:
@@ -667,20 +671,21 @@ def main_loop():
                     continue
 
                 candidates.append(r)
-                logging.info(f"{symbol}: {r['score']}pts RSI={r['rsi']}")
 
             # 6. فتح الأفضل
             if candidates:
                 candidates.sort(key=lambda x: (-x["score"], x["rsi"]))
+                logging.info(f"المرشحون: {[(c['symbol'], c['score']) for c in candidates]}")
                 for c in candidates:
                     if open_long(c["symbol"], c["price"], balance):
                         break
-                    logging.info(f"{c['symbol']}: فشل — التالي")
+                    logging.info(f"{c['symbol']}: فشل الفتح — التالي")
             else:
-                logging.info("لا فرص في هذه الدورة.")
+                logging.info("لا فرص — السوق لا يستوفي شروط الدخول.")
 
             # 7. تقرير يومي
-            if utcnow().hour == 23 and utcnow().minute == 0:
+            now = utcnow()
+            if now.hour == 23 and now.minute == 0:
                 send_daily_report(balance)
 
         except Exception as e:
@@ -695,9 +700,9 @@ def main_loop():
 
 @app.route("/")
 def home():
-    lines = [f"Bot v8 | عقود مفتوحة: {len(open_trades)}"]
+    lines = [f"<b>Bot v9</b> | صفقات: {len(open_trades)}"]
     for sym, t in open_trades.items():
-        lines.append(f"  {sym}: entry={t['entry']} qty={t['qty']}")
+        lines.append(f"• {sym}: entry={t['entry']} qty={t['qty']}")
     return "<br>".join(lines)
 
 if __name__ == "__main__":
