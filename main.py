@@ -1,12 +1,8 @@
 import os
 import time
 import math
-import hmac
-import hashlib
-import urllib.parse
 import logging
 import threading
-import requests
 from datetime import datetime, timezone
 
 from binance.client import Client
@@ -41,30 +37,6 @@ MIN_SCORE            = 20
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 bot    = telebot.TeleBot(TELEGRAM_TOKEN)
 app    = Flask(__name__)
-
-ALGO_URL = "https://fapi.binance.com/fapi/v1/algo/futures"
-
-def _sign_algo(params: dict) -> dict:
-    ts = int(time.time() * 1000)
-    params["timestamp"] = ts
-    qs = urllib.parse.urlencode(params)
-    sig = hmac.new(
-        BINANCE_API_SECRET.encode(), qs.encode(), hashlib.sha256
-    ).hexdigest()
-    return f"{qs}&signature={sig}"
-
-def algo_create_order(side: str, order_type: str, symbol: str, **kwargs) -> dict:
-    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-    params = {"symbol": symbol, "side": side, "orderType": order_type, "recvWindow": 5000}
-    params.update(kwargs)
-    qs = _sign_algo(params)
-    r = requests.post(f"{ALGO_URL}?{qs}", headers=headers, timeout=10)
-    if r.status_code != 200:
-        raise Exception(f"HTTP {r.status_code}: {r.text[:200]}")
-    try:
-        return r.json()
-    except Exception:
-        raise Exception(f"Invalid JSON: {r.text[:200]}")
 
 logging.basicConfig(
     level  = logging.INFO,
@@ -179,10 +151,11 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
 
     sl_price = round_price(symbol, entry * (1 - STOP_LOSS_PCT))
     try:
-        algo_create_order(
-            side="SELL", order_type="STOP_MARKET", symbol=symbol,
-            stopPrice=str(sl_price), quantity=str(qty),
-            workingType="MARK_PRICE", reduceOnly=True
+        client.futures_create_order(
+            symbol=symbol, side=SIDE_SELL,
+            type=FUTURE_ORDER_TYPE_STOP_MARKET,
+            stopPrice=sl_price, quantity=qty,
+            reduceOnly=True, workingType="MARK_PRICE"
         )
         ok_sl = True
         logging.info(f"✅ SL={sl_price} qty={qty} لـ {symbol}")
@@ -192,10 +165,12 @@ def place_protection(symbol: str, entry: float, qty: float) -> bool:
 
     activation = round_price(symbol, entry * (1 + TRAILING_ACTIVATION_PCT))
     try:
-        algo_create_order(
-            side="SELL", order_type="TRAILING_STOP_MARKET", symbol=symbol,
-            quantity=str(qty), callbackRate=str(TRAILING_CALLBACK_RATE),
-            activationPrice=str(activation), workingType="MARK_PRICE", reduceOnly=True
+        client.futures_create_order(
+            symbol=symbol, side=SIDE_SELL,
+            type="TRAILING_STOP_MARKET",
+            quantity=qty, callbackRate=TRAILING_CALLBACK_RATE,
+            activationPrice=activation, workingType="MARK_PRICE",
+            reduceOnly=True
         )
         ok_tr = True
         logging.info(f"✅ Trailing {TRAILING_CALLBACK_RATE}% @{activation} لـ {symbol}")
@@ -298,9 +273,10 @@ def monitor_trades():
             elif not has_sl:
                 sl_price = round_price(symbol, open_trades[symbol]["entry"] * (1 - STOP_LOSS_PCT))
                 try:
-                    algo_create_order(
-                        side="SELL", order_type="STOP_MARKET", symbol=symbol,
-                        stopPrice=str(sl_price), quantity=str(abs(amt)),
+                    client.futures_create_order(
+                        symbol=symbol, side=SIDE_SELL,
+                        type=FUTURE_ORDER_TYPE_STOP_MARKET,
+                        stopPrice=sl_price, quantity=abs(amt),
                         reduceOnly=True, workingType="MARK_PRICE"
                     )
                     logging.info(f"✅ SL أُعيد: {symbol}")
@@ -310,10 +286,11 @@ def monitor_trades():
             elif not has_trail:
                 activation = round_price(symbol, open_trades[symbol]["entry"] * (1 + TRAILING_ACTIVATION_PCT))
                 try:
-                    algo_create_order(
-                        side="SELL", order_type="TRAILING_STOP_MARKET", symbol=symbol,
-                        quantity=str(abs(amt)), callbackRate=str(TRAILING_CALLBACK_RATE),
-                        activationPrice=str(activation), reduceOnly=True, workingType="MARK_PRICE"
+                    client.futures_create_order(
+                        symbol=symbol, side=SIDE_SELL,
+                        type="TRAILING_STOP_MARKET",
+                        quantity=abs(amt), callbackRate=TRAILING_CALLBACK_RATE,
+                        activationPrice=activation, reduceOnly=True, workingType="MARK_PRICE"
                     )
                     logging.info(f"✅ Trailing أُعيد: {symbol}")
                 except Exception as e:
