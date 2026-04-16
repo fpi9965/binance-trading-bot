@@ -6,8 +6,7 @@ import threading
 from datetime import datetime, timezone
 
 from binance.client import Client
-# تم تغيير الاستيراد هنا لضمان الوصول لكل التعريفات
-import binance.enums as be
+from binance.enums import *
 from flask import Flask
 import telebot
 
@@ -15,24 +14,29 @@ import telebot
 #  1. الإعدادات
 # ══════════════════════════════════════════════
 
-BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "YOUR_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_SECRET")
-TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "YOUR_ID")
+BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY",    "YOUR_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
-RISK_PER_TRADE  = 0.05
+RISK_PER_TRADE  = 0.05   # 5% من الرصيد لكل صفقة جديدة
 LEVERAGE        = 20
 TIMEFRAME       = "15m"
-MAX_OPEN_TRADES = 3
+MAX_OPEN_TRADES = 3      # أقصى عدد عقود آجلة في نفس الوقت
 
-STOP_LOSS_PCT           = 0.02
-TRAILING_CALLBACK_RATE  = 1.0
-TRAILING_ACTIVATION_PCT = 0.005
+# 🛡️ إعدادات الحماية
+STOP_LOSS_PCT           = 0.02    # 2%  وقف خسارة ثابت (شبكة أمان)
+TRAILING_CALLBACK_RATE  = 1.0     # 1%  trailing
+TRAILING_ACTIVATION_PCT = 0.005   # +0.5% من الدخول لتفعيل الـ trailing
 
+# حماية الرصيد
 DAILY_LOSS_LIMIT_PCT = 0.05
 TOTAL_LOSS_LIMIT_PCT = 0.15
 
-TOP_SYMBOLS = ["DOGEUSDT", "XRPUSDT", "SOLUSDT", "LTCUSDT", "LINKUSDT", "POLUSDT"]
+TOP_SYMBOLS = [
+    "DOGEUSDT", "XRPUSDT", "SOLUSDT",
+    "LTCUSDT",  "LINKUSDT", "POLUSDT"
+]
 MIN_24H_QUOTE_VOLUME = 1_000_000
 MIN_SCORE            = 35
 
@@ -44,167 +48,658 @@ client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 bot    = telebot.TeleBot(TELEGRAM_TOKEN)
 app    = Flask(__name__)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level  = logging.INFO,
+    format = "%(asctime)s - %(levelname)s - %(message)s"
+)
 
-_filters_cache = {}
-open_trades = {}
+_filters_cache: dict = {}
 
-bot_start_balance = None
-daily_start_balance = None
-daily_reset_date = None
-bot_halted_total = False
-bot_halted_daily = False
+# سجل العقود الآجلة المفتوحة فقط
+# { symbol: { "entry": float, "qty": float, "open_time": datetime } }
+open_trades: dict = {}
+
+# حماية الرصيد
+bot_start_balance:   float | None = None
+daily_start_balance: float | None = None
+daily_reset_date                  = None
+bot_halted_total  = False
+bot_halted_daily  = False
+_last_report_date = None
 
 # ══════════════════════════════════════════════
-#  3. الدوال المساعدة (المحسنة)
+#  3. دوال مساعدة
 # ══════════════════════════════════════════════
 
 def utcnow():
     return datetime.now(timezone.utc)
 
-def clean_tg_msg(text):
-    """تنظيف النصوص من الرموز التي تكسر Markdown تليجرام"""
-    return text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
-
 def send_telegram(msg: str):
     try:
-        # استخدام HTML بدلاً من Markdown لأنه أكثر استقراراً مع النصوص البرمجية
-        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="HTML")
+        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Telegram error: {e}")
 
 def get_futures_balance() -> float:
+    """الرصيد الكلي في حساب العقود الآجلة فقط — لا يمس الـ Spot"""
+    try:
+        for b in client.futures_account_balance():
+            if b["asset"] == "USDT":
+                return float(b["balance"])
+    except Exception as e:
+        logging.error(f"get_futures_balance: {e}")
+    return 0.0
+
+def get_available_margin() -> float:
+    """الهامش الحر في العقود الآجلة"""
     try:
         acc = client.futures_account()
-        return float(acc["totalWalletBalance"])
+        return float(acc["availableBalance"])
     except Exception as e:
-        logging.error(f"Balance error: {e}")
-        return 0.0
+        logging.error(f"get_available_margin: {e}")
+    return 0.0
 
-def get_filters(symbol: str):
-    if symbol in _filters_cache: return _filters_cache[symbol]
-    try:
-        info = client.futures_exchange_info()
-        for s in info['symbols']:
-            if s['symbol'] == symbol:
-                lot = 1.0
-                tick = 1.0
+def get_filters(symbol: str) -> tuple[float, float, float]:
+    """(lot_size, tick_size, min_notional) — يُجلَب مرة واحدة لكل الرموز"""
+    if symbol in _filters_cache:
+        return _filters_cache[symbol]
+    if not _filters_cache:
+        try:
+            for s in client.futures_exchange_info()["symbols"]:
+                sym = s["symbol"]
+                lot = tick = None
                 notional = 5.0
-                for f in s['filters']:
-                    if f['filterType'] == 'LOT_SIZE': lot = float(f['stepSize'])
-                    if f['filterType'] == 'PRICE_FILTER': tick = float(f['tickSize'])
-                    if f['filterType'] == 'MIN_NOTIONAL': notional = float(f['notional'])
-                _filters_cache[symbol] = (lot, tick, notional)
-                return _filters_cache[symbol]
-    except: pass
-    return (0.001, 0.01, 5.0)
+                for f in s["filters"]:
+                    ft = f["filterType"]
+                    if ft == "LOT_SIZE":
+                        lot = float(f["stepSize"])
+                    elif ft == "PRICE_FILTER":
+                        tick = float(f["tickSize"])
+                    elif ft == "MIN_NOTIONAL":
+                        notional = float(f["notional"])
+                if lot and tick:
+                    _filters_cache[sym] = (lot, tick, notional)
+        except Exception as e:
+            logging.error(f"get_filters exchange_info: {e}")
+    return _filters_cache.get(symbol, (0.001, 0.01, 5.0))
 
-def round_step(value, step):
-    if step == 0: return value
-    precision = int(round(-math.log10(step)))
-    return round(math.floor(value / step) * step, precision)
+def round_qty(symbol: str, qty: float) -> float:
+    lot, _, _ = get_filters(symbol)
+    if lot <= 0:
+        return round(qty, 3)
+    prec = max(0, round(-math.log10(lot)))
+    return float(f"{qty:.{prec}f}")
 
-# ══════════════════════════════════════════════
-#  4. إدارة أوامر الحماية (تم حل مشكلة عدم التعريف)
-# ══════════════════════════════════════════════
+def round_price(symbol: str, price: float) -> float:
+    _, tick, _ = get_filters(symbol)
+    if tick <= 0:
+        return round(price, 2)
+    prec = max(0, round(-math.log10(tick)))
+    return float(f"{price:.{prec}f}")
 
-def place_protection(symbol, entry, qty):
-    """
-    V12: دالة حماية مستقرة تستخدم أوامر LIMIT لتجنب خطأ 4120 (Algo Order)
-    تضع هدف ربح معلق، مما يجعل البوت يرى أن الصفقة "محمية" ويتوقف عن التكرار.
-    """
+def get_actual_position(symbol: str) -> tuple[float, float]:
+    """يُعيد (positionAmt, entryPrice) من الوضعية الفعلية"""
     try:
-        # 1. تنظيف أي أوامر معلقة سابقة لنفس العملة لتجنب التضارب
-        client.futures_cancel_all_open_orders(symbol=symbol)
-        time.sleep(0.6) # تأخير بسيط لضمان تنفيذ الإلغاء في خوادم بايننس
+        for p in client.futures_position_information(symbol=symbol):
+            amt   = float(p["positionAmt"])
+            entry = float(p["entryPrice"])
+            if abs(amt) > 0:
+                return amt, entry
+    except Exception as e:
+        logging.warning(f"get_actual_position {symbol}: {e}")
+    return 0.0, 0.0
 
-        # 2. جلب الفلاتر لحساب السعر بدقة
-        filters = get_filters(symbol)
-        tick = filters[1]
-        
-        # 3. حساب سعر هدف الربح (مثلاً 1.5% فوق سعر الدخول)
-        # يمكنك تغيير 1.015 إلى أي نسبة تناسب استراتيجيتك
-        tp_price = round_step(entry * 1.015, tick)
+# ══════════════════════════════════════════════
+#  4. إدارة أوامر الحماية
+# ══════════════════════════════════════════════
 
-        # 4. تنفيذ أمر بيع معلق (LIMIT) كهدف ربح
-        # هذا الأمر لا يعتبر Algo Order لذلك سيعمل مباشرة
+PROTECTION_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"}
+
+def cancel_protection_orders(symbol: str):
+    """يلغي SL / TP / Trailing فقط — لا يمس أوامر الدخول"""
+    try:
+        for o in client.futures_get_open_orders(symbol=symbol):
+            if o["type"] in PROTECTION_TYPES:
+                try:
+                    client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
+                    logging.info(f"إلغاء {o['type']} لـ {symbol}")
+                except Exception as e:
+                    logging.warning(f"فشل إلغاء {o['type']} {symbol}: {e}")
+    except Exception as e:
+        logging.error(f"cancel_protection_orders {symbol}: {e}")
+
+def place_protection(symbol: str, entry: float, qty: float) -> bool:
+    """
+    يضع SL ثابت + Trailing Stop بالكمية الفعلية للوضعية.
+    ✅ الكمية تُقرأ من الوضعية الحالية وليس من الحساب
+    """
+    if qty <= 0:
+        logging.error(f"place_protection: qty=0 لـ {symbol} — تخطي")
+        return False
+
+    cancel_protection_orders(symbol)
+    time.sleep(0.4)
+
+    ok_sl = ok_tr = False
+
+    # — وقف خسارة ثابت —
+    sl_price = round_price(symbol, entry * (1 - STOP_LOSS_PCT))
+    try:
         client.futures_create_order(
-            symbol=symbol,
-            side='SELL',
-            type='LIMIT',
-            price=tp_price,
-            quantity=qty,
-            timeInForce='GTC',
-            reduceOnly=True # لضمان أن الأمر يغلق الصفقة فقط ولا يفتح واحدة جديدة
+            symbol      = symbol,
+            side        = SIDE_SELL,
+            type        = ORDER_TYPE_STOP_MARKET,
+            stopPrice   = sl_price,
+            quantity    = qty,
+            reduceOnly  = True,
+            workingType = "MARK_PRICE"
+        )
+        ok_sl = True
+        logging.info(f"✅ SL={sl_price} لـ {symbol} (qty={qty})")
+    except Exception as e:
+        logging.error(f"❌ SL فشل لـ {symbol}: {e}")
+        send_telegram(f"⚠️ *فشل Stop Loss* لـ `{symbol}`!\n`{e}`")
+
+    # — Trailing Stop —
+    activation = round_price(symbol, entry * (1 + TRAILING_ACTIVATION_PCT))
+    try:
+        client.futures_create_order(
+            symbol          = symbol,
+            side            = SIDE_SELL,
+            type            = "TRAILING_STOP_MARKET",
+            quantity        = qty,
+            callbackRate    = TRAILING_CALLBACK_RATE,
+            activationPrice = activation,
+            reduceOnly      = True,
+            workingType     = "MARK_PRICE"
+        )
+        ok_tr = True
+        logging.info(f"✅ Trailing={TRAILING_CALLBACK_RATE}% (تفعيل@{activation}) لـ {symbol}")
+    except Exception as e:
+        logging.error(f"❌ Trailing فشل لـ {symbol}: {e}")
+        send_telegram(f"⚠️ *فشل Trailing Stop* لـ `{symbol}`!\n`{e}`")
+
+    return ok_sl or ok_tr
+
+# ══════════════════════════════════════════════
+#  5. تبنّي الصفقات المفتوحة عند البدء
+# ══════════════════════════════════════════════
+
+def adopt_existing_positions():
+    """
+    ✅ عند تشغيل البوت:
+    يقرأ كل وضعية مفتوحة في العقود الآجلة
+    ويضع لها SL + Trailing فوراً إذا لم تكن موجودة
+    يضيفها لـ open_trades حتى يُراقبها
+    لا يمس الـ Spot
+    """
+    logging.info("🔍 فحص الوضعيات المفتوحة الحالية...")
+    try:
+        positions = client.futures_position_information()
+        adopted = 0
+        for p in positions:
+            amt   = float(p["positionAmt"])
+            entry = float(p["entryPrice"])
+            sym   = p["symbol"]
+
+            if abs(amt) == 0 or entry == 0:
+                continue
+
+            if amt < 0:
+                # صفقة SHORT — البوت لا يديرها، فقط يُرسل إشعاراً
+                send_telegram(
+                    f"⚠️ وُجدت صفقة SHORT في `{sym}` (كمية: {amt})\n"
+                    f"البوت لا يدير الـ SHORT — يرجى مراجعتها يدوياً."
+                )
+                continue
+
+            # LONG
+            open_trades[sym] = {
+                "entry":     entry,
+                "qty":       abs(amt),
+                "open_time": utcnow()
+            }
+
+            # فحص هل الحماية موجودة
+            orders      = client.futures_get_open_orders(symbol=sym)
+            has_sl      = any(o["type"] == "STOP_MARKET"         for o in orders)
+            has_trail   = any(o["type"] == "TRAILING_STOP_MARKET" for o in orders)
+
+            if not has_sl or not has_trail:
+                logging.warning(f"⚠️ {sym}: حماية ناقصة (SL={has_sl}, Trailing={has_trail}) — وضع الحماية...")
+                place_protection(sym, entry, abs(amt))
+                adopted += 1
+            else:
+                logging.info(f"✅ {sym}: حماية موجودة — تبنّي بدون تغيير")
+                adopted += 1
+
+        msg = (
+            f"🔄 *تبنّي الوضعيات الحالية*\n"
+            f"عدد العقود الآجلة المفتوحة: `{adopted}`\n"
+        )
+        for sym, t in open_trades.items():
+            msg += f"  • `{sym}`: دخول `{t['entry']}` | كمية `{t['qty']}`\n"
+        send_telegram(msg)
+        logging.info(f"تم تبنّي {adopted} وضعية.")
+
+    except Exception as e:
+        logging.error(f"adopt_existing_positions: {e}")
+
+# ══════════════════════════════════════════════
+#  6. مراقبة الصفقات المفتوحة
+# ══════════════════════════════════════════════
+
+def monitor_trades():
+    for symbol in list(open_trades.keys()):
+        try:
+            amt, _ = get_actual_position(symbol)
+
+            # ——— الصفقة أُغلقت ———
+            if abs(amt) == 0:
+                trade    = open_trades.pop(symbol)
+                duration = utcnow() - trade["open_time"]
+                try:
+                    exit_p  = float(client.futures_symbol_ticker(symbol=symbol)["price"])
+                    pnl_pct = ((exit_p - trade["entry"]) / trade["entry"]) * 100 * LEVERAGE
+                    send_telegram(
+                        f"{'🟢' if pnl_pct >= 0 else '🔴'} *مُغلقة: {symbol}*\n"
+                        f"دخول: `{trade['entry']}` → خروج: `{exit_p}`\n"
+                        f"P&L: `{pnl_pct:+.2f}%` (رافعة {LEVERAGE}x)\n"
+                        f"المدة: `{str(duration).split('.')[0]}`"
+                    )
+                except Exception:
+                    send_telegram(f"🏁 *مُغلقة: {symbol}*")
+                logging.info(f"صفقة مُغلقة: {symbol}")
+                continue
+
+            # ——— الصفقة مفتوحة — فحص الحماية ———
+            orders    = client.futures_get_open_orders(symbol=symbol)
+            has_sl    = any(o["type"] == "STOP_MARKET"          for o in orders)
+            has_trail = any(o["type"] == "TRAILING_STOP_MARKET"  for o in orders)
+
+            if not has_sl and not has_trail:
+                logging.warning(f"🚨 {symbol}: لا SL ولا Trailing! إعادة وضع الحماية...")
+                send_telegram(f"🚨 *{symbol}*: الحماية مفقودة كلياً! إعادة وضعها...")
+                place_protection(symbol, open_trades[symbol]["entry"], abs(amt))
+
+            elif not has_sl:
+                sl_price = round_price(symbol, open_trades[symbol]["entry"] * (1 - STOP_LOSS_PCT))
+                try:
+                    client.futures_create_order(
+                        symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_STOP_MARKET,
+                        stopPrice=sl_price, quantity=abs(amt),
+                        reduceOnly=True, workingType="MARK_PRICE"
+                    )
+                    logging.info(f"✅ SL أُعيد لـ {symbol}")
+                except Exception as e:
+                    logging.error(f"إعادة SL فشلت {symbol}: {e}")
+
+            elif not has_trail:
+                activation = round_price(symbol, open_trades[symbol]["entry"] * (1 + TRAILING_ACTIVATION_PCT))
+                try:
+                    client.futures_create_order(
+                        symbol=symbol, side=SIDE_SELL, type="TRAILING_STOP_MARKET",
+                        quantity=abs(amt), callbackRate=TRAILING_CALLBACK_RATE,
+                        activationPrice=activation, reduceOnly=True, workingType="MARK_PRICE"
+                    )
+                    logging.info(f"✅ Trailing أُعيد لـ {symbol}")
+                except Exception as e:
+                    logging.error(f"إعادة Trailing فشلت {symbol}: {e}")
+
+        except Exception as e:
+            logging.error(f"monitor_trades {symbol}: {e}")
+
+# ══════════════════════════════════════════════
+#  7. حماية الرصيد
+# ══════════════════════════════════════════════
+
+def close_all_futures(reason: str):
+    """يُغلق فقط العقود الآجلة — لا يمس الـ Spot"""
+    send_telegram(f"🚨 *إغلاق إجباري للعقود الآجلة*\nالسبب: {reason}")
+    try:
+        for p in client.futures_position_information():
+            amt = float(p["positionAmt"])
+            if abs(amt) == 0:
+                continue
+            sym  = p["symbol"]
+            side = SIDE_SELL if amt > 0 else SIDE_BUY
+            cancel_protection_orders(sym)
+            try:
+                client.futures_create_order(
+                    symbol=sym, side=side, type=ORDER_TYPE_MARKET,
+                    quantity=abs(amt), reduceOnly=True
+                )
+                open_trades.pop(sym, None)
+                logging.info(f"إغلاق إجباري: {sym}")
+            except Exception as e:
+                logging.error(f"فشل إغلاق {sym}: {e}")
+    except Exception as e:
+        logging.error(f"close_all_futures: {e}")
+
+def check_protection(current_balance: float) -> bool:
+    global bot_halted_total, bot_halted_daily
+    global daily_start_balance, daily_reset_date
+
+    if bot_halted_total:
+        return False
+
+    today = utcnow().date()
+    if daily_reset_date != today:
+        daily_start_balance = current_balance
+        daily_reset_date    = today
+        bot_halted_daily    = False
+        send_telegram(f"✅ يوم جديد — رصيد: `{current_balance:.2f}` USDT")
+
+    if daily_start_balance and daily_start_balance > 0:
+        d_loss = (daily_start_balance - current_balance) / daily_start_balance
+        if d_loss >= DAILY_LOSS_LIMIT_PCT:
+            if not bot_halted_daily:
+                bot_halted_daily = True
+                close_all_futures(f"خسارة يومية {d_loss*100:.1f}% ≥ {DAILY_LOSS_LIMIT_PCT*100:.0f}%")
+            return False
+
+    if bot_start_balance and bot_start_balance > 0:
+        t_loss = (bot_start_balance - current_balance) / bot_start_balance
+        if t_loss >= TOTAL_LOSS_LIMIT_PCT:
+            bot_halted_total = True
+            close_all_futures(f"خسارة إجمالية {t_loss*100:.1f}% ≥ {TOTAL_LOSS_LIMIT_PCT*100:.0f}%")
+            send_telegram("🚨 *البوت متوقف نهائياً* — مراجعة يدوية مطلوبة.")
+            return False
+
+    return True
+
+# ══════════════════════════════════════════════
+#  8. المؤشرات الفنية
+# ══════════════════════════════════════════════
+
+def ema(values, period):
+    if len(values) < period:
+        return sum(values) / len(values)
+    k = 2 / (period + 1)
+    v = sum(values[:period]) / period
+    for x in values[period:]:
+        v = x * k + v * (1 - k)
+    return v
+
+def compute_rsi(closes, period=14):
+    gains = losses = []
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    ag = sum(gains[-period:]) / period
+    al = sum(losses[-period:]) / period or 1e-9
+    return 100 - 100 / (1 + ag / al)
+
+def compute_macd(closes, fast=12, slow=26, signal=9):
+    if len(closes) < slow + signal:
+        return False
+    k_f, k_s = 2/(fast+1), 2/(slow+1)
+    ef = es = closes[0]
+    macd_line = []
+    for c in closes:
+        ef = c * k_f + ef * (1 - k_f)
+        es = c * k_s + es * (1 - k_s)
+        macd_line.append(ef - es)
+    sig = ema(macd_line, signal)
+    return macd_line[-1] > sig
+
+def score_symbol(symbol: str) -> dict | None:
+    try:
+        # بيانات 15m
+        klines = client.futures_klines(symbol=symbol, interval=TIMEFRAME, limit=150)
+        closes = [float(k[4]) for k in klines]
+        macd_bull = compute_macd(closes)
+        rsi       = compute_rsi(closes)
+
+        # فلتر الترند (EMA200 ساعية)
+        h_klines = client.futures_klines(symbol=symbol, interval="1h", limit=210)
+        h_closes = [float(k[4]) for k in h_klines]
+        if h_closes[-1] < ema(h_closes, 200) * 0.98:
+            return None
+
+        # فلتر الحجم
+        ticker = client.futures_ticker(symbol=symbol)
+        if float(ticker.get("quoteVolume", 0)) < MIN_24H_QUOTE_VOLUME:
+            return None
+
+        sc = 0
+        if macd_bull:  sc += 30
+        if rsi < 60:   sc += 30
+        elif rsi < 70: sc += 10
+
+        return {
+            "symbol": symbol,
+            "score":  sc,
+            "rsi":    round(rsi, 1),
+            "price":  float(ticker["lastPrice"])
+        }
+    except Exception as e:
+        logging.warning(f"score_symbol {symbol}: {e}")
+        return None
+
+# ══════════════════════════════════════════════
+#  9. فتح صفقة جديدة
+# ══════════════════════════════════════════════
+
+def open_long(symbol: str, price: float, total_balance: float) -> bool:
+    # ✅ فحص الحد الأقصى قبل أي شيء
+    if len(open_trades) >= MAX_OPEN_TRADES:
+        return False
+
+    # ✅ تحقق من عدم وجود وضعية فعلية في بايننس
+    amt, _ = get_actual_position(symbol)
+    if abs(amt) > 0:
+        logging.info(f"{symbol}: وضعية موجودة بالفعل — تخطي")
+        return False
+
+    try:
+        lot, tick, min_notional = get_filters(symbol)
+        avail = get_available_margin()
+
+        raw_qty = (total_balance * RISK_PER_TRADE * LEVERAGE) / price
+        qty     = round_qty(symbol, raw_qty)
+
+        if qty <= 0:
+            logging.warning(f"⚠️ {symbol}: qty=0 بعد التقريب (raw={raw_qty:.6f})")
+            return False
+
+        notional = qty * price
+        if notional < min_notional:
+            logging.warning(f"⚠️ {symbol}: notional={notional:.2f} < {min_notional}")
+            return False
+
+        req_margin = notional / LEVERAGE
+        if req_margin > avail * 0.95:
+            logging.info(f"⚠️ {symbol}: هامش مطلوب {req_margin:.2f} > متاح {avail:.2f}")
+            return False
+
+        # ضبط الرافعة
+        try:
+            client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+        except Exception as e:
+            logging.warning(f"رافعة {symbol}: {e}")
+
+        # أمر الدخول
+        client.futures_create_order(
+            symbol=symbol, side=SIDE_BUY,
+            type=ORDER_TYPE_MARKET, quantity=qty
         )
 
-        logging.info(f"🎯 [حماية] تم تثبيت الهدف لـ {symbol} بنجاح عند {tp_price}")
+        # انتظار التأكيد ثم قراءة الكمية الفعلية
+        time.sleep(1.2)
+        actual_amt, actual_entry = get_actual_position(symbol)
+
+        if abs(actual_amt) == 0:
+            logging.error(f"❌ {symbol}: أمر أُرسل لكن لا وضعية! تحقق يدوياً.")
+            send_telegram(f"⚠️ `{symbol}`: أُرسل أمر دخول لكن لا وضعية ظهرت!")
+            return False
+
+        actual_qty   = abs(actual_amt)
+        actual_entry = actual_entry or price
+
+        logging.info(f"✅ دخول {symbol}: entry={actual_entry}, qty={actual_qty}")
+
+        # ✅ الحماية بالكمية الفعلية
+        ok = place_protection(symbol, actual_entry, actual_qty)
+
+        open_trades[symbol] = {
+            "entry":     actual_entry,
+            "qty":       actual_qty,
+            "open_time": utcnow()
+        }
+
+        send_telegram(
+            f"🚀 *دخول {symbol}*\n"
+            f"سعر: `{actual_entry}` | كمية: `{actual_qty}`\n"
+            f"SL ثابت: `{round_price(symbol, actual_entry*(1-STOP_LOSS_PCT))}`\n"
+            f"Trailing: `{TRAILING_CALLBACK_RATE}%` ← يبدأ عند `+{TRAILING_ACTIVATION_PCT*100:.1f}%`\n"
+            f"{'✅ الحماية وُضعت' if ok else '⚠️ راجع الحماية يدوياً!'}"
+        )
         return True
 
     except Exception as e:
-        logging.error(f"❌ [خطأ حماية] فشل تأمين {symbol}: {e}")
+        logging.error(f"open_long {symbol}: {e}")
         return False
-        
+
 # ══════════════════════════════════════════════
-#  5. التحليل والدورة الرئيسية
+#  10. التقرير اليومي
 # ══════════════════════════════════════════════
 
-def get_actual_position(symbol: str):
+def send_daily_report(balance: float):
+    global _last_report_date
+    today = utcnow().date()
+    if _last_report_date == today:
+        return
+    _last_report_date = today
     try:
-        pos = client.futures_position_information(symbol=symbol)
-        for p in pos:
-            if p['symbol'] == symbol:
-                return float(p["positionAmt"]), float(p["entryPrice"])
-    except: pass
-    return 0.0, 0.0
+        positions = [p for p in client.futures_position_information() if abs(float(p["positionAmt"])) > 0]
+        d = ((daily_start_balance or balance) - balance) / (daily_start_balance or balance) * 100
+        t = ((bot_start_balance   or balance) - balance) / (bot_start_balance   or balance) * 100
+        msg  = f"📊 *تقرير يومي — v8*\n"
+        msg += f"التاريخ: `{today}` UTC\n"
+        msg += f"الرصيد: `{balance:.2f}` USDT\n"
+        msg += f"خسارة اليوم: `{d:.2f}%` | إجمالي: `{t:.2f}%`\n"
+        msg += f"عقود مفتوحة: `{len(positions)}`\n"
+        for p in positions:
+            upnl = float(p["unRealizedProfit"])
+            msg += f"  • `{p['symbol']}`: `{p['entryPrice']}` | P&L `{upnl:+.2f}$`\n"
+        send_telegram(msg)
+    except Exception as e:
+        logging.error(f"send_daily_report: {e}")
+
+# ══════════════════════════════════════════════
+#  11. الحلقة الرئيسية
+# ══════════════════════════════════════════════
 
 def main_loop():
     global bot_start_balance, daily_start_balance, daily_reset_date
-    
-    send_telegram("<b>🤖 البوت بدأ العمل (النسخة V9)</b>")
-    bot_start_balance = get_futures_balance()
-    daily_start_balance = bot_start_balance
-    daily_reset_date = utcnow().date()
 
+    initial = get_futures_balance()
+    bot_start_balance   = initial
+    daily_start_balance = initial
+    daily_reset_date    = utcnow().date()
+
+    send_telegram(
+        f"🤖 *بوت v8 يبدأ* ✅\n"
+        f"رصيد الآجلة: `{initial:.2f}` USDT\n"
+        f"SL: `{STOP_LOSS_PCT*100:.0f}%` | Trailing: `{TRAILING_CALLBACK_RATE}%`\n"
+        f"حد يومي: `{DAILY_LOSS_LIMIT_PCT*100:.0f}%` | إجمالي: `{TOTAL_LOSS_LIMIT_PCT*100:.0f}%`\n"
+        f"الحد الأقصى للصفقات: `{MAX_OPEN_TRADES}`"
+    )
+
+    # ✅ تبنّي الوضعيات الحالية فوراً
+    adopt_existing_positions()
+
+    cycle = 0
     while True:
+        cycle += 1
+        logging.info(f"══ الدورة #{cycle} ══")
         try:
-            curr_balance = get_futures_balance()
-            
-            # فحص الوضعيات الحالية وتحديث الـ SL إذا سقط
-            for symbol in TOP_SYMBOLS:
-                amt, entry = get_actual_position(symbol)
-                if abs(amt) > 0:
-                    orders = client.futures_get_open_orders(symbol=symbol)
-                    has_sl = any(o['type'] in ['STOP_MARKET', 'STOP'] for o in orders)
-                    if not has_sl:
-                        logging.warning(f"🚨 {symbol} missing SL! Resetting...")
-                        place_protection(symbol, entry, abs(amt))
-                    open_trades[symbol] = True
-                else:
-                    if symbol in open_trades: open_trades.pop(symbol)
+            balance = get_futures_balance()
+            avail   = get_available_margin()
+            logging.info(f"رصيد: {balance:.2f} | متاح: {avail:.2f} | صفقات: {len(open_trades)}")
 
-            # البحث عن فرص (إذا كان هناك مكان متاح)
-            if len(open_trades) < MAX_OPEN_TRADES:
-                for symbol in TOP_SYMBOLS:
-                    if symbol in open_trades: continue
-                    
-                    # (هنا تضع كود score_symbol من النسخة السابقة)
-                    # للتبسيط، سأقوم بمحاكاة الدخول إذا تحقق الشرط
-                    klines = client.futures_klines(symbol=symbol, interval=TIMEFRAME, limit=50)
-                    # ... حساب المؤشرات ...
-                    
-                    # مثال دخول (يجب إضافة منطق Score هنا)
-                    # if score >= MIN_SCORE: 
-                    #     execute_trade(symbol)
+            # 1. مراقبة الصفقات المفتوحة
+            monitor_trades()
+
+            # 2. حماية الرصيد
+            if not check_protection(balance):
+                time.sleep(40)
+                continue
+
+            # 3. فحص الهامش
+            if avail < 1.0:
+                logging.info("هامش أقل من 1 USDT — تخطي")
+                time.sleep(40)
+                continue
+
+            # 4. حد الصفقات
+            if len(open_trades) >= MAX_OPEN_TRADES:
+                logging.info(f"الحد الأقصى {MAX_OPEN_TRADES} — لا صفقات جديدة")
+                time.sleep(40)
+                continue
+
+            # 5. تقييم الفرص (العقود الآجلة فقط)
+            candidates = []
+            seen = set()
+            for symbol in TOP_SYMBOLS:
+                if symbol in seen or symbol in open_trades:
+                    continue
+                seen.add(symbol)
+
+                # تحقق من بايننس مباشرة
+                amt, _ = get_actual_position(symbol)
+                if abs(amt) > 0:
+                    logging.info(f"{symbol}: وضعية فعلية موجودة — تخطي")
+                    continue
+
+                r = score_symbol(symbol)
+                if r is None or r["score"] < MIN_SCORE:
+                    continue
+
+                # فلتر مسبق للقيمة
+                est_notional = balance * RISK_PER_TRADE * LEVERAGE
+                _, _, min_n  = get_filters(symbol)
+                if est_notional < min_n:
+                    logging.info(f"{symbol}: قيمة متوقعة {est_notional:.1f} < {min_n}")
+                    continue
+
+                candidates.append(r)
+                logging.info(f"{symbol}: {r['score']}pts RSI={r['rsi']}")
+
+            # 6. فتح الأفضل
+            if candidates:
+                candidates.sort(key=lambda x: (-x["score"], x["rsi"]))
+                for c in candidates:
+                    if open_long(c["symbol"], c["price"], balance):
+                        break
+                    logging.info(f"{c['symbol']}: فشل — التالي")
+            else:
+                logging.info("لا فرص في هذه الدورة.")
+
+            # 7. تقرير يومي
+            if utcnow().hour == 23 and utcnow().minute == 0:
+                send_daily_report(balance)
 
         except Exception as e:
-            logging.error(f"Error in main loop: {e}")
-        
+            logging.error(f"main_loop: {e}")
+            send_telegram(f"⚠️ خطأ:\n`{e}`")
+
         time.sleep(30)
 
-@app.route('/')
-def index(): return "Bot V9 is running"
+# ══════════════════════════════════════════════
+#  12. السيرفر
+# ══════════════════════════════════════════════
+
+@app.route("/")
+def home():
+    lines = [f"Bot v8 | عقود مفتوحة: {len(open_trades)}"]
+    for sym, t in open_trades.items():
+        lines.append(f"  {sym}: entry={t['entry']} qty={t['qty']}")
+    return "<br>".join(lines)
 
 if __name__ == "__main__":
     threading.Thread(target=main_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
