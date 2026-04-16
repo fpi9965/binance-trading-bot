@@ -18,7 +18,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
-RISK_PER_TRADE  = 0.05
+RISK_PER_TRADE  = 0.03
 LEVERAGE        = 20
 TIMEFRAME       = "15m"
 
@@ -30,16 +30,20 @@ DAILY_LOSS_LIMIT_PCT = 0.05
 TOTAL_LOSS_LIMIT_PCT = 0.15
 
 MIN_24H_QUOTE_VOLUME = 500_000
-MIN_SCORE            = 20
+MIN_SCORE            = 30
 
 TOP_SYMBOLS = [
     "DOGEUSDT", "XRPUSDT", "SOLUSDT",
     "LTCUSDT",  "LINKUSDT", "POLUSDT",
     "BNBUSDT",   "ADAUSDT",  "AVAXUSDT",
     "DOTUSDT",   "MATICUSDT","SHIBUSDT",
-    "LUNAUSDT",  "ATOMUSDT", "UNIUSDT",
-    "ETCUSDT",   "XLMUSDT",  "NEARUSDT",
+    "ATOMUSDT",  "UNIUSDT",  "NEARUSDT",
     "APTUSDT",   "ARBUSDT",  "OPUSDT",
+    "FTMUSDT",   "SANDUSDT", "MANAUSDT",
+    "ALGOUSDT",  "HBARUSDT", "VETUSDT",
+    "FILUSDT",   "AAVEUSDT", "GRTUSDT",
+    "THETAUSDT", "EOSUSDT",  "XTZUSDT",
+    "CAKEUSDT",  "BURGERUSDT","BETAUSDT",
 ]
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
@@ -62,6 +66,7 @@ daily_reset_date           = None
 bot_halted_total           = False
 bot_halted_daily           = False
 _last_report_date          = None
+_all_symbols_cache         = []
 
 
 def _sign(params: dict) -> str:
@@ -87,15 +92,29 @@ def _algo_post(endpoint: str, params: dict) -> dict:
         raise Exception(f"Invalid response: {r.text[:300]}")
 
 
+def _is_safe_symbol(symbol: str) -> bool:
+    try:
+        symbol.encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 def _get_all_symbols() -> list:
+    global _all_symbols_cache
+    if _all_symbols_cache:
+        return _all_symbols_cache
     try:
         exchange_info = client.futures_exchange_info()
         symbols = []
         for s in exchange_info["symbols"]:
-            if (s["symbol"].endswith("USDT")
+            sym = s["symbol"]
+            if (sym.endswith("USDT")
                     and s["status"] == "TRADING"
-                    and s["contractType"] == "PERPETUAL"):
-                symbols.append(s["symbol"])
+                    and s["contractType"] == "PERPETUAL"
+                    and _is_safe_symbol(sym)):
+                symbols.append(sym)
+        _all_symbols_cache = symbols
         return symbols
     except Exception as e:
         logging.error(f"_get_all_symbols: {e}")
@@ -129,6 +148,14 @@ def get_available_margin() -> float:
     except Exception as e:
         logging.error(f"get_available_margin: {e}")
     return 0.0
+
+
+def get_all_positions() -> list:
+    try:
+        return client.futures_position_information()
+    except Exception as e:
+        logging.error(f"get_all_positions: {e}")
+        return []
 
 
 def get_filters(symbol: str) -> tuple:
@@ -178,7 +205,8 @@ def get_actual_position(symbol: str) -> tuple:
             entry = float(p["entryPrice"])
             return amt, entry
     except Exception as e:
-        logging.warning(f"get_actual_position {symbol}: {e}")
+        if "-1022" not in str(e):
+            logging.warning(f"get_actual_position {symbol}: {e}")
     return 0.0, 0.0
 
 
@@ -297,7 +325,7 @@ def adopt_existing_positions():
     logging.info("🔍 جلب كل الوضعيات المفتوحة...")
     adopted = 0
     try:
-        all_positions = client.futures_position_information()
+        all_positions = get_all_positions()
         logging.info(f"إجمالي الرموز في الحساب: {len(all_positions)}")
 
         for p in all_positions:
@@ -397,7 +425,7 @@ def monitor_trades():
 def close_all_futures(reason: str):
     send_telegram(f"🚨 *إغلاق إجباري*\nالسبب: {reason}")
     try:
-        for p in client.futures_position_information():
+        for p in get_all_positions():
             amt = float(p["positionAmt"])
             if abs(amt) < 1e-8:
                 continue
@@ -485,6 +513,8 @@ def compute_macd_bull(closes, fast=12, slow=26, signal=9) -> bool:
 
 
 def score_symbol(symbol: str) -> dict | None:
+    if not _is_safe_symbol(symbol):
+        return None
     try:
         klines = client.futures_klines(symbol=symbol, interval=TIMEFRAME, limit=150)
         closes = [float(k[4]) for k in klines]
@@ -499,13 +529,6 @@ def score_symbol(symbol: str) -> dict | None:
         ticker       = client.futures_ticker(symbol=symbol)
         quote_volume = float(ticker.get("quoteVolume", 0))
         price        = float(ticker["lastPrice"])
-
-        logging.info(
-            f"{symbol}: MACD={'✅' if macd_bull else '❌'} | "
-            f"RSI={rsi:.1f} | "
-            f"Trend={'✅' if uptrend else '❌'} | "
-            f"Vol={quote_volume/1e6:.1f}M"
-        )
 
         if not uptrend:
             return None
@@ -523,21 +546,21 @@ def score_symbol(symbol: str) -> dict | None:
         return {"symbol": symbol, "score": sc, "rsi": round(rsi, 1), "price": price}
 
     except Exception as e:
-        logging.warning(f"score_symbol {symbol}: {e}")
+        if "-1022" not in str(e) and "-1000" not in str(e):
+            logging.warning(f"score_symbol {symbol}: {e}")
         return None
 
 
-def open_long(symbol: str, price: float, balance: float) -> bool:
+def open_long(symbol: str, price: float) -> bool:
     amt, _ = get_actual_position(symbol)
     if abs(amt) > 1e-8:
-        logging.info(f"{symbol}: وضعية موجودة — تخطي")
         return False
 
     try:
         lot, tick, min_notional = get_filters(symbol)
         avail = get_available_margin()
 
-        raw_qty = (balance * RISK_PER_TRADE * LEVERAGE) / price
+        raw_qty = (avail * 0.9 * LEVERAGE) / price
         qty     = round_qty(symbol, raw_qty)
 
         if qty <= 0:
@@ -550,7 +573,7 @@ def open_long(symbol: str, price: float, balance: float) -> bool:
             return False
 
         req_margin = notional / LEVERAGE
-        if req_margin > avail * 0.95:
+        if req_margin > avail * 0.9:
             logging.info(f"⚠️ {symbol}: هامش مطلوب {req_margin:.2f} > متاح {avail:.2f}")
             return False
 
@@ -577,7 +600,6 @@ def open_long(symbol: str, price: float, balance: float) -> bool:
 
         if abs(actual_amt) < 1e-8:
             logging.error(f"❌ {symbol}: أمر أُرسل لكن لا وضعية ظهرت!")
-            send_telegram(f"⚠️ `{symbol}`: أمر دخول لكن لا وضعية!")
             return False
 
         actual_qty   = abs(actual_amt)
@@ -612,7 +634,7 @@ def send_daily_report(balance: float):
         return
     _last_report_date = today
     try:
-        positions = [p for p in client.futures_position_information() if abs(float(p["positionAmt"])) > 1e-8]
+        positions = [p for p in get_all_positions() if abs(float(p["positionAmt"])) > 1e-8]
         d = (daily_start_balance - balance) / daily_start_balance * 100 if daily_start_balance else 0
         t = (bot_start_balance  - balance) / bot_start_balance  * 100 if bot_start_balance  else 0
         msg  = f"📊 *تقرير يومي*\nالتاريخ: `{today}` UTC\n"
@@ -663,8 +685,8 @@ def main_loop():
                 time.sleep(40)
                 continue
 
-            if avail < 1.0:
-                logging.info("هامش < 1 USDT — تخطي")
+            if avail < 2.0:
+                logging.info("هامش < 2 USDT — تخطي")
                 time.sleep(40)
                 continue
 
@@ -673,6 +695,8 @@ def main_loop():
 
             for symbol in all_symbols:
                 if symbol in seen or symbol in open_trades:
+                    continue
+                if not _is_safe_symbol(symbol):
                     continue
                 seen.add(symbol)
 
@@ -684,9 +708,8 @@ def main_loop():
                 if r is None:
                     continue
 
-                est_notional = balance * RISK_PER_TRADE * LEVERAGE
-                _, _, min_n  = get_filters(symbol)
-                if est_notional < min_n:
+                _, _, min_n = get_filters(symbol)
+                if r["price"] * 1 < min_n:
                     continue
 
                 candidates.append(r)
@@ -696,12 +719,11 @@ def main_loop():
                 logging.info(f"المرشحون: {[(c['symbol'], c['score']) for c in candidates[:5]]}")
                 opened = 0
                 for c in candidates:
-                    if avail < 1.0:
+                    avail = get_available_margin()
+                    if avail < 2.0:
                         break
-                    if open_long(c["symbol"], c["price"], balance):
+                    if open_long(c["symbol"], c["price"]):
                         opened += 1
-                        balance = get_futures_balance()
-                        avail   = get_available_margin()
                         time.sleep(1)
                 if opened:
                     logging.info(f"تم فتح {opened} صفقة جديدة")
