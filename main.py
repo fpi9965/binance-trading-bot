@@ -14,7 +14,18 @@ from datetime import datetime, timezone
 
 from binance.client import Client
 from binance.enums import *
-from binance.um_futures import UMFutures
+try:
+    from binance.um_futures import UMFutures as AlgoClient
+except ImportError:
+    try:
+        from binance.spot import Spot as AlgoClientFallback
+        class AlgoClient:
+            def __init__(self, key=None, secret=None):
+                self._spot = AlgoClientFallback(key=key, secret=secret)
+            def new_algo_order(self, **kwargs):
+                return self._spot.custom_request("POST", "/fapi/v1/algo/futures", signed=True, **kwargs)
+    except ImportError:
+        AlgoClient = None
 from flask import Flask
 
 # ─── CREDENTIALS ────────────────────────────────────────────
@@ -58,8 +69,11 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ─── BINANCE CLIENT ───────────────────────────────────────────
-client: Client   = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-algo_client     = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET)
+client: Client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+if AlgoClient:
+    algo_client = AlgoClient(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET)
+else:
+    algo_client = None
 
 
 # ─── GLOBALS ─────────────────────────────────────────────────
