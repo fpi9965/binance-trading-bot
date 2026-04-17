@@ -1,14 +1,14 @@
 """
 =============================================================
-  SMART TRADING BOT v4.0 — بوت التداول الذكي
+  SMART TRADING BOT v5.0 — بوت التداول الذكي
   ─────────────────────────────────────────
-  ✅ الحماية داخل البوت بالكامل (بدون STOP_MARKET/TP_MARKET)
-  ✅ Breakeven تلقائي عند +1.5% ربح
-  ✅ Trailing داخلي يتبع السعر ويحمي الأرباح
-  ✅ فحص ذكي لا يرسل تنبيهات مكررة
-  ✅ يبحث في كل العملات المتاحة
-  ✅ تحليل شموع يابانية متعدد الإطار
-  ✅ نظام تعلم يطور نفسه تلقائياً
+  ✅ Compounding — حجم الصفقة يكبر مع الرصيد تلقائياً
+  ✅ Dynamic Risk — يزيد المخاطرة عند الفوز ويخفضها عند الخسارة
+  ✅ Pyramid Entries — يضيف لمراكز رابحة عند تأكيد الاتجاه
+  ✅ Market Filter — يتوقف في السوق الهابط ويعمل في الصاعد
+  ✅ الحماية الداخلية الكاملة (بدون STOP_MARKET/TP Binance)
+  ✅ Breakeven تلقائي + Trailing ذكي يحمي الأرباح
+  ✅ تعلم ذاتي يطور المعاملات مع الوقت
 =============================================================
 """
 
@@ -25,30 +25,45 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
-# ─── إعدادات التداول ─────────────────────────────────────────
-LEVERAGE             = 10
-RISK_PER_TRADE_PCT   = 0.02      # 2% مخاطرة لكل صفقة
-MAX_OPEN_TRADES      = 5
-SCAN_INTERVAL_SEC    = 45
+# ─── إعدادات التداول الأساسية ─────────────────────────────────
+LEVERAGE           = 10
+MAX_OPEN_TRADES    = 6
+SCAN_INTERVAL_SEC  = 40
 
-# ─── إعدادات الحماية الداخلية ────────────────────────────────
-ATR_SL_MULTIPLIER      = 2.0     # SL = entry - 2 × ATR
-ATR_TP_MULTIPLIER      = 3.0     # TP = entry + 3 × ATR
+# ─── Dynamic Risk — يتغير تلقائياً ───────────────────────────
+BASE_RISK_PCT      = 0.02    # 2% أساس
+MIN_RISK_PCT       = 0.01    # 1% حد أدنى (بعد خسائر)
+MAX_RISK_PCT       = 0.05    # 5% حد أقصى (بعد فوز متتالي)
+RISK_STEP_WIN      = 0.003   # +0.3% لكل فوز متتالي
+RISK_STEP_LOSS     = 0.005   # -0.5% لكل خسارة
+
+# ─── Pyramid — إضافة لمراكز رابحة ────────────────────────────
+PYRAMID_ENABLED        = True
+PYRAMID_TRIGGER_PCT    = 0.020   # يضيف عند +2% ربح
+PYRAMID_MAX_ADDS       = 2       # أقصى إضافتين لنفس العملة
+PYRAMID_SIZE_RATIO     = 0.5     # حجم الإضافة = 50% من الأصلي
+
+# ─── الحماية الداخلية ─────────────────────────────────────────
+ATR_SL_MULTIPLIER      = 2.0
+ATR_TP_MULTIPLIER      = 3.5     # نسبة أعلى لتعظيم الأرباح
 MIN_RR_RATIO           = 1.5
-BREAKEVEN_TRIGGER_PCT  = 0.015   # 1.5% ربح → نقل SL للدخول
-TRAILING_START_PCT     = 0.025   # 2.5% ربح → تفعيل trailing
-TRAILING_STEP_PCT      = 0.008   # trailing يتحرك كل 0.8%
-MAX_TRADE_HOURS        = 48      # إغلاق إجباري بعد 48 ساعة
+BREAKEVEN_TRIGGER_PCT  = 0.015   # 1.5% → SL للدخول
+TRAILING_START_PCT     = 0.025   # 2.5% → trailing يبدأ
+TRAILING_STEP_PCT      = 0.007
+MAX_TRADE_HOURS        = 36
 
-# ─── حماية الرصيد ────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  = 0.05
-TOTAL_LOSS_LIMIT_PCT  = 0.15
+# ─── حماية الرصيد ─────────────────────────────────────────────
+DAILY_LOSS_LIMIT_PCT   = 0.06
+TOTAL_LOSS_LIMIT_PCT   = 0.18
+
+# ─── فلتر السوق ──────────────────────────────────────────────
+MARKET_FILTER_SYMBOL   = "BTCUSDT"   # مؤشر السوق
+MARKET_FILTER_EMA      = 50          # BTC فوق EMA50 = سوق صاعد
 
 # ─── فلترة العملات ───────────────────────────────────────────
-MIN_24H_QUOTE_VOLUME  = 1_000_000
-MIN_SCORE             = 40
+MIN_24H_QUOTE_VOLUME   = 1_000_000
+MIN_SCORE              = 40
 
-# ─── تعلم ────────────────────────────────────────────────────
 LEARNING_FILE = "bot_learning.json"
 
 # ─── Logging ─────────────────────────────────────────────────
@@ -66,7 +81,7 @@ app    = Flask(__name__)
 client: Client = None
 
 # ─── حالة البوت ──────────────────────────────────────────────
-open_trades:        dict  = {}   # symbol → TradeState
+open_trades:        dict  = {}
 _filters_cache:     dict  = {}
 _all_symbols_cache: list  = []
 
@@ -76,110 +91,110 @@ daily_reset_date           = None
 bot_halted_total           = False
 bot_halted_daily           = False
 _last_report_date          = None
+_market_is_bull            = True   # فلتر السوق
 
-# ─── نظام التعلم ─────────────────────────────────────────────
+# ─── نظام التعلم + Dynamic Risk ──────────────────────────────
 learning = {
-    "trade_history":     [],
-    "symbol_stats":      {},
-    "atr_sl":            ATR_SL_MULTIPLIER,
-    "atr_tp":            ATR_TP_MULTIPLIER,
-    "win_rate":          0.0,
-    "total_trades":      0,
-    "profitable_trades": 0,
+    "trade_history":      [],
+    "symbol_stats":       {},
+    "atr_sl":             ATR_SL_MULTIPLIER,
+    "atr_tp":             ATR_TP_MULTIPLIER,
+    "win_rate":           0.0,
+    "total_trades":       0,
+    "profitable_trades":  0,
+    "current_risk_pct":   BASE_RISK_PCT,   # يتغير ديناميكياً
+    "consecutive_wins":   0,
+    "consecutive_losses": 0,
+    "peak_balance":       0.0,             # للـ Compounding
+    "compounding_mult":   1.0,             # مضاعف الحجم
 }
 
 
 # ══════════════════════════════════════════════════════════════
-#  TradeState — حالة كل صفقة مفتوحة
+#  TradeState — حالة كل صفقة
 # ══════════════════════════════════════════════════════════════
 
 class TradeState:
-    """يتتبع كل بيانات الصفقة ويدير الحماية داخلياً"""
+    def __init__(self, symbol, entry, qty, atr,
+                 score=0, rsi=50, reasons=None, is_pyramid=False, pyramid_level=0):
+        self.symbol        = symbol
+        self.entry         = entry
+        self.qty           = qty
+        self.atr           = atr
+        self.score         = score
+        self.rsi           = rsi
+        self.reasons       = reasons or []
+        self.is_pyramid    = is_pyramid
+        self.pyramid_level = pyramid_level   # 0=أصلي, 1=إضافة1, 2=إضافة2
+        self.pyramid_adds  = 0               # عدد الإضافات المنفذة
+        self.open_time     = utcnow()
 
-    def __init__(self, symbol, entry, qty, atr, score=0, rsi=50, reasons=None):
-        self.symbol     = symbol
-        self.entry      = entry
-        self.qty        = qty
-        self.atr        = atr
-        self.score      = score
-        self.rsi        = rsi
-        self.reasons    = reasons or []
-        self.open_time  = utcnow()
-
-        # حدود الحماية
         sl_mult         = learning["atr_sl"]
         tp_mult         = learning["atr_tp"]
         self.sl_price   = entry - atr * sl_mult
         self.tp_price   = entry + atr * tp_mult
 
-        # تأكد من RR كافي
         risk   = entry - self.sl_price
         reward = self.tp_price - entry
         if risk > 0 and reward / risk < MIN_RR_RATIO:
             self.tp_price = entry + risk * MIN_RR_RATIO
 
-        # حالة الحماية
-        self.highest_price  = entry    # أعلى سعر وصله
-        self.at_breakeven   = False    # هل SL انتقل للدخول؟
-        self.trailing_active= False    # هل trailing يعمل؟
-        self.trail_sl       = self.sl_price  # SL الحالي (يتحرك)
-        self.last_notif_sl  = None     # آخر قيمة SL أُبلّغ عنها
-        self.alert_count    = 0        # عدد التنبيهات
+        self.highest_price   = entry
+        self.at_breakeven    = False
+        self.trailing_active = False
+        self.trail_sl        = self.sl_price
+        self.last_notif_sl   = None
 
     def update(self, current_price: float) -> str:
-        """
-        يُحدَّث مع كل سعر جديد.
-        يُعيد: "none" | "breakeven" | "trailing_move" | "sl_hit" | "tp_hit"
-        """
         if current_price > self.highest_price:
             self.highest_price = current_price
 
         pnl_pct = (current_price - self.entry) / self.entry
 
-        # ── وصل TP ──────────────────────────────────────
         if current_price >= self.tp_price:
             return "tp_hit"
-
-        # ── وصل SL ──────────────────────────────────────
         if current_price <= self.trail_sl:
             return "sl_hit"
 
-        # ── تفعيل Trailing ───────────────────────────────
+        # Trailing
         if pnl_pct >= TRAILING_START_PCT:
             new_trail = self.highest_price * (1 - TRAILING_STEP_PCT)
             if new_trail > self.trail_sl:
                 self.trail_sl        = new_trail
                 self.trailing_active = True
-                # إشعار فقط إذا تحرك SL بشكل ملحوظ
                 if (self.last_notif_sl is None or
                         abs(new_trail - self.last_notif_sl) / self.entry > 0.003):
                     self.last_notif_sl = new_trail
                     return "trailing_move"
 
-        # ── Breakeven ────────────────────────────────────
+        # Breakeven
         elif pnl_pct >= BREAKEVEN_TRIGGER_PCT and not self.at_breakeven:
             self.at_breakeven = True
-            self.trail_sl     = self.entry * 1.001   # SL فوق الدخول بقليل
+            self.trail_sl     = self.entry * 1.001
             self.last_notif_sl = self.trail_sl
             return "breakeven"
 
+        # Pyramid trigger
+        if (PYRAMID_ENABLED and not self.is_pyramid
+                and self.pyramid_adds < PYRAMID_MAX_ADDS
+                and pnl_pct >= PYRAMID_TRIGGER_PCT * (self.pyramid_adds + 1)):
+            return "pyramid_trigger"
+
         return "none"
 
-    def rr_now(self, current_price: float) -> float:
-        risk = self.entry - self.sl_price
-        if risk <= 0:
-            return 0
-        return (current_price - self.entry) / risk
-
-    def pnl_pct(self, current_price: float) -> float:
-        return (current_price - self.entry) / self.entry * 100 * LEVERAGE
+    def pnl_pct(self, price: float) -> float:
+        return (price - self.entry) / self.entry * 100 * LEVERAGE
 
     def duration_hours(self) -> float:
         return (utcnow() - self.open_time).total_seconds() / 3600
 
+    def rr(self) -> float:
+        risk = self.entry - self.sl_price
+        return (self.tp_price - self.entry) / risk if risk > 0 else 0
+
 
 # ══════════════════════════════════════════════════════════════
-#  LEARNING SYSTEM
+#  LEARNING + DYNAMIC RISK + COMPOUNDING
 # ══════════════════════════════════════════════════════════════
 
 def load_learning():
@@ -189,7 +204,7 @@ def load_learning():
             with open(LEARNING_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 learning.update(data)
-            log.info(f"📚 بيانات التعلم | صفقات: {learning['total_trades']} | فوز: {learning['win_rate']*100:.1f}%")
+            log.info(f"📚 تعلم محمّل | صفقات:{learning['total_trades']} | Win%:{learning['win_rate']*100:.1f}% | Risk:{learning['current_risk_pct']*100:.1f}%")
     except Exception as e:
         log.error(f"load_learning: {e}")
 
@@ -202,27 +217,61 @@ def save_learning():
         log.error(f"save_learning: {e}")
 
 
-def record_trade(trade: TradeState, exit_price: float):
-    won      = exit_price >= trade.entry
-    pnl      = (exit_price - trade.entry) / trade.entry * 100 * LEVERAGE
-    dur_min  = trade.duration_hours() * 60
+def update_dynamic_risk(won: bool, balance: float):
+    """
+    يضبط المخاطرة ديناميكياً:
+    - فوز متتالي → زيادة تدريجية حتى MAX
+    - خسارة → تخفيض سريع للحماية
+    - Compounding → حجم يكبر مع الرصيد
+    """
+    risk = learning["current_risk_pct"]
+
+    if won:
+        learning["consecutive_wins"]   += 1
+        learning["consecutive_losses"]  = 0
+        # زيادة تدريجية
+        risk = min(risk + RISK_STEP_WIN, MAX_RISK_PCT)
+        log.info(f"📈 Risk ↑ {risk*100:.2f}% (فوز متتالي: {learning['consecutive_wins']})")
+    else:
+        learning["consecutive_losses"] += 1
+        learning["consecutive_wins"]    = 0
+        # تخفيض أسرع عند الخسارة
+        risk = max(risk - RISK_STEP_LOSS, MIN_RISK_PCT)
+        log.info(f"📉 Risk ↓ {risk*100:.2f}% (خسارة متتالية: {learning['consecutive_losses']})")
+
+    learning["current_risk_pct"] = risk
+
+    # Compounding Multiplier — يُحسب من نمو الرصيد
+    if learning["peak_balance"] > 0:
+        growth = balance / learning["peak_balance"]
+        learning["compounding_mult"] = max(1.0, growth)
+    if balance > learning["peak_balance"]:
+        learning["peak_balance"] = balance
+
+
+def record_trade(trade: TradeState, exit_price: float, balance: float):
+    won  = exit_price > trade.entry
+    pnl  = trade.pnl_pct(exit_price)
 
     learning["trade_history"].append({
         "symbol":   trade.symbol,
         "entry":    trade.entry,
         "exit":     exit_price,
         "pnl_pct":  round(pnl, 3),
-        "duration": round(dur_min, 1),
+        "duration": round(trade.duration_hours() * 60, 1),
         "rsi":      trade.rsi,
         "score":    trade.score,
         "atr":      round(trade.atr, 8),
+        "pyramid":  trade.is_pyramid,
         "won":      won,
         "ts":       utcnow().isoformat(),
     })
     if len(learning["trade_history"]) > 500:
         learning["trade_history"] = learning["trade_history"][-500:]
 
-    sym_st = learning["symbol_stats"].setdefault(trade.symbol, {"wins": 0, "losses": 0, "pnl": 0.0})
+    sym_st = learning["symbol_stats"].setdefault(
+        trade.symbol, {"wins": 0, "losses": 0, "pnl": 0.0}
+    )
     if won:
         sym_st["wins"] += 1
     else:
@@ -234,34 +283,33 @@ def record_trade(trade: TradeState, exit_price: float):
         learning["profitable_trades"] += 1
     learning["win_rate"] = learning["profitable_trades"] / learning["total_trades"]
 
-    _adapt_parameters()
+    update_dynamic_risk(won, balance)
+    _adapt_atr(won)
     save_learning()
-    log.info(f"📊 {trade.symbol} {'✅' if won else '❌'} {pnl:+.2f}% | Win%: {learning['win_rate']*100:.1f}%")
+
+    log.info(f"📊 {trade.symbol} {'✅' if won else '❌'} {pnl:+.2f}% | Win%:{learning['win_rate']*100:.1f}% | Risk:{learning['current_risk_pct']*100:.1f}%")
 
 
-def _adapt_parameters():
+def _adapt_atr(won: bool):
     """يضبط ATR multipliers بناءً على آخر 30 صفقة"""
     history = learning["trade_history"]
     if len(history) < 15:
         return
-
     recent    = history[-30:]
     loss_rate = sum(1 for t in recent if not t["won"]) / len(recent)
 
     if loss_rate > 0.55:
-        # كثير من الخسائر → وسّع SL
         learning["atr_sl"] = min(learning["atr_sl"] * 1.08, 4.0)
-        log.info(f"🎓 ATR SL ↑ {learning['atr_sl']:.2f} (خسائر {loss_rate*100:.0f}%)")
-    elif loss_rate < 0.30:
-        # أداء جيد → شدّد SL لتقليل الخسارة
-        learning["atr_sl"] = max(learning["atr_sl"] * 0.96, 1.2)
-        log.info(f"🎓 ATR SL ↓ {learning['atr_sl']:.2f} (فوز {(1-loss_rate)*100:.0f}%)")
+        log.info(f"🎓 ATR SL ↑ {learning['atr_sl']:.2f}")
+    elif loss_rate < 0.28:
+        learning["atr_sl"] = max(learning["atr_sl"] * 0.96, 1.3)
+        log.info(f"🎓 ATR SL ↓ {learning['atr_sl']:.2f}")
 
     wins = [t for t in recent if t["won"]]
     if wins:
         avg_win = statistics.mean(t["pnl_pct"] for t in wins)
-        if avg_win > 8:
-            learning["atr_tp"] = min(learning["atr_tp"] * 1.05, 7.0)
+        if avg_win > 10:
+            learning["atr_tp"] = min(learning["atr_tp"] * 1.05, 8.0)
         elif avg_win < 3:
             learning["atr_tp"] = max(learning["atr_tp"] * 0.97, 2.0)
 
@@ -273,7 +321,7 @@ def is_blacklisted(symbol: str) -> bool:
     total = st["wins"] + st["losses"]
     if total < 6:
         return False
-    return (st["wins"] / total) < 0.28   # أقل من 28% فوز → تجنبه
+    return (st["wins"] / total) < 0.28
 
 
 def sym_win_rate(symbol: str) -> float:
@@ -282,6 +330,13 @@ def sym_win_rate(symbol: str) -> float:
         return 0.5
     total = st["wins"] + st["losses"]
     return st["wins"] / total if total else 0.5
+
+
+def get_effective_risk() -> float:
+    """المخاطرة الفعلية = ديناميكية × Compounding"""
+    base    = learning["current_risk_pct"]
+    comp    = min(learning["compounding_mult"], 2.0)  # حد Compounding ×2
+    return min(base * comp, MAX_RISK_PCT)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -296,7 +351,7 @@ def send_telegram(msg: str):
         _r.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
-            timeout=10
+            timeout=10,
         )
     except Exception as e:
         log.error(f"Telegram: {e}")
@@ -316,7 +371,7 @@ def get_futures_balance() -> float:
             if b["asset"] == "USDT":
                 return float(b["balance"])
     except Exception as e:
-        log.error(f"get_futures_balance: {e}")
+        log.error(f"balance: {e}")
     return 0.0
 
 
@@ -324,7 +379,7 @@ def get_available_margin() -> float:
     try:
         return float(client.futures_account()["availableBalance"])
     except Exception as e:
-        log.error(f"get_available_margin: {e}")
+        log.error(f"margin: {e}")
     return 0.0
 
 
@@ -332,7 +387,7 @@ def get_all_positions() -> list:
     try:
         return client.futures_position_information()
     except Exception as e:
-        log.error(f"get_all_positions: {e}")
+        log.error(f"positions: {e}")
         return []
 
 
@@ -342,7 +397,7 @@ def get_actual_position(symbol: str) -> tuple:
             return float(p["positionAmt"]), float(p["entryPrice"])
     except Exception as e:
         if "-1022" not in str(e):
-            log.warning(f"get_actual_position {symbol}: {e}")
+            log.warning(f"actual_pos {symbol}: {e}")
     return 0.0, 0.0
 
 
@@ -350,7 +405,7 @@ def get_current_price(symbol: str) -> float:
     try:
         return float(client.futures_symbol_ticker(symbol=symbol)["price"])
     except Exception as e:
-        log.error(f"get_current_price {symbol}: {e}")
+        log.error(f"price {symbol}: {e}")
     return 0.0
 
 
@@ -374,7 +429,7 @@ def get_filters(symbol: str) -> tuple:
                 if lot and tick:
                     _filters_cache[sym] = (lot, tick, notional)
         except Exception as e:
-            log.error(f"get_filters: {e}")
+            log.error(f"filters: {e}")
     return _filters_cache.get(symbol, (0.001, 0.01, 5.0))
 
 
@@ -411,19 +466,43 @@ def _get_all_symbols() -> list:
                 except UnicodeEncodeError:
                     pass
         _all_symbols_cache = symbols
-        log.info(f"📋 عملات متاحة: {len(symbols)}")
+        log.info(f"📋 عملات: {len(symbols)}")
         return symbols
     except Exception as e:
-        log.error(f"_get_all_symbols: {e}")
+        log.error(f"symbols: {e}")
         return []
 
 
 # ══════════════════════════════════════════════════════════════
-#  MARKET ORDER — الطريقة الوحيدة التي تعمل دائماً
+#  MARKET FILTER — فلتر السوق العام
+# ══════════════════════════════════════════════════════════════
+
+def update_market_filter():
+    """يتحقق إذا BTC فوق EMA50 → سوق صاعد"""
+    global _market_is_bull
+    try:
+        kl  = client.futures_klines(symbol=MARKET_FILTER_SYMBOL, interval="1h", limit=60)
+        cls = [float(k[4]) for k in kl]
+        k   = 2 / (MARKET_FILTER_EMA + 1)
+        v   = sum(cls[:MARKET_FILTER_EMA]) / MARKET_FILTER_EMA
+        for c in cls[MARKET_FILTER_EMA:]:
+            v = c * k + v * (1 - k)
+        ema50        = v
+        prev         = _market_is_bull
+        _market_is_bull = cls[-1] >= ema50 * 0.98   # هامش 2%
+        if prev != _market_is_bull:
+            status = "🟢 صاعد" if _market_is_bull else "🔴 هابط"
+            send_telegram(f"📡 *تغيير اتجاه السوق: {status}*\nBTC: `{cls[-1]:.2f}` | EMA50: `{ema50:.2f}`")
+            log.info(f"Market filter → {'BULL' if _market_is_bull else 'BEAR'}")
+    except Exception as e:
+        log.error(f"market_filter: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
+#  MARKET ORDER
 # ══════════════════════════════════════════════════════════════
 
 def market_close(symbol: str, qty: float) -> bool:
-    """إغلاق وضعية LONG بأمر سوق"""
     qty = abs(qty)
     if qty <= 0:
         return False
@@ -436,10 +515,10 @@ def market_close(symbol: str, qty: float) -> bool:
                 quantity=qty,
                 reduceOnly=True,
             )
-            log.info(f"✅ إغلاق سوق: {symbol} qty={qty}")
+            log.info(f"✅ إغلاق: {symbol} qty={qty}")
             return True
         except Exception as e:
-            log.warning(f"market_close {symbol} (محاولة {attempt+1}): {e}")
+            log.warning(f"market_close {symbol} #{attempt+1}: {e}")
             time.sleep(1)
     log.error(f"❌ فشل إغلاق {symbol}")
     return False
@@ -472,7 +551,7 @@ def compute_rsi(closes: list, period=14) -> float:
     return 100 - 100 / (1 + ag / al)
 
 
-def compute_atr(highs: list, lows: list, closes: list, period=14) -> float:
+def compute_atr(highs, lows, closes, period=14) -> float:
     trs = []
     for i in range(1, len(closes)):
         tr = max(
@@ -486,7 +565,7 @@ def compute_atr(highs: list, lows: list, closes: list, period=14) -> float:
     return sum(trs[-period:]) / min(period, len(trs))
 
 
-def compute_macd_bull(closes: list, fast=12, slow=26, signal=9) -> bool:
+def compute_macd_bull(closes, fast=12, slow=26, signal=9) -> bool:
     if len(closes) < slow + signal:
         return False
     kf, ks = 2 / (fast + 1), 2 / (slow + 1)
@@ -497,11 +576,10 @@ def compute_macd_bull(closes: list, fast=12, slow=26, signal=9) -> bool:
         es = c * ks + es * (1 - ks)
         line.append(ef - es)
     sig_val = ema(line, signal)
-    hist    = line[-1] - sig_val
-    return line[-1] > sig_val and hist > 0
+    return line[-1] > sig_val and (line[-1] - sig_val) > 0
 
 
-def compute_bollinger_pct(closes: list, period=20) -> float:
+def compute_bb_pct(closes, period=20) -> float:
     if len(closes) < period:
         return 0.5
     window = closes[-period:]
@@ -513,15 +591,15 @@ def compute_bollinger_pct(closes: list, period=20) -> float:
     return (closes[-1] - lower) / width
 
 
-def detect_patterns(klines: list) -> list:
+def detect_patterns(klines) -> list:
     found = []
     if len(klines) < 3:
         return found
 
     def c(k):
         o, h, l, cl = float(k[1]), float(k[2]), float(k[3]), float(k[4])
-        body  = abs(cl - o)
-        rng   = h - l or 1e-9
+        body = abs(cl - o)
+        rng  = h - l or 1e-9
         return o, h, l, cl, body, rng, h - max(o, cl), min(o, cl) - l
 
     o1,h1,l1,c1,b1,r1,u1,lo1 = c(klines[-3])
@@ -532,13 +610,12 @@ def detect_patterns(klines: list) -> list:
         found.append("hammer")
     if c2 < o2 and c3 > o3 and c3 > o2 and o3 < c2:
         found.append("bullish_engulfing")
-    if c1 < o1 and b2 < b1 * 0.3 and c3 > o3 and c3 > (o1+c1)/2:
+    if c1 < o1 and b2 < b1 * 0.3 and c3 > o3 and c3 > (o1 + c1) / 2:
         found.append("morning_star")
     if c1 > o1 and c2 > o2 and c3 > o3 and c3 > c2 > c1:
         found.append("three_soldiers")
     if b3 / r3 > 0.85 and c3 > o3:
         found.append("strong_bull")
-
     return found
 
 
@@ -547,24 +624,20 @@ def score_symbol(symbol: str) -> dict | None:
         if is_blacklisted(symbol):
             return None
 
-        # ── شموع 15m ────────────────────────────────────
-        kl_15 = client.futures_klines(symbol=symbol, interval="15m", limit=210)
-        if len(kl_15) < 80:
+        kl15 = client.futures_klines(symbol=symbol, interval="15m", limit=210)
+        if len(kl15) < 80:
             return None
-        cl15 = [float(k[4]) for k in kl_15]
-        hi15 = [float(k[2]) for k in kl_15]
-        lo15 = [float(k[3]) for k in kl_15]
-        vo15 = [float(k[5]) for k in kl_15]
+        cl15 = [float(k[4]) for k in kl15]
+        hi15 = [float(k[2]) for k in kl15]
+        lo15 = [float(k[3]) for k in kl15]
+        vo15 = [float(k[5]) for k in kl15]
 
-        # ── شموع 1h ──────────────────────────────────────
-        kl_1h = client.futures_klines(symbol=symbol, interval="1h", limit=210)
-        cl1h  = [float(k[4]) for k in kl_1h]
+        kl1h = client.futures_klines(symbol=symbol, interval="1h", limit=210)
+        cl1h = [float(k[4]) for k in kl1h]
 
-        # ── شموع 4h ──────────────────────────────────────
-        kl_4h = client.futures_klines(symbol=symbol, interval="4h", limit=100)
-        cl4h  = [float(k[4]) for k in kl_4h]
+        kl4h = client.futures_klines(symbol=symbol, interval="4h", limit=100)
+        cl4h = [float(k[4]) for k in kl4h]
 
-        # ── Ticker ───────────────────────────────────────
         ticker = client.futures_ticker(symbol=symbol)
         vol24  = float(ticker.get("quoteVolume", 0))
         price  = float(ticker["lastPrice"])
@@ -572,79 +645,83 @@ def score_symbol(symbol: str) -> dict | None:
         if vol24 < MIN_24H_QUOTE_VOLUME or price <= 0:
             return None
 
-        # ── Indicators ───────────────────────────────────
-        rsi_15    = compute_rsi(cl15)
-        macd_15   = compute_macd_bull(cl15)
-        bb_pct    = compute_bollinger_pct(cl15)
-        atr_15    = compute_atr(hi15, lo15, cl15)
-        patterns  = detect_patterns(kl_15)
+        rsi15    = compute_rsi(cl15)
+        macd15   = compute_macd_bull(cl15)
+        bb_pct   = compute_bb_pct(cl15)
+        atr15    = compute_atr(hi15, lo15, cl15)
+        patterns = detect_patterns(kl15)
 
         ema200_1h = ema(cl1h, 200)
         ema50_1h  = ema(cl1h, 50)
         ema20_1h  = ema(cl1h, 20)
-        macd_4h   = compute_macd_bull(cl4h)
+        macd4h    = compute_macd_bull(cl4h)
         ema50_4h  = ema(cl4h, 50)
+        rsi1h     = compute_rsi(cl1h)
 
         cur = cl15[-1]
 
-        # ── حجم ─────────────────────────────────────────
-        avg_vol = sum(vo15[-20:]) / 20
+        # حجم
+        avg_vol   = sum(vo15[-20:]) / 20
         vol_ratio = vo15[-1] / avg_vol if avg_vol > 0 else 1
 
-        # ── Score ────────────────────────────────────────
+        # ── SCORE ──────────────────────────────────────────────
         score   = 0
         reasons = []
 
-        # اتجاه طويل (1h/4h) — 35 نقطة
+        # اتجاه طويل — 35
         if cur > ema200_1h:
             score += 15; reasons.append("↑EMA200")
         if ema20_1h > ema50_1h:
-            score += 10; reasons.append("EMA20>50(1h)")
+            score += 10; reasons.append("EMA20>50")
         if cur > ema50_4h:
             score += 5;  reasons.append("↑EMA50(4h)")
-        if macd_4h:
+        if macd4h:
             score += 5;  reasons.append("MACD↑(4h)")
 
-        # RSI — 20 نقطة
-        if 40 <= rsi_15 <= 58:
-            score += 20; reasons.append(f"RSI✓{rsi_15:.0f}")
-        elif 30 <= rsi_15 < 40:
-            score += 15; reasons.append(f"RSI-OS{rsi_15:.0f}")
-        elif 58 < rsi_15 <= 65:
-            score += 8;  reasons.append(f"RSI~{rsi_15:.0f}")
-        elif rsi_15 > 70:
-            score -= 15  # تشبع شراء → نقاط سالبة
+        # RSI — 20
+        if 38 <= rsi15 <= 58:
+            score += 20; reasons.append(f"RSI✓{rsi15:.0f}")
+        elif 28 <= rsi15 < 38:
+            score += 15; reasons.append(f"RSI-OS{rsi15:.0f}")
+        elif 58 < rsi15 <= 65:
+            score += 8;  reasons.append(f"RSI~{rsi15:.0f}")
+        elif rsi15 > 70:
+            score -= 15
 
-        # MACD 15m — 15 نقطة
-        if macd_15:
-            score += 15; reasons.append("MACD↑(15m)")
+        # RSI 1h تأكيد
+        if rsi1h < 65:
+            score += 5; reasons.append(f"RSI1h{rsi1h:.0f}")
 
-        # Bollinger — 10 نقطة
+        # MACD 15m — 15
+        if macd15:
+            score += 15; reasons.append("MACD↑")
+
+        # Bollinger — 10
         if bb_pct < 0.30:
             score += 10; reasons.append("BB-low")
         elif bb_pct > 0.85:
             score -= 5
 
-        # أنماط شمعية — 15 نقطة max
-        pattern_scores = {
-            "morning_star":       15,
-            "bullish_engulfing":  15,
-            "three_soldiers":     12,
-            "hammer":             10,
-            "strong_bull":        8,
+        # أنماط — 15 max
+        pattern_score = {
+            "morning_star":      15,
+            "bullish_engulfing": 15,
+            "three_soldiers":    12,
+            "hammer":            10,
+            "strong_bull":       8,
         }
-        best_pattern_score = max((pattern_scores.get(p, 0) for p in patterns), default=0)
-        if best_pattern_score:
-            score += best_pattern_score
-            reasons.append(f"🕯️{','.join(patterns[:2])}")
+        best = max((pattern_score.get(p, 0) for p in patterns), default=0)
+        if best:
+            score += best
+            reasons.append(f"🕯️{patterns[0]}")
 
-        # حجم — 10 نقطة
+        # حجم — 10
         if vol_ratio > 1.8:
             score += 10; reasons.append(f"Vol×{vol_ratio:.1f}")
         elif vol_ratio > 1.3:
             score += 5;  reasons.append(f"Vol×{vol_ratio:.1f}")
 
-        # سمعة العملة
+        # سمعة
         wr = sym_win_rate(symbol)
         if wr > 0.62:
             score += 5; reasons.append(f"WR{wr*100:.0f}%")
@@ -655,9 +732,9 @@ def score_symbol(symbol: str) -> dict | None:
         return {
             "symbol":   symbol,
             "score":    score,
-            "rsi":      round(rsi_15, 1),
+            "rsi":      round(rsi15, 1),
             "price":    price,
-            "atr":      atr_15,
+            "atr":      atr15,
             "reasons":  reasons,
             "patterns": patterns,
         }
@@ -669,15 +746,10 @@ def score_symbol(symbol: str) -> dict | None:
 
 
 # ══════════════════════════════════════════════════════════════
-#  PROTECTION MONITOR — القلب الجديد للبوت
+#  PROTECTION MONITOR — Thread مستقل كل 5 ثواني
 # ══════════════════════════════════════════════════════════════
 
 def protection_monitor():
-    """
-    يعمل في thread منفصل كل 5 ثواني.
-    يُحدّث TradeState لكل صفقة ويتخذ قرار الإغلاق بناءً على السعر الحالي.
-    لا يُرسل أوامر STOP_MARKET أو TAKE_PROFIT_MARKET إلى Binance.
-    """
     while True:
         try:
             for symbol in list(open_trades.keys()):
@@ -685,49 +757,45 @@ def protection_monitor():
                 if trade is None:
                     continue
 
-                # ── تحقق من الوضعية الفعلية ─────────────
                 amt, _ = get_actual_position(symbol)
                 if abs(amt) < 1e-8:
-                    # أُغلقت خارجياً
-                    _handle_closed(symbol, trade, reason="external")
+                    _handle_closed_externally(symbol, trade)
                     continue
 
                 current = get_current_price(symbol)
                 if current <= 0:
                     continue
 
-                # ── تجاوز الحد الزمني ────────────────────
+                # Timeout
                 if trade.duration_hours() >= MAX_TRADE_HOURS:
-                    log.warning(f"⏰ {symbol}: {MAX_TRADE_HOURS}h انتهت — إغلاق")
-                    _close_trade(symbol, trade, current, reason="timeout")
+                    log.warning(f"⏰ {symbol}: timeout — إغلاق")
+                    _execute_close(symbol, trade, current, "timeout")
                     continue
 
-                # ── تحديث الحماية ────────────────────────
                 event = trade.update(current)
 
                 if event == "sl_hit":
-                    log.info(f"🔴 {symbol}: SL @ {current:.6f} — إغلاق")
-                    _close_trade(symbol, trade, current, reason="sl")
+                    _execute_close(symbol, trade, current, "sl")
 
                 elif event == "tp_hit":
-                    log.info(f"🟢 {symbol}: TP @ {current:.6f} — إغلاق")
-                    _close_trade(symbol, trade, current, reason="tp")
+                    _execute_close(symbol, trade, current, "tp")
 
                 elif event == "breakeven":
                     send_telegram(
                         f"🔒 *Breakeven: {symbol}*\n"
-                        f"السعر: `{current:.6f}` | SL نُقل لـ: `{trade.trail_sl:.6f}`\n"
+                        f"سعر:`{current:.6f}` → SL:`{trade.trail_sl:.6f}`\n"
                         f"P&L: `+{trade.pnl_pct(current):.2f}%`"
                     )
-                    log.info(f"🔒 {symbol}: Breakeven SL={trade.trail_sl:.6f}")
 
                 elif event == "trailing_move":
                     send_telegram(
-                        f"📈 *Trailing: {symbol}*\n"
-                        f"سعر: `{current:.6f}` | SL الجديد: `{trade.trail_sl:.6f}`\n"
+                        f"📈 *Trailing ↑ {symbol}*\n"
+                        f"سعر:`{current:.6f}` | SL:`{trade.trail_sl:.6f}`\n"
                         f"P&L: `+{trade.pnl_pct(current):.2f}%`"
                     )
-                    log.info(f"📈 {symbol}: Trailing SL={trade.trail_sl:.6f}")
+
+                elif event == "pyramid_trigger" and not trade.is_pyramid:
+                    _execute_pyramid(symbol, trade, current)
 
         except Exception as e:
             log.error(f"protection_monitor: {e}")
@@ -735,8 +803,7 @@ def protection_monitor():
         time.sleep(5)
 
 
-def _close_trade(symbol: str, trade: TradeState, current_price: float, reason: str):
-    """يُغلق الصفقة بأمر سوق ويُسجّل في التعلم"""
+def _execute_close(symbol: str, trade: TradeState, current_price: float, reason: str):
     amt, _ = get_actual_position(symbol)
     if abs(amt) < 1e-8:
         open_trades.pop(symbol, None)
@@ -745,44 +812,108 @@ def _close_trade(symbol: str, trade: TradeState, current_price: float, reason: s
     ok = market_close(symbol, abs(amt))
     if ok:
         open_trades.pop(symbol, None)
-        pnl    = trade.pnl_pct(current_price)
-        emoji  = "🟢" if pnl >= 0 else "🔴"
-        dur    = f"{trade.duration_hours():.1f}h"
+        pnl   = trade.pnl_pct(current_price)
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        dur   = f"{trade.duration_hours():.1f}h"
+
+        balance = get_futures_balance()
+        record_trade(trade, current_price, balance)
 
         reason_txt = {
             "sl":      "وقف الخسارة ⛔",
             "tp":      "جني الأرباح 💰",
             "timeout": f"انتهاء {MAX_TRADE_HOURS}h ⏰",
-            "external":"إغلاق خارجي 🤚",
         }.get(reason, reason)
 
-        record_trade(trade, current_price)
+        risk_now = learning["current_risk_pct"] * 100
+        comp     = learning["compounding_mult"]
 
         send_telegram(
             f"{emoji} *مُغلقة: {symbol}*\n"
             f"السبب: {reason_txt}\n"
-            f"دخول: `{trade.entry:.6f}` → خروج: `{current_price:.6f}`\n"
-            f"P&L: `{pnl:+.2f}%` (رافعة {LEVERAGE}x)\n"
-            f"المدة: `{dur}` | أعلى سعر: `{trade.highest_price:.6f}`\n"
-            f"📊 Win%: `{learning['win_rate']*100:.1f}%`"
+            f"دخول:`{trade.entry:.6f}` → خروج:`{current_price:.6f}`\n"
+            f"P&L: `{pnl:+.2f}%` (×{LEVERAGE})\n"
+            f"المدة: `{dur}` | أعلى: `{trade.highest_price:.6f}`\n"
+            f"─────────────────\n"
+            f"📊 Win%:`{learning['win_rate']*100:.1f}%` | Risk:`{risk_now:.1f}%` | Comp:`×{comp:.2f}`\n"
+            f"💰 رصيد:`{balance:.2f}` USDT"
         )
     else:
         send_telegram(f"🚨 *فشل إغلاق {symbol}* — راجع يدوياً!")
 
 
-def _handle_closed(symbol: str, trade: TradeState, reason: str):
-    """يتعامل مع صفقة أُغلقت خارجياً"""
+def _handle_closed_externally(symbol: str, trade: TradeState):
     open_trades.pop(symbol, None)
     current = get_current_price(symbol)
     if current > 0:
         pnl   = trade.pnl_pct(current)
         emoji = "🟢" if pnl >= 0 else "🔴"
-        record_trade(trade, current)
+        balance = get_futures_balance()
+        record_trade(trade, current, balance)
         send_telegram(
             f"{emoji} *خارجية: {symbol}*\n"
             f"P&L تقريبي: `{pnl:+.2f}%`\n"
-            f"📊 Win%: `{learning['win_rate']*100:.1f}%`"
+            f"Win%:`{learning['win_rate']*100:.1f}%`"
         )
+
+
+def _execute_pyramid(symbol: str, trade: TradeState, current_price: float):
+    """
+    Pyramid — يضيف مركز إضافي للصفقة الرابحة.
+    الحجم = 50% من الأصلي. SL يُرفع للمستوى الأحدث.
+    """
+    if trade.pyramid_adds >= PYRAMID_MAX_ADDS:
+        return
+    if len(open_trades) >= MAX_OPEN_TRADES + PYRAMID_MAX_ADDS:
+        return
+
+    avail = get_available_margin()
+    if avail < 5.0:
+        return
+
+    # حجم الإضافة
+    add_qty_raw = trade.qty * PYRAMID_SIZE_RATIO
+    add_qty     = round_qty(symbol, add_qty_raw)
+
+    if add_qty <= 0:
+        return
+
+    notional = add_qty * current_price
+    _, _, min_notional = get_filters(symbol)
+    if notional < min_notional:
+        return
+
+    try:
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_BUY,
+            type=ORDER_TYPE_MARKET,
+            quantity=add_qty,
+        )
+        time.sleep(1.0)
+
+        amt, new_entry = get_actual_position(symbol)
+        if abs(amt) < 1e-8:
+            return
+
+        # رفع SL للدخول الأصلي (breakeven الجديد)
+        if not trade.at_breakeven:
+            trade.trail_sl    = trade.entry * 1.001
+            trade.at_breakeven = True
+
+        trade.pyramid_adds += 1
+        level = trade.pyramid_adds
+
+        log.info(f"🔺 Pyramid L{level}: {symbol} +{add_qty} @ {current_price:.6f}")
+        send_telegram(
+            f"🔺 *Pyramid L{level}: {symbol}*\n"
+            f"إضافة: `{add_qty}` @ `{current_price:.6f}`\n"
+            f"SL الجديد: `{trade.trail_sl:.6f}` (Breakeven)\n"
+            f"P&L الحالي: `+{trade.pnl_pct(current_price):.2f}%`"
+        )
+
+    except Exception as e:
+        log.error(f"pyramid {symbol}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -805,15 +936,15 @@ def open_long(candidate: dict) -> bool:
         balance = get_futures_balance()
         avail   = get_available_margin()
 
-        # حجم الصفقة بناءً على المخاطرة
-        risk_usdt   = balance * RISK_PER_TRADE_PCT
-        sl_distance = atr * learning["atr_sl"]
-        sl_pct      = sl_distance / price if price > 0 else 0.02
+        # ── Compounding + Dynamic Risk ────────────────────────
+        effective_risk = get_effective_risk()
+        sl_distance    = atr * learning["atr_sl"]
+        sl_pct         = sl_distance / price if price > 0 else 0.02
 
-        qty_by_risk = risk_usdt / (price * sl_pct)
-        qty_by_avail = (avail * 0.9 * LEVERAGE) / price
-        raw_qty = min(qty_by_risk, qty_by_avail)
-        qty     = round_qty(symbol, raw_qty)
+        qty_by_risk  = (balance * effective_risk) / (price * sl_pct)
+        qty_by_avail = (avail * 0.88 * LEVERAGE) / price
+        raw_qty      = min(qty_by_risk, qty_by_avail)
+        qty          = round_qty(symbol, raw_qty)
 
         if qty <= 0:
             return False
@@ -837,7 +968,7 @@ def open_long(candidate: dict) -> bool:
                 )
                 break
             except Exception as e:
-                log.warning(f"entry {symbol} (محاولة {attempt+1}): {e}")
+                log.warning(f"entry {symbol} #{attempt+1}: {e}")
                 time.sleep(1)
                 if attempt == 2:
                     return False
@@ -846,13 +977,12 @@ def open_long(candidate: dict) -> bool:
         actual_amt, actual_entry = get_actual_position(symbol)
 
         if abs(actual_amt) < 1e-8:
-            log.error(f"❌ {symbol}: أمر أُرسل لكن لا وضعية!")
+            log.error(f"❌ {symbol}: لا وضعية بعد الأمر")
             return False
 
         actual_qty   = abs(actual_amt)
         actual_entry = actual_entry or price
 
-        # إنشاء TradeState
         trade = TradeState(
             symbol  = symbol,
             entry   = actual_entry,
@@ -864,17 +994,22 @@ def open_long(candidate: dict) -> bool:
         )
         open_trades[symbol] = trade
 
+        rr       = trade.rr()
+        risk_pct = effective_risk * 100
+        comp     = learning["compounding_mult"]
+
         send_telegram(
             f"🚀 *دخول {symbol}*\n"
-            f"سعر: `{actual_entry:.6f}` | كمية: `{actual_qty}`\n"
-            f"SL: `{trade.sl_price:.6f}` | TP: `{trade.tp_price:.6f}`\n"
-            f"RR: `{(trade.tp_price-actual_entry)/(actual_entry-trade.sl_price):.2f}` | ATR: `{atr:.6f}`\n"
-            f"Breakeven عند: `+{BREAKEVEN_TRIGGER_PCT*100:.1f}%`\n"
-            f"Trailing عند: `+{TRAILING_START_PCT*100:.1f}%`\n"
-            f"📋 {' | '.join(candidate.get('reasons',[])[:4])}\n"
-            f"نقاط: `{candidate['score']}` | RSI: `{candidate['rsi']}`"
+            f"سعر:`{actual_entry:.6f}` | كمية:`{actual_qty}`\n"
+            f"SL:`{trade.sl_price:.6f}` | TP:`{trade.tp_price:.6f}`\n"
+            f"RR:`{rr:.2f}` | ATR:`{atr:.6f}`\n"
+            f"─────────────────\n"
+            f"⚙️ Risk:`{risk_pct:.1f}%` | Comp:`×{comp:.2f}`\n"
+            f"فوز متتالي:`{learning['consecutive_wins']}` | خسارة:`{learning['consecutive_losses']}`\n"
+            f"Breakeven عند`+{BREAKEVEN_TRIGGER_PCT*100:.1f}%` | Pyramid عند`+{PYRAMID_TRIGGER_PCT*100:.1f}%`\n"
+            f"📋 {' | '.join(candidate.get('reasons',[])[:4])}"
         )
-        log.info(f"✅ {symbol} @ {actual_entry:.6f} SL={trade.sl_price:.6f} TP={trade.tp_price:.6f}")
+        log.info(f"✅ {symbol} @ {actual_entry:.6f} Risk={risk_pct:.1f}% Comp=×{comp:.2f}")
         return True
 
     except Exception as e:
@@ -883,7 +1018,7 @@ def open_long(candidate: dict) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
-#  ADOPT EXISTING POSITIONS
+#  ADOPT EXISTING
 # ══════════════════════════════════════════════════════════════
 
 def adopt_existing_positions():
@@ -895,17 +1030,14 @@ def adopt_existing_positions():
             amt   = float(p["positionAmt"])
             entry = float(p["entryPrice"])
 
-            if abs(amt) < 1e-8 or entry == 0:
+            if abs(amt) < 1e-8 or entry == 0 or sym in open_trades:
                 continue
-            if sym in open_trades:
-                continue
-
             if amt < 0:
                 send_telegram(f"⚠️ SHORT في `{sym}` — راجع يدوياً")
                 continue
 
             try:
-                kl = client.futures_klines(symbol=sym, interval="15m", limit=30)
+                kl  = client.futures_klines(symbol=sym, interval="15m", limit=30)
                 atr = compute_atr(
                     [float(k[2]) for k in kl],
                     [float(k[3]) for k in kl],
@@ -918,16 +1050,14 @@ def adopt_existing_positions():
             open_trades[sym] = trade
             adopted += 1
 
-            log.info(f"✅ تبنّي: {sym} @ {entry} qty={abs(amt)}")
-
     except Exception as e:
-        log.error(f"adopt_existing_positions: {e}")
+        log.error(f"adopt: {e}")
 
-    msg = f"🔄 *تبنّي الوضعيات* — {adopted} وضعية\n"
+    msg = f"🔄 *تبنّي* — {adopted} وضعية\n"
     for sym, t in open_trades.items():
-        msg += f"  • `{sym}`: دخول `{t.entry:.6f}` | SL: `{t.sl_price:.6f}`\n"
+        msg += f"  • `{sym}` @ `{t.entry:.6f}` | SL:`{t.sl_price:.6f}`\n"
     if not open_trades:
-        msg += "لا توجد وضعيات."
+        msg += "لا وضعيات."
     send_telegram(msg)
 
 
@@ -965,7 +1095,7 @@ def check_protection(balance: float) -> bool:
         daily_start_balance = balance
         daily_reset_date    = today
         bot_halted_daily    = False
-        send_telegram(f"✅ يوم جديد | رصيد: `{balance:.2f}` USDT")
+        send_telegram(f"✅ يوم جديد | رصيد:`{balance:.2f}` USDT | Risk:`{learning['current_risk_pct']*100:.1f}%`")
 
     if daily_start_balance > 0:
         d = (daily_start_balance - balance) / daily_start_balance
@@ -993,17 +1123,37 @@ def send_daily_report(balance: float):
         return
     _last_report_date = today
     try:
-        d = (daily_start_balance - balance) / daily_start_balance * 100 if daily_start_balance else 0
-        t = (bot_start_balance  - balance) / bot_start_balance  * 100 if bot_start_balance  else 0
+        d    = (daily_start_balance - balance) / daily_start_balance * 100 if daily_start_balance else 0
+        t    = (bot_start_balance   - balance) / bot_start_balance   * 100 if bot_start_balance   else 0
+        risk = learning["current_risk_pct"] * 100
+        comp = learning["compounding_mult"]
+
         msg  = f"📊 *تقرير يومي — {today}*\n"
         msg += f"رصيد: `{balance:.2f}` USDT\n"
-        msg += f"اليوم: `{d:.2f}%` | إجمالي: `{t:.2f}%`\n"
-        msg += f"Win%: `{learning['win_rate']*100:.1f}%` ({learning['total_trades']} صفقة)\n"
-        msg += f"ATR SL×`{learning['atr_sl']:.2f}` TP×`{learning['atr_tp']:.2f}`\n"
-        msg += f"مفتوحة: `{len(open_trades)}`\n"
-        for sym, t in open_trades.items():
-            cp = get_current_price(sym)
-            msg += f"  • `{sym}` P&L:`{t.pnl_pct(cp):+.2f}%` Trail:`{'✅' if t.trailing_active else '⏳'}`\n"
+        msg += f"اليوم:`{d:.2f}%` | إجمالي:`{t:.2f}%`\n"
+        msg += f"─────────────────\n"
+        msg += f"Win%:`{learning['win_rate']*100:.1f}%` ({learning['total_trades']} صفقة)\n"
+        msg += f"Risk الحالي:`{risk:.1f}%` | Comp:`×{comp:.2f}`\n"
+        msg += f"فوز متتالي:`{learning['consecutive_wins']}` | ATR SL×`{learning['atr_sl']:.2f}`\n"
+        msg += f"─────────────────\n"
+        msg += f"مفتوحة:`{len(open_trades)}`\n"
+
+        for sym, tr in open_trades.items():
+            cp  = get_current_price(sym)
+            pnl = tr.pnl_pct(cp)
+            msg += f"  • `{sym}` P&L:`{pnl:+.2f}%` {'🔒' if tr.at_breakeven else ''} {'📈' if tr.trailing_active else ''} {'🔺×'+str(tr.pyramid_adds) if tr.pyramid_adds else ''}\n"
+
+        # أفضل وأسوأ
+        stats = learning["symbol_stats"]
+        if stats:
+            ranked = sorted(
+                [(s, v["wins"]/(v["wins"]+v["losses"])) for s, v in stats.items() if v["wins"]+v["losses"] >= 3],
+                key=lambda x: -x[1]
+            )
+            if ranked:
+                msg += f"🏆 أفضل:`{ranked[0][0]}` ({ranked[0][1]*100:.0f}%)\n"
+                msg += f"💔 أسوأ:`{ranked[-1][0]}` ({ranked[-1][1]*100:.0f}%)\n"
+
         send_telegram(msg)
     except Exception as e:
         log.error(f"daily_report: {e}")
@@ -1016,55 +1166,82 @@ def send_daily_report(balance: float):
 def main_loop():
     global bot_start_balance, daily_start_balance, daily_reset_date, client
 
-    log.info("🚀 تهيئة البوت v4.0...")
+    log.info("🚀 بوت التداول الذكي v5.0")
     client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
     load_learning()
 
-    # تشغيل Protection Monitor في thread منفصل
-    threading.Thread(target=protection_monitor, daemon=True, name="ProtectionMonitor").start()
-    log.info("🛡️ Protection Monitor يعمل")
-
+    # تهيئة peak_balance
     initial = get_futures_balance()
+    if learning["peak_balance"] == 0:
+        learning["peak_balance"] = initial
+
     bot_start_balance   = initial
     daily_start_balance = initial
     daily_reset_date    = utcnow().date()
 
     all_symbols = _get_all_symbols()
 
+    # threads
+    threading.Thread(target=protection_monitor, daemon=True, name="ProtMon").start()
+    log.info("🛡️ Protection Monitor يعمل")
+
     send_telegram(
-        f"🤖 *بوت التداول الذكي v4.0* ✅\n"
-        f"رصيد: `{initial:.2f}` USDT\n"
-        f"رافعة: `{LEVERAGE}x` | مخاطرة: `{RISK_PER_TRADE_PCT*100:.0f}%`/صفقة\n"
-        f"SL داخلي × ATR`{learning['atr_sl']:.1f}` | TP × ATR`{learning['atr_tp']:.1f}`\n"
-        f"Breakeven: `+{BREAKEVEN_TRIGGER_PCT*100:.1f}%` | Trailing: `+{TRAILING_START_PCT*100:.1f}%`\n"
-        f"عملات للفحص: `{len(all_symbols)}`\n"
-        f"Win% سابق: `{learning['win_rate']*100:.1f}%`"
+        f"🤖 *بوت التداول v5.0* ✅\n"
+        f"رصيد:`{initial:.2f}` USDT\n"
+        f"─────────────────\n"
+        f"⚙️ Risk:`{learning['current_risk_pct']*100:.1f}%` (ديناميكي {MIN_RISK_PCT*100:.0f}%-{MAX_RISK_PCT*100:.0f}%)\n"
+        f"Compounding:`×{learning['compounding_mult']:.2f}`\n"
+        f"Pyramid: عند`+{PYRAMID_TRIGGER_PCT*100:.0f}%` (×`{PYRAMID_MAX_ADDS}`)\n"
+        f"فلتر السوق: BTC EMA{MARKET_FILTER_EMA}\n"
+        f"─────────────────\n"
+        f"Win% سابق:`{learning['win_rate']*100:.1f}%` | ATR SL×`{learning['atr_sl']:.2f}`\n"
+        f"عملات للفحص:`{len(all_symbols)}`"
     )
 
     adopt_existing_positions()
+    update_market_filter()
 
-    cycle = 0
+    cycle           = 0
+    market_check_c  = 0
+
     while True:
-        cycle += 1
+        cycle          += 1
+        market_check_c += 1
+
         try:
             balance = get_futures_balance()
             avail   = get_available_margin()
-            log.info(f"══ #{cycle} | رصيد:{balance:.2f} متاح:{avail:.2f} صفقات:{len(open_trades)} ══")
+            log.info(
+                f"══ #{cycle} | رصيد:{balance:.2f} متاح:{avail:.2f} "
+                f"صفقات:{len(open_trades)} | Risk:{learning['current_risk_pct']*100:.1f}% "
+                f"Comp:×{learning['compounding_mult']:.2f} | {'🟢BULL' if _market_is_bull else '🔴BEAR'} ══"
+            )
+
+            # فلتر السوق كل 20 دورة (~13 دقيقة)
+            if market_check_c >= 20:
+                update_market_filter()
+                market_check_c = 0
 
             if not check_protection(balance):
                 time.sleep(SCAN_INTERVAL_SEC)
                 continue
 
-            if avail < 2.0 or len(open_trades) >= MAX_OPEN_TRADES:
+            # لا ندخل في السوق الهابط
+            if not _market_is_bull:
+                log.info("🔴 السوق هابط — تخطي البحث")
                 time.sleep(SCAN_INTERVAL_SEC)
                 continue
 
-            # ── تجديد قائمة الرموز كل 100 دورة ─────────
+            if avail < 3.0 or len(open_trades) >= MAX_OPEN_TRADES:
+                time.sleep(SCAN_INTERVAL_SEC)
+                continue
+
+            # تجديد رموز كل 100 دورة
             if cycle % 100 == 0:
                 _all_symbols_cache.clear()
                 all_symbols = _get_all_symbols()
 
-            # ── فحص وتقييم العملات ───────────────────────
+            # ── بحث وتقييم ───────────────────────────────────
             candidates = []
             for sym in all_symbols:
                 if sym in open_trades:
@@ -1081,20 +1258,20 @@ def main_loop():
                 for c in candidates:
                     if len(open_trades) >= MAX_OPEN_TRADES:
                         break
-                    avail = get_available_margin()
-                    if avail < 2.0:
+                    if get_available_margin() < 3.0:
                         break
                     if open_long(c):
                         time.sleep(2)
             else:
                 log.info("لا فرص مناسبة.")
 
+            # تقرير منتصف الليل
             now = utcnow()
             if now.hour == 0 and now.minute < 2:
                 send_daily_report(balance)
 
         except Exception as e:
-            log.error(f"main_loop #{cycle}: {e}")
+            log.error(f"main #{cycle}: {e}")
             send_telegram(f"⚠️ خطأ:\n`{e}`")
 
         time.sleep(SCAN_INTERVAL_SEC)
@@ -1106,20 +1283,30 @@ def main_loop():
 
 @app.route("/")
 def home():
+    bal  = get_futures_balance()
+    risk = learning["current_risk_pct"] * 100
+    comp = learning["compounding_mult"]
+    wr   = learning["win_rate"] * 100
+    bull = "🟢 صاعد" if _market_is_bull else "🔴 هابط"
+
     lines = [
-        "<b>🤖 Bot v4.0</b> | الحماية: داخلية 100%",
-        f"Win%: {learning['win_rate']*100:.1f}% ({learning['total_trades']} صفقة)",
-        f"ATR SL×{learning['atr_sl']:.2f} TP×{learning['atr_tp']:.2f}",
+        f"<b>🤖 Bot v5.0</b> | السوق: {bull}",
+        f"رصيد: {bal:.2f} USDT | مفتوحة: {len(open_trades)}",
+        f"Win%: {wr:.1f}% ({learning['total_trades']} صفقة)",
+        f"Risk: {risk:.1f}% | Compounding: ×{comp:.2f}",
+        f"فوز متتالي: {learning['consecutive_wins']} | خسارة متتالية: {learning['consecutive_losses']}",
         "<hr>",
     ]
     for sym, t in open_trades.items():
         cp  = get_current_price(sym)
         pnl = t.pnl_pct(cp)
+        flags = []
+        if t.at_breakeven:   flags.append("🔒BE")
+        if t.trailing_active: flags.append("📈Trail")
+        if t.pyramid_adds:   flags.append(f"🔺×{t.pyramid_adds}")
         lines.append(
-            f"• <b>{sym}</b> @ {t.entry:.6f} | "
-            f"P&L: {pnl:+.2f}% | "
-            f"SL: {t.trail_sl:.6f} | "
-            f"{'🔒BE' if t.at_breakeven else ''} {'📈Trail' if t.trailing_active else ''}"
+            f"• <b>{sym}</b> @ {t.entry:.6f} | P&L: {pnl:+.2f}% | "
+            f"SL: {t.trail_sl:.6f} | {' '.join(flags)}"
         )
     return "<br>".join(lines)
 
@@ -1138,14 +1325,30 @@ def trades_route():
             "entry":       t.entry,
             "current":     cp,
             "pnl_pct":     round(t.pnl_pct(cp), 2),
-            "sl":          round(t.trail_sl, 6),
-            "tp":          round(t.tp_price, 6),
-            "highest":     round(t.highest_price, 6),
+            "sl":          round(t.trail_sl, 8),
+            "tp":          round(t.tp_price, 8),
+            "highest":     round(t.highest_price, 8),
             "breakeven":   t.at_breakeven,
             "trailing":    t.trailing_active,
+            "pyramid_adds": t.pyramid_adds,
             "hours":       round(t.duration_hours(), 2),
         }
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@app.route("/learning")
+def learning_route():
+    return json.dumps({
+        "win_rate":           learning["win_rate"],
+        "total_trades":       learning["total_trades"],
+        "current_risk_pct":   learning["current_risk_pct"],
+        "compounding_mult":   learning["compounding_mult"],
+        "consecutive_wins":   learning["consecutive_wins"],
+        "consecutive_losses": learning["consecutive_losses"],
+        "atr_sl":             learning["atr_sl"],
+        "atr_tp":             learning["atr_tp"],
+        "peak_balance":       learning["peak_balance"],
+    }, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
