@@ -22,7 +22,7 @@ BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY",    "YOUR_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY",     "AIzaSyAy2Re5aXDtAL-2-ol4qJhwmmPd-NpH3bM")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY",     "")
 
 # ─── إعدادات التداول ──────────────────────────────────────────
 LEVERAGE           = 10
@@ -95,6 +95,7 @@ bot_halted_total           = False
 bot_halted_daily           = False
 _last_report_date          = None
 _market_is_bull            = True
+_verified_protections    = set()
 
 learning = {
     "trade_history":      [],
@@ -252,7 +253,7 @@ def gemini_analyze(symbol: str, data: dict) -> dict | None:
 
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     )
 
     try:
@@ -273,8 +274,8 @@ def gemini_analyze(symbol: str, data: dict) -> dict | None:
             time.sleep(5)
             return None
 
-        if resp.status_code == 403:
-            log.warning(f"Gemini API مفتوح — جرب 1.5-flash-8b")
+        if resp.status_code == 403 or resp.status_code == 404:
+            log.warning(f"Gemini API فشل — جرب gemini-1.5-flash-8b")
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent?key={GEMINI_API_KEY}"
             resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.1, "maxOutputTokens": 400}}, timeout=25)
 
@@ -631,46 +632,35 @@ def place_binance_protection(symbol: str, entry: float, qty: float) -> bool:
 
     ok_sl = ok_tr = False
     sl_price = round_price(symbol, entry * (1 - BN_SL_PCT))
-    ts = int(time.time() * 1000)
 
     try:
-        query = f"symbol={symbol}&side=SELL&type=STOP_MARKET&stopPrice={sl_price}&quantity={qty}&reduceOnly=true&workingType=CONTRACT_PRICE&newOrderRespType=RESULT&timestamp={ts}"
-        signature = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-        query += f"&signature={signature}"
-
-        resp = requests.post(
-            "https://api.binance.com/api/v3/order",
-            data=query,
-            headers={"X-MBX-APIKEY": BINANCE_API_KEY, "Content-Type": "application/x-www-form-urlencoded"},
-            timeout=10,
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL,
+            type="STOP_MARKET",
+            stopPrice=sl_price,
+            quantity=qty,
+            reduceOnly=True,
+            workingType="CONTRACT_PRICE"
         )
-        if resp.status_code in (200, 201):
-            ok_sl = True
-            log.info(f"✅ BN-SL={sl_price} {symbol}")
-        else:
-            log.warning(f"❌ BN-SL {symbol}: {resp.text[:100]}")
+        ok_sl = True
+        log.info(f"✅ BN-SL={sl_price} {symbol}")
     except Exception as e:
         log.warning(f"❌ BN-SL {symbol}: {e}")
 
     time.sleep(0.2)
 
     try:
-        ts2 = int(time.time() * 1000)
-        query2 = f"symbol={symbol}&side=SELL&type=TRAILING_STOP_MARKET&quantity={qty}&callbackRate={BN_TRAILING_CALLBACK}&reduceOnly=true&timestamp={ts2}"
-        signature2 = hmac.new(BINANCE_API_SECRET.encode(), query2.encode(), hashlib.sha256).hexdigest()
-        query2 += f"&signature={signature2}"
-
-        resp2 = requests.post(
-            "https://api.binance.com/api/v3/order",
-            data=query2,
-            headers={"X-MBX-APIKEY": BINANCE_API_KEY, "Content-Type": "application/x-www-form-urlencoded"},
-            timeout=10,
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL,
+            type="TRAILING_STOP_MARKET",
+            quantity=qty,
+            callbackRate=BN_TRAILING_CALLBACK,
+            reduceOnly=True,
         )
-        if resp2.status_code in (200, 201):
-            ok_tr = True
-            log.info(f"✅ BN-Trail={BN_TRAILING_CALLBACK}% {symbol}")
-        else:
-            log.warning(f"❌ BN-Trail {symbol}: {resp2.text[:100]}")
+        ok_tr = True
+        log.info(f"✅ BN-Trail={BN_TRAILING_CALLBACK}% {symbol}")
     except Exception as e:
         log.warning(f"❌ BN-Trail {symbol}: {e}")
 
@@ -1310,14 +1300,14 @@ def send_daily_report(balance: float):
 # ══════════════════════════════════════════════════════════════
 
 def main_loop():
-    global bot_start_balance, daily_start_balance, daily_reset_date, client
+    global bot_start_balance, daily_start_balance, daily_reset_date, client, learning
 
     log.info("🚀 بوت v6.1 — Gemini AI Analyst")
     client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
     load_learning()
 
     initial = get_futures_balance()
-    if learning["peak_balance"] == 0:
+    if learning.get("peak_balance", 0) == 0:
         learning["peak_balance"] = initial
 
     bot_start_balance   = initial
