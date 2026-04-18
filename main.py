@@ -596,15 +596,14 @@ def place_binance_protection(symbol: str, entry: float, qty: float) -> bool:
     # ✅ إصلاح 1: "STOP_MARKET" كنص مباشر
     sl_price = round_price(symbol, entry * (1 - BN_SL_PCT))
     try:
-        client.futures_create_order(
-            symbol      = symbol,
-            side        = SIDE_SELL,
-            type        = "STOP_MARKET",
-            stopPrice   = sl_price,
-            quantity    = qty,
-            reduceOnly  = True,
-            workingType = "MARK_PRICE"
-        )
+        client.futures_algo_order(
+    symbol      = symbol,
+    side        = SIDE_SELL,
+    type        = "STOP",
+    stopPrice   = sl_price,
+    quantity    = qty,
+    reduceOnly  = True
+)
         ok_sl = True
         log.info(f"✅ BN-SL={sl_price} qty={qty} {symbol}")
     except Exception as e:
