@@ -539,7 +539,7 @@ def place_binance_protection(symbol: str, entry: float, qty: float) -> bool:
     return ok_sl or ok_tr
 
 
-def verify_binance_protection(symbol: str, trade: TradeState):
+def _old_verify_binance_protection(symbol: str, trade: TradeState):
     try:
         orders    = client.futures_get_open_orders(symbol=symbol)
         has_sl    = any(o["type"] == "STOP_MARKET"          for o in orders)
@@ -806,11 +806,6 @@ def protection_monitor():
                     )
                 elif event == "pyramid_trigger":
                     _execute_pyramid(symbol, trade, current)
-
-                if symbol not in _verified_protections:
-                    verify_binance_protection(symbol, trade)
-                    if trade.duration_hours() > 2:
-                        _verified_protections.add(symbol)
 
         except Exception as e:
             log.error(f"protection_monitor: {e}")
