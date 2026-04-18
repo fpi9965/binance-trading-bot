@@ -10,7 +10,7 @@
 =============================================================
 """
 
-import os, time, math, logging, threading, json, statistics, requests
+import os, time, math, logging, threading, json, statistics, requests, hmac, hashlib
 from datetime import datetime, timezone
 
 from binance.client import Client
@@ -22,7 +22,7 @@ BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY",    "YOUR_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY",     "YOUR_GEMINI_KEY")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY",     "AIzaSyAy2Re5aXDtAL-2-ol4qJhwmmPd-NpH3bM")
 
 # ─── إعدادات التداول ──────────────────────────────────────────
 LEVERAGE           = 10
@@ -229,7 +229,6 @@ confidence من 0 إلى 100"""
 def gemini_analyze(symbol: str, data: dict) -> dict | None:
     """
     يرسل البيانات لـ Gemini Flash ويحصل على قرار التداول
-    النموذج: gemini-2.0-flash (مجاني بحد 15 طلب/دقيقة)
     """
     if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_KEY":
         log.warning("GEMINI_API_KEY غير مضبوط")
@@ -253,7 +252,7 @@ def gemini_analyze(symbol: str, data: dict) -> dict | None:
 
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     )
 
     try:
@@ -262,27 +261,35 @@ def gemini_analyze(symbol: str, data: dict) -> dict | None:
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
-                    "temperature":    0.1,   # منخفض للحصول على ردود متسقة
-                    "maxOutputTokens": 300,
-                    "responseMimeType": "application/json",   # يجبر Gemini على JSON
+                    "temperature":    0.1,
+                    "maxOutputTokens": 400,
                 },
             },
-            timeout=20,
+            timeout=25,
         )
 
         if resp.status_code == 429:
-            log.warning(f"Gemini rate limit — انتظار 4 ثوان")
-            time.sleep(4)
+            log.warning(f"Gemini rate limit — انتظار 5 ثوان")
+            time.sleep(5)
             return None
 
+        if resp.status_code == 403:
+            log.warning(f"Gemini API مفتوح — جرب 1.5-flash-8b")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent?key={GEMINI_API_KEY}"
+            resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.1, "maxOutputTokens": 400}}, timeout=25)
+
         if resp.status_code != 200:
-            log.warning(f"Gemini API {resp.status_code}: {resp.text[:200]}")
+            log.warning(f"Gemini API {resp.status_code}: {resp.text[:150]}")
             return None
 
         resp_json = resp.json()
+
+        if "candidates" not in resp_json or not resp_json["candidates"]:
+            log.warning(f"Gemini no response: {resp_json}")
+            return None
+
         text = resp_json["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-        # تنظيف إذا جاء بـ ```
         if "```" in text:
             parts = text.split("```")
             for part in parts:
@@ -568,14 +575,45 @@ def _get_all_symbols() -> list:
         return []
 
 
-# ══════════════════════════════════════════════════════════════
-#  ✅ حماية بايننس — إصلاح كامل
-# ══════════════════════════════════════════════════════════════
+BN_API_URL = "https://api.binance.com/api/v3"
+
+
+def sign_request(params: dict) -> str:
+    import hmac, hashlib
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    signature = hmac.new(
+        BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256
+    ).hexdigest()
+    return query + "&signature=" + signature
+
+
+def binance_request(method: str, endpoint: str, params: dict = None) -> dict:
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    params = params or {}
+    params["timestamp"] = int(time.time() * 1000)
+
+    if method == "GET":
+        url = f"{BN_API_URL}{endpoint}"
+        query = sign_request(params)
+        url += "?" + query
+    else:
+        url = f"{BN_API_URL}{endpoint}"
+        body = sign_request(params)
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+    try:
+        resp = requests.request(method, url, headers=headers, data=body if method != "GET" else None, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        log.error(f"BN API {method} {endpoint}: {e}")
+        return {}
+
 
 def cancel_protection_orders(symbol: str):
     try:
         for o in client.futures_get_open_orders(symbol=symbol):
-            if o["type"] in PROTECTION_TYPES:
+            if "STOP" in o.get("type", "") or "TRAILING" in o.get("type", ""):
                 try:
                     client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
                 except Exception as e:
@@ -589,58 +627,52 @@ def place_binance_protection(symbol: str, entry: float, qty: float) -> bool:
         return False
 
     cancel_protection_orders(symbol)
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     ok_sl = ok_tr = False
-
-    # ✅ إصلاح 1: "STOP_MARKET" كنص مباشر
     sl_price = round_price(symbol, entry * (1 - BN_SL_PCT))
-    try:
-        client.futures_algo_order(
-    symbol      = symbol,
-    side        = SIDE_SELL,
-    type        = "STOP",
-    stopPrice   = sl_price,
-    quantity    = qty,
-    reduceOnly  = True
-)
-        ok_sl = True
-        log.info(f"✅ BN-SL={sl_price} qty={qty} {symbol}")
-    except Exception as e:
-        log.error(f"❌ BN-SL {symbol}: {e}")
-        send_telegram(f"⚠️ *فشل SL* `{symbol}`\n`{e}`")
+    ts = int(time.time() * 1000)
 
-    # ✅ إصلاح 2: Trailing بدون activationPrice أولاً (أكثر توافقاً)
     try:
-        client.futures_create_order(
-            symbol       = symbol,
-            side         = SIDE_SELL,
-            type         = "TRAILING_STOP_MARKET",
-            quantity     = qty,
-            callbackRate = BN_TRAILING_CALLBACK,
-            reduceOnly   = True,
+        query = f"symbol={symbol}&side=SELL&type=STOP_MARKET&stopPrice={sl_price}&quantity={qty}&reduceOnly=true&workingType=CONTRACT_PRICE&newOrderRespType=RESULT&timestamp={ts}"
+        signature = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+        query += f"&signature={signature}"
+
+        resp = requests.post(
+            "https://api.binance.com/api/v3/order",
+            data=query,
+            headers={"X-MBX-APIKEY": BINANCE_API_KEY, "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
         )
-        ok_tr = True
-        log.info(f"✅ BN-Trail={BN_TRAILING_CALLBACK}% {symbol}")
+        if resp.status_code in (200, 201):
+            ok_sl = True
+            log.info(f"✅ BN-SL={sl_price} {symbol}")
+        else:
+            log.warning(f"❌ BN-SL {symbol}: {resp.text[:100]}")
     except Exception as e:
-        log.error(f"❌ BN-Trail {symbol}: {e}")
-        # fallback مع activationPrice
-        try:
-            activation = round_price(symbol, entry * (1 + BN_TRAILING_ACTIVATION))
-            client.futures_create_order(
-                symbol          = symbol,
-                side            = SIDE_SELL,
-                type            = "TRAILING_STOP_MARKET",
-                quantity        = qty,
-                callbackRate    = BN_TRAILING_CALLBACK,
-                activationPrice = activation,
-                reduceOnly      = True,
-                workingType     = "CONTRACT_PRICE"
-            )
+        log.warning(f"❌ BN-SL {symbol}: {e}")
+
+    time.sleep(0.2)
+
+    try:
+        ts2 = int(time.time() * 1000)
+        query2 = f"symbol={symbol}&side=SELL&type=TRAILING_STOP_MARKET&quantity={qty}&callbackRate={BN_TRAILING_CALLBACK}&reduceOnly=true&timestamp={ts2}"
+        signature2 = hmac.new(BINANCE_API_SECRET.encode(), query2.encode(), hashlib.sha256).hexdigest()
+        query2 += f"&signature={signature2}"
+
+        resp2 = requests.post(
+            "https://api.binance.com/api/v3/order",
+            data=query2,
+            headers={"X-MBX-APIKEY": BINANCE_API_KEY, "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+        if resp2.status_code in (200, 201):
             ok_tr = True
-            log.info(f"✅ BN-Trail (fallback) {symbol}")
-        except Exception as e2:
-            log.error(f"❌ BN-Trail fallback {symbol}: {e2}")
+            log.info(f"✅ BN-Trail={BN_TRAILING_CALLBACK}% {symbol}")
+        else:
+            log.warning(f"❌ BN-Trail {symbol}: {resp2.text[:100]}")
+    except Exception as e:
+        log.warning(f"❌ BN-Trail {symbol}: {e}")
 
     return ok_sl or ok_tr
 
@@ -913,12 +945,15 @@ def protection_monitor():
                 elif event == "pyramid_trigger":
                     _execute_pyramid(symbol, trade, current)
 
-                verify_binance_protection(symbol, trade)
+                if symbol not in _verified_protections:
+                    verify_binance_protection(symbol, trade)
+                    if trade.duration_hours() > 2:
+                        _verified_protections.add(symbol)
 
         except Exception as e:
             log.error(f"protection_monitor: {e}")
 
-        time.sleep(5)
+        time.sleep(10)
 
 
 def _execute_close(symbol, trade, current_price, reason):
@@ -1009,9 +1044,59 @@ def _execute_pyramid(symbol, trade, current_price):
 #  OPEN POSITION
 # ══════════════════════════════════════════════════════════════
 
+def can_open_new_trade() -> bool:
+    if len(open_trades) >= MAX_OPEN_TRADES:
+        return False
+    if len(open_trades) == 0:
+        return True
+
+    for sym, trade in open_trades.items():
+        try:
+            current = get_current_price(sym)
+            if current <= 0:
+                continue
+            pnl = trade.pnl_pct(current)
+            if pnl < -3.0:
+                log.warning(f"⚠️ {sym} خسارة {-pnl:.1f}% — لا فتح صفقة جديدة")
+                return False
+            if trade.duration_hours() > 6 and pnl < 0:
+                log.warning(f"⚠️ {sym} مفتوحة {trade.duration_hours():.1f}h بدون ربح — لا فتح")
+                return False
+        except Exception:
+            continue
+
+    total_exposure = 0.0
+    for sym, trade in open_trades.items():
+        total_exposure += trade.qty * trade.entry
+
+    balance = get_futures_balance()
+    if total_exposure > balance * LEVERAGE * 0.7:
+        log.warning(f"⚠️ تعريض عالي {total_exposure/(balance*LEVERAGE)*100:.0f}% — لا فتح")
+        return False
+
+    return True
+
+
+def verify_all_protections():
+    for sym in list(open_trades.keys()):
+        trade = open_trades.get(sym)
+        if trade is None:
+            continue
+        amt, _ = get_actual_position(sym)
+        if abs(amt) < 1e-8:
+            continue
+        if trade.duration_hours() < 1:
+            continue
+        verify_binance_protection(sym, trade)
+
+
 def open_long(symbol: str, data: dict, gemini_result: dict) -> bool:
     amt, _ = get_actual_position(symbol)
-    if abs(amt) > 1e-8 or len(open_trades) >= MAX_OPEN_TRADES:
+    if abs(amt) > 1e-8:
+        return False
+
+    if not can_open_new_trade():
+        log.info(f"⏸️ تخطي {symbol}: شروط فتح لم تتحقق")
         return False
 
     price = data["price"]
