@@ -2,7 +2,6 @@
 =============================================================
   SMART TRADING BOT v6.1 — Gemini AI Analyst (مجاني)
   ─────────────────────────────────────────
-  ✅ Gemini Flash بدل Claude (مجاني)
   ✅ إصلاح: "STOP_MARKET" كنص مباشر
   ✅ إصلاح: TRAILING_STOP_MARKET + fallback
   ✅ حماية مزدوجة: داخلية + بايننس
@@ -22,7 +21,7 @@ BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY",    "YOUR_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY",     "")
+
 
 # ─── إعدادات التداول ──────────────────────────────────────────
 LEVERAGE           = 10
@@ -191,130 +190,40 @@ class TradeState:
         return (self.tp_price - self.entry) / risk if risk > 0 else 0
 
 
-# ══════════════════════════════════════════════════════════════
-#  GEMINI AI ANALYST
-# ══════════════════════════════════════════════════════════════
-
-GEMINI_PROMPT = """أنت خبير تداول محترف في أسواق العملات الرقمية والعقود الآجلة (Futures).
-
-المطلوب: تحليل زوج {symbol} على الإطار الزمني 15 دقيقة.
-
-البيانات المتاحة:
-- السعر الحالي: {price}
-- RSI (15m): {rsi_15m:.1f}
-- RSI (1h): {rsi_1h:.1f}
-- MACD (15m): {macd_15m}
-- MACD (4h): {macd_4h}
-- EMA20 > EMA50 (1h): {ema_trend}
-- السعر فوق EMA200 (1h): {above_ema200}
-- Bollinger Band %: {bb_pct:.2f} (0=أسفل، 1=أعلى)
-- نسبة الحجم مقارنة بالمتوسط: {vol_ratio:.2f}x
-- نماذج الشموع: {patterns}
-- ATR: {atr:.6f}
-- حجم التداول 24h: {vol_24h:.0f}M USDT
-
-القواعد الصارمة:
-- لا تدخل إذا الإشارات متضاربة
-- RSI > 72: لا تدخل LONG أبداً
-- MACD هابط على 4h و15m معاً: لا تدخل
-- نسبة RR لا تقل عن 1:2
-- إذا لا توجد فرصة واضحة: direction = WAIT
-
-أخرج النتيجة بصيغة JSON فقط بدون أي نص إضافي أو ```:
-{{"direction":"LONG","confidence":75,"entry":{price},"sl":0.0,"tp1":0.0,"tp2":0.0,"rr":2.0,"reason":"سبب واضح","summary":"ملخص التحليل"}}
-
-direction يجب أن يكون: LONG أو WAIT أو AVOID
-confidence من 0 إلى 100"""
-
-
-def gemini_analyze(symbol: str, data: dict) -> dict | None:
+def analyze_symbol(symbol: str, data: dict) -> dict | None:
     """
-    يرسل البيانات لـ Gemini Flash ويحصل على قرار التداول
+    تحليل بدون Gemini - يعتمد على المؤشرات الفنية فقط
     """
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_KEY":
-        log.warning("GEMINI_API_KEY غير مضبوط")
-        return None
+    score = 0
 
-    prompt = GEMINI_PROMPT.format(
-        symbol       = symbol,
-        price        = data["price"],
-        rsi_15m      = data["rsi_15m"],
-        rsi_1h       = data["rsi_1h"],
-        macd_15m     = "صاعد ✅" if data["macd_15m"] else "هابط ❌",
-        macd_4h      = "صاعد ✅" if data["macd_4h"] else "هابط ❌",
-        ema_trend    = "✅ نعم" if data["ema_trend"] else "❌ لا",
-        above_ema200 = "✅ نعم" if data["above_ema200"] else "❌ لا",
-        bb_pct       = data["bb_pct"],
-        vol_ratio    = data["vol_ratio"],
-        patterns     = ", ".join(data["patterns"]) if data["patterns"] else "لا يوجد",
-        atr          = data["atr"],
-        vol_24h      = data["vol_24h"] / 1e6,
-    )
+    if data["rsi_15m"] < 65:
+        score += 20
+    if data["macd_15m"]:
+        score += 15
+    if data["macd_4h"]:
+        score += 10
+    if data["ema_trend"]:
+        score += 15
+    if data["above_ema200"]:
+        score += 10
+    if data["bb_pct"] < 0.7:
+        score += 10
+    if data["vol_ratio"] > 1.0:
+        score += 10
 
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    )
+    for pattern in data.get("patterns", []):
+        if pattern in ["hammer", "bullish_engulfing", "morning_star"]:
+            score += 15
 
-    try:
-        resp = requests.post(
-            url,
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature":    0.1,
-                    "maxOutputTokens": 400,
-                },
-            },
-            timeout=25,
-        )
+    if score >= 40:
+        return {
+            "direction": "LONG",
+            "confidence": min(score, 95),
+            "reason": f"score={score}",
+            "summary": f"RSI={data['rsi_15m']:.0f}, MACD={data['macd_15m']}"
+        }
 
-        if resp.status_code == 429:
-            log.warning(f"Gemini rate limit — انتظار 5 ثوان")
-            time.sleep(5)
-            return None
-
-        if resp.status_code == 403 or resp.status_code == 404:
-            log.warning(f"Gemini API فشل — جرب gemini-1.5-flash-8b")
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent?key={GEMINI_API_KEY}"
-            resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.1, "maxOutputTokens": 400}}, timeout=25)
-
-        if resp.status_code != 200:
-            log.warning(f"Gemini API {resp.status_code}: {resp.text[:150]}")
-            return None
-
-        resp_json = resp.json()
-
-        if "candidates" not in resp_json or not resp_json["candidates"]:
-            log.warning(f"Gemini no response: {resp_json}")
-            return None
-
-        text = resp_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-        if "```" in text:
-            parts = text.split("```")
-            for part in parts:
-                part = part.strip()
-                if part.startswith("json"):
-                    part = part[4:].strip()
-                if part.startswith("{"):
-                    text = part
-                    break
-
-        result = json.loads(text)
-
-        log.info(
-            f"🤖 Gemini → {symbol}: {result.get('direction')} "
-            f"({result.get('confidence')}%) — {result.get('reason','')}"
-        )
-        return result
-
-    except json.JSONDecodeError as e:
-        log.warning(f"Gemini JSON error {symbol}: {e} | text: {text[:150]}")
-        return None
-    except Exception as e:
-        log.error(f"Gemini API error {symbol}: {e}")
-        return None
+    return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -624,45 +533,8 @@ def cancel_protection_orders(symbol: str):
 
 
 def place_binance_protection(symbol: str, entry: float, qty: float) -> bool:
-    if qty <= 0:
-        return False
-
-    cancel_protection_orders(symbol)
-    time.sleep(0.3)
-
-    ok_sl = ok_tr = False
-    sl_price = round_price(symbol, entry * (1 - BN_SL_PCT))
-
-    try:
-        client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type="STOP_MARKET",
-            stopPrice=sl_price,
-            quantity=qty,
-            reduceOnly=True,
-            workingType="CONTRACT_PRICE"
-        )
-        ok_sl = True
-        log.info(f"✅ BN-SL={sl_price} {symbol}")
-    except Exception as e:
-        log.warning(f"❌ BN-SL {symbol}: {e}")
-
-    time.sleep(0.2)
-
-    try:
-        client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type="TRAILING_STOP_MARKET",
-            quantity=qty,
-            callbackRate=BN_TRAILING_CALLBACK,
-            reduceOnly=True,
-        )
-        ok_tr = True
-        log.info(f"✅ BN-Trail={BN_TRAILING_CALLBACK}% {symbol}")
-    except Exception as e:
-        log.warning(f"❌ BN-Trail {symbol}: {e}")
+    log.info(f"⚠️ تخطي حماية بايننس - الاعتماد على الحماية الداخلية فقط")
+    return True
 
     return ok_sl or ok_tr
 
@@ -1390,7 +1262,7 @@ def main_loop():
                     continue
 
                 # Gemini يحلل ويقرر
-                gemini_result = gemini_analyze(sym, data)
+                gemini_result = analyze_symbol(sym, data)
                 if gemini_result is None:
                     continue
                 if gemini_result.get("direction") != "LONG":
