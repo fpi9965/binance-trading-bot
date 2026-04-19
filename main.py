@@ -1,15 +1,18 @@
 """
 =============================================================
-  SMART TRADING BOT v6.1 — Gemini AI Analyst (مجاني)
+  SMART TRADING BOT v7.0
   ─────────────────────────────────────────
-  ✅ إصلاح: "STOP_MARKET" كنص مباشر
-  ✅ إصلاح: TRAILING_STOP_MARKET + fallback
-  ✅ حماية مزدوجة: داخلية + بايننس
-  ✅ Dynamic Risk + Compounding + Pyramid
+  ✅ رافعة 20x
+  ✅ أقصى 4 صفقات متزامنة
+  ✅ تحليل متعدد الـ Timeframes (15m + 1h + 4h)
+  ✅ حماية داخلية كاملة (Breakeven + Trailing كل 5 ثوان)
+  ✅ SL على بايننس كشبكة أمان (2.5%)
+  ✅ Dynamic Risk + Compounding
+  ✅ RR لا تقل عن 1:2
 =============================================================
 """
 
-import os, time, math, logging, threading, json, statistics, requests, hmac, hashlib
+import os, time, math, logging, threading, json, statistics, requests
 from datetime import datetime, timezone
 
 from binance.client import Client
@@ -22,51 +25,43 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
+# ─── 8 عملات كبيرة فقط ───────────────────────────────────────
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT",
+    "DOGEUSDT", "BNBUSDT", "LINKUSDT", "LTCUSDT",
+]
 
 # ─── إعدادات التداول ──────────────────────────────────────────
-LEVERAGE           = 10
-MAX_OPEN_TRADES    = 4
-SCAN_INTERVAL_SEC  = 45
+LEVERAGE          = 20
+MAX_OPEN_TRADES   = 2
+SCAN_INTERVAL_SEC = 60
 
-# ─── Dynamic Risk ─────────────────────────────────────────────
-BASE_RISK_PCT   = 0.02
-MIN_RISK_PCT    = 0.01
-MAX_RISK_PCT    = 0.05
-RISK_STEP_WIN   = 0.004
-RISK_STEP_LOSS  = 0.004
-
-# ─── Pyramid ──────────────────────────────────────────────────
-PYRAMID_ENABLED      = True
-PYRAMID_TRIGGER_PCT  = 0.025
-PYRAMID_MAX_ADDS     = 1
-PYRAMID_SIZE_RATIO   = 0.4
+# ─── إدارة المخاطر ────────────────────────────────────────────
+BASE_RISK_PCT  = 0.02
+MIN_RISK_PCT   = 0.01
+MAX_RISK_PCT   = 0.04
+RISK_STEP_WIN  = 0.003
+RISK_STEP_LOSS = 0.005
 
 # ─── الحماية الداخلية ─────────────────────────────────────────
-ATR_SL_MULTIPLIER     = 1.8
-ATR_TP_MULTIPLIER     = 3.0
-ATR_SL_MAX            = 2.5
-MIN_RR_RATIO          = 1.5
-BREAKEVEN_TRIGGER_PCT = 0.012
-TRAILING_START_PCT    = 0.020
-TRAILING_STEP_PCT     = 0.006
-MAX_TRADE_HOURS       = 24
+ATR_SL_MULT        = 1.5
+ATR_TP_MULT        = 3.0
+ATR_SL_MAX         = 2.0
+MIN_RR             = 2.0
+BREAKEVEN_PCT      = 0.008
+TRAILING_START_PCT = 0.015
+TRAILING_STEP_PCT  = 0.005
+MAX_TRADE_HOURS    = 18
 
-# ─── حماية بايننس ─────────────────────────────────────────────
-BN_SL_PCT              = 0.02
-BN_TRAILING_CALLBACK   = 1.5
-BN_TRAILING_ACTIVATION = 0.008
+# ─── SL بايننس (شبكة أمان) ────────────────────────────────────
+BN_SL_PCT = 0.025
 
 # ─── حماية الرصيد ─────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  = 0.05
-TOTAL_LOSS_LIMIT_PCT  = 0.15
+DAILY_LOSS_LIMIT_PCT = 0.04
+TOTAL_LOSS_LIMIT_PCT = 0.12
 
-# ─── فلتر السوق ──────────────────────────────────────────────
-MARKET_FILTER_SYMBOL = "BTCUSDT"
-MARKET_FILTER_EMA    = 50
-
-# ─── فلترة العملات ────────────────────────────────────────────
-MIN_24H_QUOTE_VOLUME  = 50_000_000
-MIN_GEMINI_CONFIDENCE = 65
+# ─── شروط الدخول ─────────────────────────────────────────────
+MIN_SCORE = 55
 
 LEARNING_FILE = "bot_learning.json"
 
@@ -83,9 +78,8 @@ log = logging.getLogger(__name__)
 app    = Flask(__name__)
 client: Client = None
 
-open_trades:        dict = {}
-_filters_cache:     dict = {}
-_all_symbols_cache: list = []
+open_trades:    dict = {}
+_filters_cache: dict = {}
 
 bot_start_balance:   float = 0.0
 daily_start_balance: float = 0.0
@@ -94,13 +88,12 @@ bot_halted_total           = False
 bot_halted_daily           = False
 _last_report_date          = None
 _market_is_bull            = True
-_verified_protections    = set()
 
 learning = {
     "trade_history":      [],
     "symbol_stats":       {},
-    "atr_sl":             ATR_SL_MULTIPLIER,
-    "atr_tp":             ATR_TP_MULTIPLIER,
+    "atr_sl":             ATR_SL_MULT,
+    "atr_tp":             ATR_TP_MULT,
     "win_rate":           0.0,
     "total_trades":       0,
     "profitable_trades":  0,
@@ -111,25 +104,20 @@ learning = {
     "compounding_mult":   1.0,
 }
 
-PROTECTION_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"}
-
 
 # ══════════════════════════════════════════════════════════════
 #  TradeState
 # ══════════════════════════════════════════════════════════════
 
 class TradeState:
-    def __init__(self, symbol, entry, qty, atr,
-                 rsi=50, reasons=None, gemini_analysis=""):
-        self.symbol          = symbol
-        self.entry           = entry
-        self.qty             = qty
-        self.atr             = atr
-        self.rsi             = rsi
-        self.reasons         = reasons or []
-        self.gemini_analysis = gemini_analysis
-        self.pyramid_adds    = 0
-        self.open_time       = utcnow()
+    def __init__(self, symbol, entry, qty, atr, rsi=50, reasons=None):
+        self.symbol    = symbol
+        self.entry     = entry
+        self.qty       = qty
+        self.atr       = atr
+        self.rsi       = rsi
+        self.reasons   = reasons or []
+        self.open_time = utcnow()
 
         sl_mult       = learning["atr_sl"]
         tp_mult       = learning["atr_tp"]
@@ -138,8 +126,8 @@ class TradeState:
 
         risk   = entry - self.sl_price
         reward = self.tp_price - entry
-        if risk > 0 and reward / risk < MIN_RR_RATIO:
-            self.tp_price = entry + risk * MIN_RR_RATIO
+        if risk > 0 and reward / risk < MIN_RR:
+            self.tp_price = entry + risk * MIN_RR
 
         self.highest_price   = entry
         self.at_breakeven    = False
@@ -147,35 +135,30 @@ class TradeState:
         self.trail_sl        = self.sl_price
         self.last_notif_sl   = None
 
-    def update(self, current_price: float) -> str:
-        if current_price > self.highest_price:
-            self.highest_price = current_price
-        pnl_pct = (current_price - self.entry) / self.entry
+    def update(self, price: float) -> str:
+        if price > self.highest_price:
+            self.highest_price = price
+        pnl = (price - self.entry) / self.entry
 
-        if current_price >= self.tp_price:
+        if price >= self.tp_price:
             return "tp_hit"
-        if current_price <= self.trail_sl:
+        if price <= self.trail_sl:
             return "sl_hit"
 
-        if pnl_pct >= TRAILING_START_PCT:
+        if pnl >= TRAILING_START_PCT:
             new_trail = self.highest_price * (1 - TRAILING_STEP_PCT)
             if new_trail > self.trail_sl:
                 self.trail_sl        = new_trail
                 self.trailing_active = True
                 if (self.last_notif_sl is None or
-                        abs(new_trail - self.last_notif_sl) / self.entry > 0.003):
+                        abs(new_trail - self.last_notif_sl) / self.entry > 0.004):
                     self.last_notif_sl = new_trail
                     return "trailing_move"
-        elif pnl_pct >= BREAKEVEN_TRIGGER_PCT and not self.at_breakeven:
+        elif pnl >= BREAKEVEN_PCT and not self.at_breakeven:
             self.at_breakeven  = True
-            self.trail_sl      = self.entry * 1.001
+            self.trail_sl      = self.entry * 1.0005
             self.last_notif_sl = self.trail_sl
             return "breakeven"
-
-        if (PYRAMID_ENABLED
-                and self.pyramid_adds < PYRAMID_MAX_ADDS
-                and pnl_pct >= PYRAMID_TRIGGER_PCT * (self.pyramid_adds + 1)):
-            return "pyramid_trigger"
 
         return "none"
 
@@ -190,45 +173,13 @@ class TradeState:
         return (self.tp_price - self.entry) / risk if risk > 0 else 0
 
 
-def analyze_symbol(symbol: str, data: dict) -> dict | None:
-    """
-    تحليل بدون Gemini - يعتمد على المؤشرات الفنية فقط
-    """
-    score = 0
-
-    if data["rsi_15m"] < 65:
-        score += 20
-    if data["macd_15m"]:
-        score += 15
-    if data["macd_4h"]:
-        score += 10
-    if data["ema_trend"]:
-        score += 15
-    if data["above_ema200"]:
-        score += 10
-    if data["bb_pct"] < 0.7:
-        score += 10
-    if data["vol_ratio"] > 1.0:
-        score += 10
-
-    for pattern in data.get("patterns", []):
-        if pattern in ["hammer", "bullish_engulfing", "morning_star"]:
-            score += 15
-
-    if score >= 40:
-        return {
-            "direction": "LONG",
-            "confidence": min(score, 95),
-            "reason": f"score={score}",
-            "summary": f"RSI={data['rsi_15m']:.0f}, MACD={data['macd_15m']}"
-        }
-
-    return None
-
-
 # ══════════════════════════════════════════════════════════════
-#  LEARNING + DYNAMIC RISK
+#  LEARNING
 # ══════════════════════════════════════════════════════════════
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
 
 def load_learning():
     global learning
@@ -238,11 +189,7 @@ def load_learning():
                 data = json.load(f)
                 learning.update(data)
             learning["atr_sl"] = min(learning["atr_sl"], ATR_SL_MAX)
-            log.info(
-                f"📚 تعلم محمّل | صفقات:{learning['total_trades']} "
-                f"Win%:{learning['win_rate']*100:.1f}% "
-                f"Risk:{learning['current_risk_pct']*100:.1f}%"
-            )
+            log.info(f"📚 تعلم | صفقات:{learning['total_trades']} Win%:{learning['win_rate']*100:.1f}%")
     except Exception as e:
         log.error(f"load_learning: {e}")
 
@@ -255,29 +202,26 @@ def save_learning():
         log.error(f"save_learning: {e}")
 
 
-def update_dynamic_risk(won: bool, balance: float):
+def update_risk(won: bool, balance: float):
     risk = learning["current_risk_pct"]
     if won:
         learning["consecutive_wins"]  += 1
         learning["consecutive_losses"] = 0
         risk = min(risk + RISK_STEP_WIN, MAX_RISK_PCT)
-        log.info(f"📈 Risk ↑ {risk*100:.2f}%")
     else:
         learning["consecutive_losses"] += 1
         learning["consecutive_wins"]    = 0
         risk = max(risk - RISK_STEP_LOSS, MIN_RISK_PCT)
-        log.info(f"📉 Risk ↓ {risk*100:.2f}%")
 
     if learning["consecutive_wins"] >= 2 and risk < BASE_RISK_PCT:
         risk = BASE_RISK_PCT
-
     learning["current_risk_pct"] = risk
 
     if balance > learning["peak_balance"]:
         learning["peak_balance"] = balance
     if learning["peak_balance"] > 0 and bot_start_balance > 0:
         growth = learning["peak_balance"] / bot_start_balance
-        learning["compounding_mult"] = max(1.0, min(growth, 2.0))
+        learning["compounding_mult"] = max(1.0, min(growth, 1.5))
 
 
 def record_trade(trade: TradeState, exit_price: float, balance: float):
@@ -288,68 +232,54 @@ def record_trade(trade: TradeState, exit_price: float, balance: float):
         "symbol":  trade.symbol,
         "entry":   trade.entry,
         "exit":    exit_price,
-        "pnl_pct": round(pnl, 3),
+        "pnl_pct": round(pnl, 2),
         "won":     won,
+        "hours":   round(trade.duration_hours(), 1),
         "ts":      utcnow().isoformat(),
     })
-    if len(learning["trade_history"]) > 500:
-        learning["trade_history"] = learning["trade_history"][-500:]
+    if len(learning["trade_history"]) > 300:
+        learning["trade_history"] = learning["trade_history"][-300:]
 
-    sym_st = learning["symbol_stats"].setdefault(
-        trade.symbol, {"wins": 0, "losses": 0, "pnl": 0.0}
-    )
+    st = learning["symbol_stats"].setdefault(trade.symbol, {"wins": 0, "losses": 0, "pnl": 0.0})
     if won:
-        sym_st["wins"] += 1
+        st["wins"] += 1
     else:
-        sym_st["losses"] += 1
-    sym_st["pnl"] += pnl
+        st["losses"] += 1
+    st["pnl"] += pnl
 
     learning["total_trades"] += 1
     if won:
         learning["profitable_trades"] += 1
     learning["win_rate"] = learning["profitable_trades"] / learning["total_trades"]
 
-    update_dynamic_risk(won, balance)
+    update_risk(won, balance)
     _adapt_atr(won)
     save_learning()
-    log.info(f"📊 {trade.symbol} {'✅' if won else '❌'} {pnl:+.2f}%")
+    log.info(f"📊 {trade.symbol} {'✅' if won else '❌'} {pnl:+.2f}% | Win%:{learning['win_rate']*100:.1f}%")
 
 
 def _adapt_atr(won: bool):
-    history = learning["trade_history"]
-    if len(history) < 15:
+    h = learning["trade_history"]
+    if len(h) < 10:
         return
-    recent    = history[-30:]
+    recent    = h[-20:]
     loss_rate = sum(1 for t in recent if not t["won"]) / len(recent)
-
     if loss_rate > 0.55:
-        new_sl = min(learning["atr_sl"] * 1.06, ATR_SL_MAX)
-        if new_sl != learning["atr_sl"]:
-            learning["atr_sl"] = new_sl
-    elif loss_rate < 0.30:
-        learning["atr_sl"] = max(learning["atr_sl"] * 0.96, 1.3)
-
-    wins = [t for t in recent if t["won"]]
-    if wins:
-        avg_win = statistics.mean(t["pnl_pct"] for t in wins)
-        if avg_win > 8:
-            learning["atr_tp"] = min(learning["atr_tp"] * 1.04, 6.0)
-        elif avg_win < 3:
-            learning["atr_tp"] = max(learning["atr_tp"] * 0.97, 2.0)
+        learning["atr_sl"] = min(learning["atr_sl"] * 1.05, ATR_SL_MAX)
+    elif loss_rate < 0.25:
+        learning["atr_sl"] = max(learning["atr_sl"] * 0.97, 1.2)
 
 
-def is_blacklisted(symbol: str) -> bool:
+def get_effective_risk():
+    return min(learning["current_risk_pct"] * learning["compounding_mult"], MAX_RISK_PCT)
+
+
+def sym_win_rate(symbol: str) -> float:
     st = learning["symbol_stats"].get(symbol)
     if not st:
-        return False
+        return 0.5
     total = st["wins"] + st["losses"]
-    if total < 5:
-        return False
-    return (st["wins"] / total) < 0.35
-
-
-def get_effective_risk() -> float:
-    return min(learning["current_risk_pct"] * learning["compounding_mult"], MAX_RISK_PCT)
+    return st["wins"] / total if total else 0.5
 
 
 # ══════════════════════════════════════════════════════════════
@@ -372,10 +302,6 @@ def send_telegram(msg: str):
 # ══════════════════════════════════════════════════════════════
 #  BINANCE HELPERS
 # ══════════════════════════════════════════════════════════════
-
-def utcnow():
-    return datetime.now(timezone.utc)
-
 
 def get_futures_balance() -> float:
     try:
@@ -409,7 +335,7 @@ def get_actual_position(symbol: str) -> tuple:
             return float(p["positionAmt"]), float(p["entryPrice"])
     except Exception as e:
         if "-1022" not in str(e):
-            log.warning(f"actual_pos {symbol}: {e}")
+            log.warning(f"pos {symbol}: {e}")
     return 0.0, 0.0
 
 
@@ -424,11 +350,10 @@ def get_current_price(symbol: str) -> float:
 def get_filters(symbol: str) -> tuple:
     if symbol in _filters_cache:
         return _filters_cache[symbol]
-    if not _filters_cache:
-        try:
-            for s in client.futures_exchange_info()["symbols"]:
-                sym  = s["symbol"]
-                lot  = tick = None
+    try:
+        for s in client.futures_exchange_info()["symbols"]:
+            if s["symbol"] == symbol:
+                lot = tick = None
                 notional = 5.0
                 for f in s["filters"]:
                     ft = f["filterType"]
@@ -439,10 +364,11 @@ def get_filters(symbol: str) -> tuple:
                     elif ft == "MIN_NOTIONAL":
                         notional = float(f["notional"])
                 if lot and tick:
-                    _filters_cache[sym] = (lot, tick, notional)
-        except Exception as e:
-            log.error(f"filters: {e}")
-    return _filters_cache.get(symbol, (0.001, 0.01, 5.0))
+                    _filters_cache[symbol] = (lot, tick, notional)
+                    return _filters_cache[symbol]
+    except Exception as e:
+        log.error(f"filters {symbol}: {e}")
+    return (0.001, 0.01, 5.0)
 
 
 def round_qty(symbol: str, qty: float) -> float:
@@ -456,155 +382,59 @@ def round_qty(symbol: str, qty: float) -> float:
 def round_price(symbol: str, price: float) -> float:
     _, tick, _ = get_filters(symbol)
     if tick <= 0:
-        return round(price, 6)
+        return round(price, 4)
     prec = max(0, round(-math.log10(tick)))
     return float(f"{price:.{prec}f}")
 
 
-def _get_all_symbols() -> list:
-    global _all_symbols_cache
-    if _all_symbols_cache:
-        return _all_symbols_cache
-    try:
-        symbols = []
-        for s in client.futures_exchange_info()["symbols"]:
-            sym = s["symbol"]
-            if (sym.endswith("USDT")
-                    and s["status"] == "TRADING"
-                    and s["contractType"] == "PERPETUAL"):
-                try:
-                    sym.encode("ascii")
-                    symbols.append(sym)
-                except UnicodeEncodeError:
-                    pass
-        _all_symbols_cache = symbols
-        log.info(f"📋 عملات: {len(symbols)}")
-        return symbols
-    except Exception as e:
-        log.error(f"symbols: {e}")
-        return []
+# ══════════════════════════════════════════════════════════════
+#  SL على بايننس
+# ══════════════════════════════════════════════════════════════
 
-
-BN_API_URL = "https://api.binance.com/api/v3"
-
-
-def sign_request(params: dict) -> str:
-    import hmac, hashlib
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    signature = hmac.new(
-        BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256
-    ).hexdigest()
-    return query + "&signature=" + signature
-
-
-def binance_request(method: str, endpoint: str, params: dict = None) -> dict:
-    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-    params = params or {}
-    params["timestamp"] = int(time.time() * 1000)
-
-    if method == "GET":
-        url = f"{BN_API_URL}{endpoint}"
-        query = sign_request(params)
-        url += "?" + query
-    else:
-        url = f"{BN_API_URL}{endpoint}"
-        body = sign_request(params)
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-
-    try:
-        resp = requests.request(method, url, headers=headers, data=body if method != "GET" else None, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        log.error(f"BN API {method} {endpoint}: {e}")
-        return {}
-
-
-def cancel_protection_orders(symbol: str):
+def place_binance_sl(symbol: str, entry: float, qty: float) -> bool:
+    if qty <= 0:
+        return False
+    sl_price = round_price(symbol, entry * (1 - BN_SL_PCT))
     try:
         for o in client.futures_get_open_orders(symbol=symbol):
-            if "STOP" in o.get("type", "") or "TRAILING" in o.get("type", ""):
+            if "STOP" in o.get("type", ""):
                 try:
                     client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
-                except Exception as e:
-                    log.warning(f"إلغاء فشل {symbol}: {e}")
+                except Exception:
+                    pass
+        time.sleep(0.3)
+
+        client.futures_create_order(
+            symbol      = symbol,
+            side        = SIDE_SELL,
+            type        = "STOP_MARKET",
+            stopPrice   = sl_price,
+            quantity    = qty,
+            reduceOnly  = True,
+            workingType = "MARK_PRICE"
+        )
+        log.info(f"✅ BN-SL={sl_price} {symbol}")
+        return True
     except Exception as e:
-        log.error(f"cancel_protection {symbol}: {e}")
+        log.error(f"❌ BN-SL {symbol}: {e}")
+        return False
 
 
-def place_binance_protection(symbol: str, entry: float, qty: float) -> bool:
-    log.info(f"⚠️ تخطي حماية بايننس - الاعتماد على الحماية الداخلية فقط")
-    return True
-
-    return ok_sl or ok_tr
-
-
-def _old_verify_binance_protection(symbol: str, trade: TradeState):
+def check_and_restore_sl(symbol: str, trade: TradeState):
     try:
-        orders    = client.futures_get_open_orders(symbol=symbol)
-        has_sl    = any(o["type"] == "STOP_MARKET"          for o in orders)
-        has_trail = any(o["type"] == "TRAILING_STOP_MARKET"  for o in orders)
-
-        if not has_sl and not has_trail:
-            log.warning(f"⚠️ {symbol}: حماية مفقودة — إعادة")
+        orders = client.futures_get_open_orders(symbol=symbol)
+        has_sl = any("STOP" in o.get("type", "") for o in orders)
+        if not has_sl:
             amt, _ = get_actual_position(symbol)
             if abs(amt) > 1e-8:
-                place_binance_protection(symbol, trade.entry, abs(amt))
-        elif not has_sl:
-            sl_price = round_price(symbol, trade.entry * (1 - BN_SL_PCT))
-            amt, _   = get_actual_position(symbol)
-            try:
-                client.futures_create_order(
-                    symbol=symbol, side=SIDE_SELL, type="STOP_MARKET",
-                    stopPrice=sl_price, quantity=abs(amt),
-                    reduceOnly=True, workingType="MARK_PRICE"
-                )
-            except Exception as e:
-                log.error(f"إعادة SL {symbol}: {e}")
-        elif not has_trail:
-            amt, _ = get_actual_position(symbol)
-            try:
-                client.futures_create_order(
-                    symbol=symbol, side=SIDE_SELL,
-                    type="TRAILING_STOP_MARKET",
-                    quantity=abs(amt),
-                    callbackRate=BN_TRAILING_CALLBACK,
-                    reduceOnly=True,
-                )
-            except Exception as e:
-                log.error(f"إعادة Trail {symbol}: {e}")
+                log.warning(f"⚠️ {symbol}: SL مفقود — إعادة")
+                place_binance_sl(symbol, trade.entry, abs(amt))
     except Exception as e:
-        log.error(f"verify_protection {symbol}: {e}")
+        log.error(f"check_sl {symbol}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
-#  MARKET FILTER
-# ══════════════════════════════════════════════════════════════
-
-def update_market_filter():
-    global _market_is_bull
-    try:
-        kl  = client.futures_klines(symbol=MARKET_FILTER_SYMBOL, interval="1h", limit=60)
-        cls = [float(k[4]) for k in kl]
-        k   = 2 / (MARKET_FILTER_EMA + 1)
-        v   = sum(cls[:MARKET_FILTER_EMA]) / MARKET_FILTER_EMA
-        for c in cls[MARKET_FILTER_EMA:]:
-            v = c * k + v * (1 - k)
-        ema50           = v
-        prev            = _market_is_bull
-        _market_is_bull = cls[-1] >= ema50 * 0.98
-        if prev != _market_is_bull:
-            status = "🟢 صاعد" if _market_is_bull else "🔴 هابط"
-            send_telegram(
-                f"📡 *تغيير السوق: {status}*\n"
-                f"BTC:`{cls[-1]:.2f}` | EMA50:`{ema50:.2f}`"
-            )
-    except Exception as e:
-        log.error(f"market_filter: {e}")
-
-
-# ══════════════════════════════════════════════════════════════
-#  TECHNICAL DATA
+#  TECHNICAL ANALYSIS
 # ══════════════════════════════════════════════════════════════
 
 def ema_calc(values, period):
@@ -638,9 +468,9 @@ def compute_atr(highs, lows, closes, period=14):
     return sum(trs[-period:]) / min(period, len(trs)) if trs else closes[-1] * 0.01
 
 
-def compute_macd_bull(closes, fast=12, slow=26, signal=9):
+def compute_macd(closes, fast=12, slow=26, signal=9):
     if len(closes) < slow + signal:
-        return False
+        return False, 0
     kf, ks = 2/(fast+1), 2/(slow+1)
     ef = es = closes[0]
     line = []
@@ -648,7 +478,11 @@ def compute_macd_bull(closes, fast=12, slow=26, signal=9):
         ef = c*kf + ef*(1-kf)
         es = c*ks + es*(1-ks)
         line.append(ef - es)
-    return line[-1] > ema_calc(line, signal)
+    sig = ema_calc(line, signal)
+    hist     = line[-1] - sig
+    hist_prv = line[-2] - ema_calc(line[:-1], signal) if len(line) > signal else 0
+    bullish  = line[-1] > sig and hist > hist_prv
+    return bullish, hist
 
 
 def compute_bb_pct(closes, period=20):
@@ -659,13 +493,13 @@ def compute_bb_pct(closes, period=20):
     std = (sum((x-mid)**2 for x in window) / period) ** 0.5
     upper = mid + 2*std
     lower = mid - 2*std
-    width = upper - lower or 1
+    width = upper - lower or 1e-9
     return (closes[-1] - lower) / width
 
 
-def detect_patterns(klines):
+def detect_patterns(klines) -> list:
     found = []
-    if len(klines) < 3:
+    if len(klines) < 4:
         return found
 
     def c(k):
@@ -674,79 +508,196 @@ def detect_patterns(klines):
         rng  = h - l or 1e-9
         return o, h, l, cl, body, rng, h-max(o,cl), min(o,cl)-l
 
-    o1,h1,l1,c1,b1,r1,u1,lo1 = c(klines[-3])
-    o2,h2,l2,c2,b2,r2,u2,lo2 = c(klines[-2])
-    o3,h3,l3,c3,b3,r3,u3,lo3 = c(klines[-1])
+    o2,h2,l2,c2,b2,r2,u2,lo2 = c(klines[-3])
+    o3,h3,l3,c3,b3,r3,u3,lo3 = c(klines[-2])
+    o4,h4,l4,c4,b4,r4,u4,lo4 = c(klines[-1])
 
-    if lo3 > b3*2 and u3 < b3*0.3 and c3 > o3:
+    if lo4 > b4*2 and u4 < b4*0.5 and c4 > o4:
         found.append("hammer")
-    if c2 < o2 and c3 > o3 and c3 > o2 and o3 < c2:
-        found.append("bullish_engulfing")
-    if c1 < o1 and b2 < b1*0.3 and c3 > o3 and c3 > (o1+c1)/2:
+    if c3 < o3 and c4 > o4 and c4 > o3 and o4 < c3:
+        found.append("engulfing")
+    if c2 < o2 and b3 < b2*0.3 and c4 > o4 and c4 > (o2+c2)/2:
         found.append("morning_star")
-    if c1 > o1 and c2 > o2 and c3 > o3 and c3 > c2 > c1:
-        found.append("three_soldiers")
-    if b3/r3 > 0.85 and c3 > o3:
+    if b4/r4 > 0.80 and c4 > o4 and lo4 < b4*0.3:
         found.append("strong_bull")
     return found
 
 
-def gather_technical_data(symbol: str) -> dict | None:
+def analyze_symbol(symbol: str) -> dict | None:
+    """تحليل متعدد الـ Timeframes — 15m + 1h + 4h"""
     try:
-        ticker = client.futures_ticker(symbol=symbol)
-        vol24  = float(ticker.get("quoteVolume", 0))
-        price  = float(ticker["lastPrice"])
-
-        if vol24 < MIN_24H_QUOTE_VOLUME or price <= 0:
-            return None
-
-        kl15 = client.futures_klines(symbol=symbol, interval="15m", limit=210)
-        if len(kl15) < 80:
-            return None
-        cl15 = [float(k[4]) for k in kl15]
-        hi15 = [float(k[2]) for k in kl15]
-        lo15 = [float(k[3]) for k in kl15]
-        vo15 = [float(k[5]) for k in kl15]
-
-        kl1h = client.futures_klines(symbol=symbol, interval="1h", limit=210)
+        kl1h = client.futures_klines(symbol=symbol, interval="1h", limit=250)
         cl1h = [float(k[4]) for k in kl1h]
+        hi1h = [float(k[2]) for k in kl1h]
+        lo1h = [float(k[3]) for k in kl1h]
+        vo1h = [float(k[5]) for k in kl1h]
 
         kl4h = client.futures_klines(symbol=symbol, interval="4h", limit=100)
         cl4h = [float(k[4]) for k in kl4h]
 
-        avg_vol   = sum(vo15[-20:]) / 20 or 1
-        vol_ratio = vo15[-1] / avg_vol
+        kl15 = client.futures_klines(symbol=symbol, interval="15m", limit=150)
+        cl15 = [float(k[4]) for k in kl15]
+
+        ticker = client.futures_ticker(symbol=symbol)
+        price  = float(ticker["lastPrice"])
+        if price <= 0:
+            return None
+
+        # المؤشرات
+        ema20_1h  = ema_calc(cl1h, 20)
+        ema50_1h  = ema_calc(cl1h, 50)
+        ema200_1h = ema_calc(cl1h, 200)
+        ema50_4h  = ema_calc(cl4h, 50)
+        ema200_4h = ema_calc(cl4h, 200)
+
+        rsi_1h  = compute_rsi(cl1h)
+        rsi_15m = compute_rsi(cl15)
+
+        macd_bull_4h,  hist_4h  = compute_macd(cl4h)
+        macd_bull_1h,  hist_1h  = compute_macd(cl1h)
+        macd_bull_15m, hist_15m = compute_macd(cl15)
+
+        bb_pct = compute_bb_pct(cl1h)
+        atr_1h = compute_atr(hi1h, lo1h, cl1h)
+
+        avg_vol   = sum(vo1h[-20:]) / 20 or 1
+        vol_ratio = vo1h[-1] / avg_vol
+
+        patterns = detect_patterns(kl1h[-4:])
+
+        # ── قيود صارمة — رفض فوري ─────────────────────────
+        if not macd_bull_4h and not macd_bull_1h:
+            return None
+        if rsi_1h > 72 or rsi_15m > 75:
+            return None
+        if price < ema200_1h * 0.97:
+            return None
+
+        # ── نظام النقاط ────────────────────────────────────
+        score   = 0
+        reasons = []
+
+        # الاتجاه (35)
+        if price > ema200_1h:
+            score += 12; reasons.append("↑EMA200")
+        if ema20_1h > ema50_1h:
+            score += 8;  reasons.append("EMA20>50")
+        if price > ema50_4h:
+            score += 8;  reasons.append("↑4h-EMA50")
+        if price > ema200_4h:
+            score += 7;  reasons.append("↑4h-EMA200")
+
+        # RSI (25)
+        if 35 <= rsi_1h <= 55:
+            score += 15; reasons.append(f"RSI1h✓{rsi_1h:.0f}")
+        elif 25 <= rsi_1h < 35:
+            score += 20; reasons.append(f"RSI1h-OS{rsi_1h:.0f}")
+        elif 55 < rsi_1h <= 65:
+            score += 8;  reasons.append(f"RSI1h~{rsi_1h:.0f}")
+        elif rsi_1h > 70:
+            score -= 20
+
+        if 35 <= rsi_15m <= 60:
+            score += 10; reasons.append(f"RSI15✓{rsi_15m:.0f}")
+        elif rsi_15m > 70:
+            score -= 10
+
+        # MACD (25)
+        if macd_bull_4h:
+            score += 15; reasons.append("MACD4h↑")
+        if macd_bull_1h:
+            score += 8;  reasons.append("MACD1h↑")
+        if macd_bull_15m:
+            score += 2;  reasons.append("MACD15↑")
+
+        # Bollinger (10)
+        if bb_pct < 0.25:
+            score += 10; reasons.append("BB-low")
+        elif bb_pct > 0.85:
+            score -= 8
+
+        # أنماط (15)
+        pts = {"morning_star": 15, "engulfing": 10, "hammer": 8, "strong_bull": 6}
+        best = max((pts.get(p, 0) for p in patterns), default=0)
+        if best:
+            score += best; reasons.append(f"🕯️{patterns[0]}")
+
+        # الحجم (10)
+        if vol_ratio > 2.0:
+            score += 10; reasons.append(f"Vol×{vol_ratio:.1f}")
+        elif vol_ratio > 1.5:
+            score += 6;  reasons.append(f"Vol×{vol_ratio:.1f}")
+        elif vol_ratio < 0.5:
+            score -= 5
+
+        # سمعة الرمز
+        wr = sym_win_rate(symbol)
+        if wr > 0.60:
+            score += 5;  reasons.append(f"WR{wr*100:.0f}%")
+        elif wr < 0.35:
+            score -= 8
+
+        if score < MIN_SCORE:
+            log.info(f"{symbol}: score={score} < {MIN_SCORE} — تخطي")
+            return None
 
         return {
-            "symbol":       symbol,
-            "price":        price,
-            "vol_24h":      vol24,
-            "vol_ratio":    round(vol_ratio, 2),
-            "rsi_15m":      compute_rsi(cl15),
-            "rsi_1h":       compute_rsi(cl1h),
-            "macd_15m":     compute_macd_bull(cl15),
-            "macd_4h":      compute_macd_bull(cl4h),
-            "bb_pct":       compute_bb_pct(cl15),
-            "atr":          compute_atr(hi15, lo15, cl15),
-            "ema_trend":    ema_calc(cl1h, 20) > ema_calc(cl1h, 50),
-            "above_ema200": cl1h[-1] > ema_calc(cl1h, 200) * 0.98,
-            "patterns":     detect_patterns(kl15),
+            "symbol":   symbol,
+            "score":    score,
+            "rsi_1h":   round(rsi_1h, 1),
+            "rsi_15m":  round(rsi_15m, 1),
+            "price":    price,
+            "atr":      atr_1h,
+            "reasons":  reasons,
+            "patterns": patterns,
         }
+
     except Exception as e:
         if "-1022" not in str(e):
-            log.warning(f"gather_data {symbol}: {e}")
+            log.warning(f"analyze {symbol}: {e}")
         return None
+
+
+# ══════════════════════════════════════════════════════════════
+#  MARKET FILTER
+# ══════════════════════════════════════════════════════════════
+
+def update_market_filter():
+    global _market_is_bull
+    try:
+        kl    = client.futures_klines(symbol="BTCUSDT", interval="1h", limit=60)
+        cls   = [float(k[4]) for k in kl]
+        ema50 = ema_calc(cls, 50)
+        prev  = _market_is_bull
+        _market_is_bull = cls[-1] >= ema50 * 0.97
+        if prev != _market_is_bull:
+            s = "🟢 صاعد" if _market_is_bull else "🔴 هابط"
+            send_telegram(f"📡 *تغيير السوق: {s}*\nBTC:`{cls[-1]:.0f}` | EMA50:`{ema50:.0f}`")
+    except Exception as e:
+        log.error(f"market_filter: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
 #  CLOSE
 # ══════════════════════════════════════════════════════════════
 
+def cancel_sl_orders(symbol: str):
+    try:
+        for o in client.futures_get_open_orders(symbol=symbol):
+            if "STOP" in o.get("type", ""):
+                try:
+                    client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
+                except Exception:
+                    pass
+    except Exception as e:
+        log.error(f"cancel_sl {symbol}: {e}")
+
+
 def market_close(symbol: str, qty: float) -> bool:
     qty = abs(qty)
     if qty <= 0:
         return False
-    cancel_protection_orders(symbol)
+    cancel_sl_orders(symbol)
     for attempt in range(3):
         try:
             client.futures_create_order(
@@ -778,186 +729,100 @@ def protection_monitor():
                     _handle_closed_externally(symbol, trade)
                     continue
 
-                current = get_current_price(symbol)
-                if current <= 0:
+                price = get_current_price(symbol)
+                if price <= 0:
                     continue
 
                 if trade.duration_hours() >= MAX_TRADE_HOURS:
-                    _execute_close(symbol, trade, current, "timeout")
+                    _execute_close(symbol, trade, price, "timeout")
                     continue
 
-                event = trade.update(current)
+                event = trade.update(price)
 
                 if event == "sl_hit":
-                    _execute_close(symbol, trade, current, "sl_internal")
+                    _execute_close(symbol, trade, price, "sl_internal")
                 elif event == "tp_hit":
-                    _execute_close(symbol, trade, current, "tp_internal")
+                    _execute_close(symbol, trade, price, "tp_internal")
                 elif event == "breakeven":
                     send_telegram(
                         f"🔒 *Breakeven: {symbol}*\n"
-                        f"سعر:`{current:.6f}` SL:`{trade.trail_sl:.6f}`\n"
-                        f"P&L:`+{trade.pnl_pct(current):.2f}%`"
+                        f"سعر:`{price:.4f}` SL:`{trade.trail_sl:.4f}`\n"
+                        f"P&L:`+{trade.pnl_pct(price):.2f}%`"
                     )
                 elif event == "trailing_move":
                     send_telegram(
                         f"📈 *Trailing ↑ {symbol}*\n"
-                        f"سعر:`{current:.6f}` SL:`{trade.trail_sl:.6f}`\n"
-                        f"P&L:`+{trade.pnl_pct(current):.2f}%`"
+                        f"سعر:`{price:.4f}` | SL:`{trade.trail_sl:.4f}`\n"
+                        f"P&L:`+{trade.pnl_pct(price):.2f}%`"
                     )
-                elif event == "pyramid_trigger":
-                    _execute_pyramid(symbol, trade, current)
+
+                check_and_restore_sl(symbol, trade)
 
         except Exception as e:
             log.error(f"protection_monitor: {e}")
 
-        time.sleep(10)
+        time.sleep(5)
 
 
-def _execute_close(symbol, trade, current_price, reason):
+def _execute_close(symbol, trade, price, reason):
     amt, _ = get_actual_position(symbol)
     if abs(amt) < 1e-8:
         open_trades.pop(symbol, None)
         return
-
     ok = market_close(symbol, abs(amt))
     if ok:
         open_trades.pop(symbol, None)
-        pnl     = trade.pnl_pct(current_price)
+        pnl     = trade.pnl_pct(price)
         emoji   = "🟢" if pnl >= 0 else "🔴"
         balance = get_futures_balance()
-        record_trade(trade, current_price, balance)
-
-        labels = {
-            "sl_internal": "SL داخلي ⛔",
-            "tp_internal": "TP داخلي 💰",
+        record_trade(trade, price, balance)
+        labels  = {
+            "sl_internal": "وقف الخسارة ⛔",
+            "tp_internal": "جني الأرباح 💰",
             "timeout":     f"Timeout {MAX_TRADE_HOURS}h ⏰",
         }
         send_telegram(
             f"{emoji} *مُغلقة: {symbol}*\n"
             f"السبب: {labels.get(reason, reason)}\n"
-            f"دخول:`{trade.entry:.6f}` → خروج:`{current_price:.6f}`\n"
+            f"دخول:`{trade.entry:.4f}` → خروج:`{price:.4f}`\n"
             f"P&L:`{pnl:+.2f}%` (×{LEVERAGE})\n"
-            f"المدة:`{trade.duration_hours():.1f}h`\n"
+            f"المدة:`{trade.duration_hours():.1f}h` | أعلى:`{trade.highest_price:.4f}`\n"
             f"─────────────────\n"
-            f"Win%:`{learning['win_rate']*100:.1f}%` "
-            f"Risk:`{learning['current_risk_pct']*100:.1f}%` "
-            f"Comp:`×{learning['compounding_mult']:.2f}`\n"
+            f"Win%:`{learning['win_rate']*100:.1f}%` Risk:`{learning['current_risk_pct']*100:.1f}%`\n"
             f"💰 رصيد:`{balance:.2f}` USDT"
         )
     else:
-        send_telegram(f"🚨 *فشل إغلاق {symbol}*")
+        send_telegram(f"🚨 *فشل إغلاق {symbol}* — راجع يدوياً!")
 
 
 def _handle_closed_externally(symbol, trade):
     open_trades.pop(symbol, None)
-    current = get_current_price(symbol)
-    if current > 0:
-        pnl     = trade.pnl_pct(current)
+    price = get_current_price(symbol)
+    if price > 0:
+        pnl     = trade.pnl_pct(price)
         balance = get_futures_balance()
-        record_trade(trade, current, balance)
+        record_trade(trade, price, balance)
         emoji = "🟢" if pnl >= 0 else "🔴"
         send_telegram(
             f"{emoji} *مُغلقة (بايننس): {symbol}*\n"
-            f"P&L:`{pnl:+.2f}%` | رصيد:`{balance:.2f}`"
+            f"P&L:`{pnl:+.2f}%` | رصيد:`{balance:.2f}` USDT"
         )
-
-
-def _execute_pyramid(symbol, trade, current_price):
-    if trade.pyramid_adds >= PYRAMID_MAX_ADDS:
-        return
-    avail = get_available_margin()
-    if avail < 5.0:
-        return
-    add_qty = round_qty(symbol, trade.qty * PYRAMID_SIZE_RATIO)
-    if add_qty <= 0:
-        return
-    _, _, min_notional = get_filters(symbol)
-    if add_qty * current_price < min_notional:
-        return
-    try:
-        client.futures_create_order(
-            symbol=symbol, side=SIDE_BUY,
-            type=ORDER_TYPE_MARKET, quantity=add_qty,
-        )
-        time.sleep(1.0)
-        amt, _ = get_actual_position(symbol)
-        if abs(amt) < 1e-8:
-            return
-        if not trade.at_breakeven:
-            trade.trail_sl    = trade.entry * 1.001
-            trade.at_breakeven = True
-        trade.pyramid_adds += 1
-        place_binance_protection(symbol, trade.entry, abs(amt))
-        send_telegram(
-            f"🔺 *Pyramid L{trade.pyramid_adds}: {symbol}*\n"
-            f"إضافة:`{add_qty}` @ `{current_price:.6f}`\n"
-            f"P&L:`+{trade.pnl_pct(current_price):.2f}%`"
-        )
-    except Exception as e:
-        log.error(f"pyramid {symbol}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
 #  OPEN POSITION
 # ══════════════════════════════════════════════════════════════
 
-def can_open_new_trade() -> bool:
+def open_long(candidate: dict) -> bool:
+    symbol = candidate["symbol"]
+    price  = candidate["price"]
+    atr    = candidate["atr"]
+
+    amt, _ = get_actual_position(symbol)
+    if abs(amt) > 1e-8 or symbol in open_trades:
+        return False
     if len(open_trades) >= MAX_OPEN_TRADES:
         return False
-    if len(open_trades) == 0:
-        return True
-
-    for sym, trade in open_trades.items():
-        try:
-            current = get_current_price(sym)
-            if current <= 0:
-                continue
-            pnl = trade.pnl_pct(current)
-            if pnl < -3.0:
-                log.warning(f"⚠️ {sym} خسارة {-pnl:.1f}% — لا فتح صفقة جديدة")
-                return False
-            if trade.duration_hours() > 6 and pnl < 0:
-                log.warning(f"⚠️ {sym} مفتوحة {trade.duration_hours():.1f}h بدون ربح — لا فتح")
-                return False
-        except Exception:
-            continue
-
-    total_exposure = 0.0
-    for sym, trade in open_trades.items():
-        total_exposure += trade.qty * trade.entry
-
-    balance = get_futures_balance()
-    if total_exposure > balance * LEVERAGE * 0.7:
-        log.warning(f"⚠️ تعريض عالي {total_exposure/(balance*LEVERAGE)*100:.0f}% — لا فتح")
-        return False
-
-    return True
-
-
-def verify_all_protections():
-    for sym in list(open_trades.keys()):
-        trade = open_trades.get(sym)
-        if trade is None:
-            continue
-        amt, _ = get_actual_position(sym)
-        if abs(amt) < 1e-8:
-            continue
-        if trade.duration_hours() < 1:
-            continue
-        verify_binance_protection(sym, trade)
-
-
-def open_long(symbol: str, data: dict, gemini_result: dict) -> bool:
-    amt, _ = get_actual_position(symbol)
-    if abs(amt) > 1e-8:
-        return False
-
-    if not can_open_new_trade():
-        log.info(f"⏸️ تخطي {symbol}: شروط فتح لم تتحقق")
-        return False
-
-    price = data["price"]
-    atr   = data["atr"]
 
     try:
         _, _, min_notional = get_filters(symbol)
@@ -966,14 +831,15 @@ def open_long(symbol: str, data: dict, gemini_result: dict) -> bool:
 
         effective_risk = get_effective_risk()
         sl_distance    = atr * learning["atr_sl"]
-        sl_pct         = sl_distance / price if price > 0 else 0.02
+        sl_pct         = sl_distance / price if price > 0 else 0.025
 
         qty_by_risk  = (balance * effective_risk) / (price * sl_pct)
-        qty_by_avail = (avail * 0.85 * LEVERAGE) / price
+        qty_by_avail = (avail * 0.80 * LEVERAGE) / price
         raw_qty      = min(qty_by_risk, qty_by_avail)
         qty          = round_qty(symbol, raw_qty)
 
         if qty <= 0 or qty * price < min_notional:
+            log.info(f"{symbol}: qty={qty:.4f} أقل من الحد — تخطي")
             return False
 
         try:
@@ -998,38 +864,39 @@ def open_long(symbol: str, data: dict, gemini_result: dict) -> bool:
         actual_amt, actual_entry = get_actual_position(symbol)
 
         if abs(actual_amt) < 1e-8:
+            log.error(f"❌ {symbol}: لا وضعية بعد الأمر!")
             return False
 
         actual_qty   = abs(actual_amt)
         actual_entry = actual_entry or price
 
         trade = TradeState(
-            symbol         = symbol,
-            entry          = actual_entry,
-            qty            = actual_qty,
-            atr            = atr,
-            rsi            = data["rsi_15m"],
-            reasons        = data.get("patterns", []),
-            gemini_analysis = gemini_result.get("summary", ""),
+            symbol  = symbol,
+            entry   = actual_entry,
+            qty     = actual_qty,
+            atr     = atr,
+            rsi     = candidate["rsi_1h"],
+            reasons = candidate.get("reasons", []),
         )
         open_trades[symbol] = trade
 
-        bn_ok = place_binance_protection(symbol, actual_entry, actual_qty)
-        conf  = gemini_result.get("confidence", 0)
+        bn_ok = place_binance_sl(symbol, actual_entry, actual_qty)
 
         send_telegram(
-            f"🚀 *دخول {symbol}* (Gemini {conf}%)\n"
-            f"سعر:`{actual_entry:.6f}` | كمية:`{actual_qty}`\n"
-            f"─── داخلي ───\n"
-            f"SL:`{trade.sl_price:.6f}` | TP:`{trade.tp_price:.6f}`\n"
-            f"─── بايننس ───\n"
-            f"SL:`{round_price(symbol, actual_entry*(1-BN_SL_PCT))}` | "
-            f"Trail:`{BN_TRAILING_CALLBACK}%`\n"
-            f"{'✅ حماية بايننس' if bn_ok else '⚠️ راجع بايننس!'}\n"
+            f"🚀 *دخول {symbol}*\n"
+            f"سعر:`{actual_entry:.4f}` | كمية:`{actual_qty}`\n"
+            f"─── الحماية الداخلية ───\n"
+            f"SL:`{trade.sl_price:.4f}` | TP:`{trade.tp_price:.4f}`\n"
+            f"RR:`{trade.rr():.2f}` | BE`+{BREAKEVEN_PCT*100:.1f}%` | Trail`+{TRAILING_START_PCT*100:.1f}%`\n"
+            f"─── بايننس (شبكة أمان) ───\n"
+            f"SL:`{round_price(symbol, actual_entry*(1-BN_SL_PCT))}`\n"
+            f"{'✅ SL وُضع' if bn_ok else '⚠️ SL فشل!'}\n"
             f"─────────────────\n"
-            f"🤖 *Gemini:* {gemini_result.get('reason','')}\n"
-            f"⚙️ Risk:`{effective_risk*100:.1f}%` | Comp:`×{learning['compounding_mult']:.2f}`"
+            f"Score:`{candidate['score']}` RSI1h:`{candidate['rsi_1h']:.0f}` RSI15:`{candidate['rsi_15m']:.0f}`\n"
+            f"Risk:`{effective_risk*100:.1f}%` Comp:`×{learning['compounding_mult']:.2f}`\n"
+            f"📋 {' | '.join(candidate.get('reasons', [])[:5])}"
         )
+        log.info(f"✅ {symbol} @ {actual_entry:.4f} qty={actual_qty} Risk={effective_risk*100:.1f}%")
         return True
 
     except Exception as e:
@@ -1057,18 +924,18 @@ def adopt_existing_positions():
                 continue
 
             try:
-                kl  = client.futures_klines(symbol=sym, interval="15m", limit=30)
+                kl  = client.futures_klines(symbol=sym, interval="1h", limit=30)
                 atr = compute_atr(
                     [float(k[2]) for k in kl],
                     [float(k[3]) for k in kl],
                     [float(k[4]) for k in kl],
                 )
             except Exception:
-                atr = entry * 0.01
+                atr = entry * 0.015
 
             trade = TradeState(sym, entry, abs(amt), atr, reasons=["موروثة"])
             open_trades[sym] = trade
-            place_binance_protection(sym, entry, abs(amt))
+            place_binance_sl(sym, entry, abs(amt))
             adopted += 1
 
     except Exception as e:
@@ -1076,9 +943,9 @@ def adopt_existing_positions():
 
     msg = f"🔄 *تبنّي — {adopted} وضعية*\n"
     for sym, t in open_trades.items():
-        msg += f"  • `{sym}` @ `{t.entry:.6f}`\n"
+        msg += f"  • `{sym}` @ `{t.entry:.4f}`\n"
     if not open_trades:
-        msg += "لا وضعيات."
+        msg += "لا وضعيات مفتوحة."
     send_telegram(msg)
 
 
@@ -1094,7 +961,7 @@ def close_all_futures(reason: str):
             continue
         sym  = p["symbol"]
         side = SIDE_SELL if amt > 0 else SIDE_BUY
-        cancel_protection_orders(sym)
+        cancel_sl_orders(sym)
         try:
             client.futures_create_order(
                 symbol=sym, side=side, type=ORDER_TYPE_MARKET,
@@ -1152,11 +1019,13 @@ def send_daily_report(balance: float):
         msg += f"اليوم:`{d:.2f}%` | إجمالي:`{t:.2f}%`\n"
         msg += f"Win%:`{learning['win_rate']*100:.1f}%` ({learning['total_trades']} صفقة)\n"
         msg += f"Risk:`{learning['current_risk_pct']*100:.1f}%` Comp:`×{learning['compounding_mult']:.2f}`\n"
-        msg += f"مفتوحة:`{len(open_trades)}`\n"
-        for sym, tr in open_trades.items():
-            cp  = get_current_price(sym)
-            pnl = tr.pnl_pct(cp)
-            msg += f"  • `{sym}` P&L:`{pnl:+.2f}%`\n"
+        msg += f"─────────────────\n"
+        for sym in SYMBOLS:
+            st = learning["symbol_stats"].get(sym)
+            if st:
+                tot = st["wins"] + st["losses"]
+                wr  = st["wins"]/tot*100 if tot else 0
+                msg += f"`{sym.replace('USDT','')}`: {st['wins']}✅/{st['losses']}❌ WR:{wr:.0f}%\n"
         send_telegram(msg)
     except Exception as e:
         log.error(f"daily_report: {e}")
@@ -1167,47 +1036,51 @@ def send_daily_report(balance: float):
 # ══════════════════════════════════════════════════════════════
 
 def main_loop():
-    global bot_start_balance, daily_start_balance, daily_reset_date, client, learning
+    global bot_start_balance, daily_start_balance, daily_reset_date, client
 
-    log.info("🚀 بوت v6.1 — Gemini AI Analyst")
+    log.info("🚀 بوت v7.0 — 8 عملات | 20x | 2 صفقات")
     client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
     load_learning()
 
+    for sym in SYMBOLS:
+        get_filters(sym)
+
     initial = get_futures_balance()
-    if learning.get("peak_balance", 0) == 0:
+    if learning["peak_balance"] == 0:
         learning["peak_balance"] = initial
 
     bot_start_balance   = initial
     daily_start_balance = initial
     daily_reset_date    = utcnow().date()
 
-    all_symbols = _get_all_symbols()
-
     threading.Thread(target=protection_monitor, daemon=True, name="ProtMon").start()
 
     send_telegram(
-        f"🤖 *بوت v6.1 — Gemini AI* ✅\n"
+        f"🤖 *بوت v7.0* ✅\n"
         f"رصيد:`{initial:.2f}` USDT\n"
+        f"عملات: BTC ETH SOL XRP DOGE BNB LINK LTC\n"
+        f"رافعة:`{LEVERAGE}x` | أقصى:`{MAX_OPEN_TRADES}` صفقات\n"
         f"─── الحماية ───\n"
-        f"داخلي: SL×`{learning['atr_sl']:.2f}` | BE`+{BREAKEVEN_TRIGGER_PCT*100:.1f}%`\n"
-        f"بايننس: SL`{BN_SL_PCT*100:.0f}%` | Trail`{BN_TRAILING_CALLBACK}%`\n"
-        f"─── الفلاتر ───\n"
-        f"Vol_min:`{MIN_24H_QUOTE_VOLUME/1e6:.0f}M` | Gemini_min:`{MIN_GEMINI_CONFIDENCE}%`\n"
-        f"عملات:`{len(all_symbols)}`"
+        f"SL داخلي×`{learning['atr_sl']:.2f}` | BE`+{BREAKEVEN_PCT*100:.1f}%` | Trail`+{TRAILING_START_PCT*100:.1f}%`\n"
+        f"SL بايننس:`{BN_SL_PCT*100:.1f}%`\n"
+        f"─── المخاطرة ───\n"
+        f"Risk:`{learning['current_risk_pct']*100:.1f}%` | RR_min:`1:{MIN_RR:.0f}`\n"
+        f"يومي:`{DAILY_LOSS_LIMIT_PCT*100:.0f}%` | إجمالي:`{TOTAL_LOSS_LIMIT_PCT*100:.0f}%`"
     )
 
     adopt_existing_positions()
     update_market_filter()
 
-    cycle = market_check_c = 0
+    cycle = mf_cycle = 0
 
     while True:
-        cycle          += 1
-        market_check_c += 1
+        cycle    += 1
+        mf_cycle += 1
 
         try:
             balance = get_futures_balance()
             avail   = get_available_margin()
+
             log.info(
                 f"══ #{cycle} | رصيد:{balance:.2f} متاح:{avail:.2f} "
                 f"صفقات:{len(open_trades)}/{MAX_OPEN_TRADES} | "
@@ -1216,72 +1089,55 @@ def main_loop():
                 f"{'🟢BULL' if _market_is_bull else '🔴BEAR'} ══"
             )
 
-            if market_check_c >= 20:
+            if mf_cycle >= 15:
                 update_market_filter()
-                market_check_c = 0
+                mf_cycle = 0
 
             if not check_protection(balance):
                 time.sleep(SCAN_INTERVAL_SEC)
                 continue
 
             if not _market_is_bull:
-                log.info("🔴 هابط — توقف")
+                log.info("🔴 سوق هابط — انتظار")
                 time.sleep(SCAN_INTERVAL_SEC)
                 continue
 
-            if avail < 3.0 or len(open_trades) >= MAX_OPEN_TRADES:
+            if avail < 2.0 or len(open_trades) >= MAX_OPEN_TRADES:
                 time.sleep(SCAN_INTERVAL_SEC)
                 continue
 
-            if cycle % 100 == 0:
-                _all_symbols_cache.clear()
-                all_symbols = _get_all_symbols()
-
-            # ── جمع البيانات + Gemini ──────────────────────
-            for sym in all_symbols:
-                if len(open_trades) >= MAX_OPEN_TRADES:
-                    break
-                if get_available_margin() < 3.0:
-                    break
-                if sym in open_trades or is_blacklisted(sym):
+            # ── تحليل الـ 8 عملات ────────────────────────────
+            candidates = []
+            for sym in SYMBOLS:
+                if sym in open_trades:
                     continue
-
-                data = gather_technical_data(sym)
-                if data is None:
+                amt, _ = get_actual_position(sym)
+                if abs(amt) > 1e-8:
                     continue
-
-                # فلتر أولي قبل Gemini — يوفر API calls
-                if data["rsi_15m"] > 75:
-                    continue
-                if not data["macd_15m"] and not data["macd_4h"]:
-                    continue
-
-                # Gemini يحلل ويقرر
-                gemini_result = analyze_symbol(sym, data)
-                if gemini_result is None:
-                    continue
-                if gemini_result.get("direction") != "LONG":
-                    log.info(f"🤖 Gemini → {sym}: {gemini_result.get('direction')} — تخطي")
-                    continue
-                if gemini_result.get("confidence", 0) < MIN_GEMINI_CONFIDENCE:
+                result = analyze_symbol(sym)
+                if result:
+                    candidates.append(result)
                     log.info(
-                        f"🤖 Gemini → {sym}: ثقة {gemini_result.get('confidence')}% "
-                        f"< {MIN_GEMINI_CONFIDENCE}% — تخطي"
+                        f"✅ {sym}: {result['score']}pts "
+                        f"RSI1h={result['rsi_1h']:.0f} "
+                        f"RSI15={result['rsi_15m']:.0f}"
                     )
-                    continue
 
-                log.info(
-                    f"🤖 Gemini ✅ {sym}: {gemini_result.get('confidence')}% — "
-                    f"{gemini_result.get('reason','')}"
-                )
-                if open_long(sym, data, gemini_result):
-                    time.sleep(2)
-
-                # تأخير بين كل طلب Gemini (حد 15 طلب/دقيقة)
-                time.sleep(4)
+            if candidates:
+                candidates.sort(key=lambda x: (-x["score"], x["rsi_1h"]))
+                log.info(f"مرشحون: {[(c['symbol'], c['score']) for c in candidates]}")
+                for c in candidates:
+                    if len(open_trades) >= MAX_OPEN_TRADES:
+                        break
+                    if get_available_margin() < 2.0:
+                        break
+                    if open_long(c):
+                        time.sleep(3)
+            else:
+                log.info("لا فرص الآن — انتظار شروط أفضل.")
 
             now = utcnow()
-            if now.hour == 0 and now.minute < 2:
+            if now.hour == 0 and now.minute < 1:
                 send_daily_report(balance)
 
         except Exception as e:
@@ -1300,26 +1156,25 @@ def home():
     bal  = get_futures_balance()
     bull = "🟢 صاعد" if _market_is_bull else "🔴 هابط"
     lines = [
-        f"<b>🤖 Bot v6.1 — Gemini AI</b> | {bull}",
-        f"رصيد: {bal:.2f} USDT | مفتوحة: {len(open_trades)}/{MAX_OPEN_TRADES}",
+        f"<b>🤖 Bot v7.0</b> | {bull}",
+        f"رصيد: <b>{bal:.2f} USDT</b> | مفتوحة: {len(open_trades)}/{MAX_OPEN_TRADES}",
         f"Win%: {learning['win_rate']*100:.1f}% ({learning['total_trades']} صفقة)",
         f"Risk: {learning['current_risk_pct']*100:.1f}% | Comp: ×{learning['compounding_mult']:.2f}",
-        f"حماية: داخلية + بايننس (SL {BN_SL_PCT*100:.0f}% | Trail {BN_TRAILING_CALLBACK}%)",
         "<hr>",
     ]
     for sym, t in open_trades.items():
-        cp  = get_current_price(sym)
-        pnl = t.pnl_pct(cp)
+        cp    = get_current_price(sym)
+        pnl   = t.pnl_pct(cp)
+        color = "green" if pnl >= 0 else "red"
         flags = []
         if t.at_breakeven:    flags.append("🔒BE")
         if t.trailing_active: flags.append("📈Trail")
-        if t.pyramid_adds:    flags.append(f"🔺×{t.pyramid_adds}")
         lines.append(
-            f"• <b>{sym}</b> @ {t.entry:.6f} | P&L: {pnl:+.2f}% | "
-            f"SL: {t.trail_sl:.6f} | {' '.join(flags)}"
+            f"• <b>{sym}</b> @ {t.entry:.4f} | "
+            f"<span style='color:{color}'>{pnl:+.2f}%</span> | "
+            f"SL:{t.trail_sl:.4f} TP:{t.tp_price:.4f} | "
+            f"RR:{t.rr():.2f} | {' '.join(flags)}"
         )
-        if t.gemini_analysis:
-            lines.append(f"  🤖 {t.gemini_analysis}")
     return "<br>".join(lines)
 
 
@@ -1329,16 +1184,30 @@ def trades_route():
     for sym, t in open_trades.items():
         cp = get_current_price(sym)
         result[sym] = {
-            "entry":        t.entry,
-            "current":      cp,
-            "pnl_pct":      round(t.pnl_pct(cp), 2),
-            "sl_internal":  round(t.trail_sl, 8),
-            "tp_internal":  round(t.tp_price, 8),
-            "breakeven":    t.at_breakeven,
-            "trailing":     t.trailing_active,
-            "pyramid_adds": t.pyramid_adds,
-            "hours":        round(t.duration_hours(), 2),
-            "gemini":       t.gemini_analysis,
+            "entry":    t.entry,
+            "current":  cp,
+            "pnl_pct":  round(t.pnl_pct(cp), 2),
+            "sl":       round(t.trail_sl, 6),
+            "tp":       round(t.tp_price, 6),
+            "rr":       round(t.rr(), 2),
+            "breakeven": t.at_breakeven,
+            "trailing":  t.trailing_active,
+            "hours":    round(t.duration_hours(), 2),
+        }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@app.route("/stats")
+def stats_route():
+    result = {}
+    for sym in SYMBOLS:
+        st    = learning["symbol_stats"].get(sym, {"wins": 0, "losses": 0, "pnl": 0.0})
+        total = st["wins"] + st["losses"]
+        result[sym] = {
+            "wins":    st["wins"],
+            "losses":  st["losses"],
+            "win_rate": round(st["wins"]/total*100, 1) if total else 0,
+            "pnl":     round(st["pnl"], 2),
         }
     return json.dumps(result, ensure_ascii=False, indent=2)
 
