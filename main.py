@@ -28,8 +28,16 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
-# ─── عملات السكالبينج (سيولة عالية فقط) ──────────────────────
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+# ─── فلترة العملات الديناميكية ───────────────────────────────
+# SYMBOLS تُملأ تلقائياً عند البدء من Binance Futures
+SYMBOLS: list = []                  # لا تعدل هنا
+
+# ─── معايير اختيار العملات تلقائياً ─────────────────────────
+MIN_QUOTE_VOLUME_24H = 50_000_000   # أدنى حجم تداول يومي 50M USDT
+EXCLUDE_SYMBOLS      = {            # عملات مستثناة
+    "USDCUSDT","BUSDUSDT","TUSDUSDT","USDTUSDT",
+    "BTCDOMUSDT","DEFIUSDT","BNBDOMUSDT",
+}
 
 # ─── إعدادات التداول ──────────────────────────────────────────
 MAX_OPEN_TRADES   = 2
@@ -67,8 +75,8 @@ MAX_DAILY_TRADES     = 8        # أقصى صفقات يومياً
 CONSECUTIVE_LOSS_STOP = 2       # توقف بعد خسارتين متتاليتين
 
 # ─── شروط الدخول ─────────────────────────────────────────────
-MIN_SCORE      = 55
-MIN_VOLUME_RATIO = 1.3          # فوليوم أعلى من المعدل بـ 30%
+MIN_SCORE      = 45             # خفضنا من 55 لنكتشف الفرص أكثر
+MIN_VOLUME_RATIO = 1.0          # خفضنا من 1.3 — السوق الهادئ فوليومه أقل
 
 # ─── SL بايننس — قائمة العملات التي تدعم STOP_MARKET ─────────
 SL_SUPPORTED_SYMBOLS = set()    # يُملأ تلقائياً عند البدء
@@ -483,6 +491,50 @@ def probe_sl_support(symbol: str) -> bool:
         return "-4120" not in code
 
 
+def load_symbols_dynamic():
+    """
+    يجلب كل عملات Futures المقترنة بـ USDT،
+    يرتبها بحجم التداول اليومي تنازلياً،
+    ويحتفظ بأعلى 40 عملة سيولة (مع استثناء الـ stablecoins).
+    يُشغَّل مرة عند البدء + يتجدد كل 6 ساعات.
+    """
+    global SYMBOLS
+    try:
+        tickers = client.futures_ticker()           # 24h stats لكل الرموز
+        filtered = []
+        for t in tickers:
+            sym = t["symbol"]
+            if not sym.endswith("USDT"):
+                continue
+            if sym in EXCLUDE_SYMBOLS:
+                continue
+            vol = float(t.get("quoteVolume", 0))
+            if vol < MIN_QUOTE_VOLUME_24H:
+                continue
+            filtered.append((sym, vol))
+
+        # ترتيب تنازلي حسب الحجم
+        filtered.sort(key=lambda x: -x[1])
+        new_symbols = [s for s, _ in filtered[:40]]
+
+        if new_symbols:
+            SYMBOLS = new_symbols
+            log.info(f"📊 عملات محملة ({len(SYMBOLS)}): {' '.join(SYMBOLS[:10])}...")
+            # جلب filters للعملات الجديدة
+            for sym in SYMBOLS:
+                if sym not in _filters_cache:
+                    get_filters(sym)
+        else:
+            # fallback آمن
+            SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","DOGEUSDT"]
+            log.warning("⚠️ فشل جلب العملات — استخدام القائمة الافتراضية")
+
+    except Exception as e:
+        log.error(f"load_symbols_dynamic: {e}")
+        if not SYMBOLS:
+            SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT"]
+
+
 def detect_sl_supported_symbols():
     """يُشغَّل مرة عند البدء لمعرفة العملات الداعمة لـ STOP_MARKET"""
     global SL_SUPPORTED_SYMBOLS
@@ -645,14 +697,14 @@ def detect_market_structure(closes_5m, highs_5m, lows_5m):
     ema21 = ema_calc(closes_5m, 21)
     ema_diff_pct = abs(ema9 - ema21) / closes_5m[-1]
 
-    if ema_diff_pct < 0.001:  # EMA متلاصقة جداً → سوق عرضي
+    if ema_diff_pct < 0.0003:  # خففنا من 0.001 — كان يرفض كثيراً
         return "RANGING"
 
     # تذبذب السعر
     high_range = max(highs) - min(lows)
     price_range_pct = high_range / closes_5m[-1]
 
-    if price_range_pct < 0.004:  # أقل من 0.4% → سوق عرضي
+    if price_range_pct < 0.002:  # خففنا من 0.004
         return "RANGING"
 
     if ema9 > ema21 and closes_5m[-1] > ema21:
@@ -701,10 +753,10 @@ def analyze_symbol_scalp(symbol: str) -> dict | None:
 
         # ── رفض فوري ──────────────────────────────────────────
         if structure == "RANGING":
-            log.debug(f"{symbol}: سوق عرضي — رفض")
+            log.info(f"🔕 {symbol}: سوق عرضي (EMA diff={abs(ema_calc(cl5,9)-ema_calc(cl5,21))/cl5[-1]*100:.3f}%) — رفض")
             return None
         if vol_ratio < MIN_VOLUME_RATIO:
-            log.debug(f"{symbol}: فوليوم منخفض {vol_ratio:.2f} — رفض")
+            log.info(f"🔕 {symbol}: فوليوم منخفض {vol_ratio:.2f} < {MIN_VOLUME_RATIO} — رفض")
             return None
 
         # ── قرار الاتجاه ──────────────────────────────────────
@@ -794,6 +846,7 @@ def analyze_symbol_scalp(symbol: str) -> dict | None:
             if dist_to_support < 0.005:
                 score -= 15; reasons.append("قرب-دعم⚠️")
         else:
+            log.info(f"🔕 {symbol}: لا اتجاه واضح — هيكل={structure} EMA9={'↑' if ema9_5m>ema21_5m else '↓'} RSI={rsi_5m:.0f}")
             return None  # لا اتجاه واضح
 
         # فوليوم
@@ -1286,8 +1339,8 @@ def main_loop():
     client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
     load_learning()
 
-    for sym in SYMBOLS:
-        get_filters(sym)
+    # جلب العملات الديناميكي
+    load_symbols_dynamic()
 
     # كشف دعم STOP_MARKET لكل رمز
     detect_sl_supported_symbols()
@@ -1306,7 +1359,8 @@ def main_loop():
     send_telegram(
         f"🤖 *بوت v8.0 SCALPING* ✅\n"
         f"رصيد:`{initial:.2f}` USDT\n"
-        f"عملات: BTC ETH SOL XRP\n"
+        f"عملات: {len(SYMBOLS)} رمز (ديناميكي)\n"
+        f"أعلى 5: {' '.join(SYMBOLS[:5])}\n"
         f"إطار: 5m+1m | Long & Short\n"
         f"─── الأهداف ───\n"
         f"TP:`0.8-1.5%` SL:`0.5-0.8%` RR≥`{MIN_RR}`\n"
@@ -1322,11 +1376,12 @@ def main_loop():
     adopt_existing_positions()
     update_market_filter()
 
-    cycle = mf_cycle = 0
+    cycle = mf_cycle = sym_cycle = 0
 
     while True:
-        cycle    += 1
-        mf_cycle += 1
+        cycle     += 1
+        mf_cycle  += 1
+        sym_cycle += 1
 
         try:
             balance = get_futures_balance()
@@ -1342,6 +1397,12 @@ def main_loop():
             if mf_cycle >= 20:  # كل 5 دقائق (20×15s)
                 update_market_filter()
                 mf_cycle = 0
+
+            # تجديد قائمة العملات كل 6 ساعات (1440 دورة × 15s)
+            if sym_cycle >= 1440:
+                log.info("🔄 تجديد قائمة العملات...")
+                load_symbols_dynamic()
+                sym_cycle = 0
 
             if not check_protection(balance):
                 time.sleep(SCAN_INTERVAL_SEC)
