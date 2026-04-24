@@ -33,17 +33,16 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 SYMBOLS: list = []                  # لا تعدل هنا
 
 # ─── معايير اختيار العملات تلقائياً ─────────────────────────
-MIN_QUOTE_VOLUME_24H = 200_000_000  # 200M USDT — يضمن سيولة عالية فقط
+MIN_QUOTE_VOLUME_24H = 500_000_000  # 500M USDT — يضمن عملات كبيرة فعلاً
+MIN_TRADE_COUNT_24H  = 100_000      # أدنى عدد صفقات يومياً
 MAX_SYMBOLS          = 30           # أقصى عدد عملات للمسح
-EXCLUDE_SYMBOLS      = {            # عملات مستثناة
+EXCLUDE_SYMBOLS      = {
     # Stablecoins
     "USDCUSDT","BUSDUSDT","TUSDUSDT","USDTUSDT","DAIUSDT","FDUSDUSDT",
-    # معادن / commodities
+    # معادن
     "XAUUSDT","XAGUSDT",
-    # Leveraged / index tokens
+    # Leveraged / index
     "BTCDOMUSDT","DEFIUSDT","BNBDOMUSDT",
-    # عملات حجمها مصطنع أو صغيرة جداً
-    "CLUSDT","ZECUSDT","CHIPUSDT","KATUSDT",
 }
 
 # ─── إعدادات التداول ──────────────────────────────────────────
@@ -510,23 +509,25 @@ def load_symbols_dynamic():
         filtered = []
         for t in tickers:
             sym = t["symbol"]
-            # شرط 1: USDT فقط
             if not sym.endswith("USDT"):
                 continue
-            # شرط 2: ليس في القائمة المستثناة
             if sym in EXCLUDE_SYMBOLS:
                 continue
-            # شرط 3: لا يحتوي على أرقام في اسم العملة (مثل 1000SHIBUSDT مقبول لكن CHIP3USDT مرفوض)
+            # استثناء الـ leveraged tokens (UP/DOWN/BULL/BEAR)
             base = sym.replace("USDT", "")
-            if any(c.isdigit() for c in base) and not base.startswith("1000"):
+            if any(x in base for x in ["UP","DOWN","BULL","BEAR","LONG","SHORT"]):
                 continue
-            # شرط 4: حجم تداول كافٍ
+            # فلتر حجم التداول
             vol = float(t.get("quoteVolume", 0))
             if vol < MIN_QUOTE_VOLUME_24H:
                 continue
-            # شرط 5: تغير السعر معقول (ليس 0% = عملة ميتة)
-            price_change = abs(float(t.get("priceChangePercent", 0)))
-            if price_change < 0.1:
+            # فلتر عدد الصفقات (يكشف الحجم المصطنع)
+            count = int(t.get("count", 0))
+            if count < MIN_TRADE_COUNT_24H:
+                continue
+            # فلتر السعر (لا تقبل عملة بسعر 0)
+            price = float(t.get("lastPrice", 0))
+            if price <= 0:
                 continue
 
             filtered.append((sym, vol))
@@ -534,6 +535,14 @@ def load_symbols_dynamic():
         # ترتيب تنازلي حسب الحجم
         filtered.sort(key=lambda x: -x[1])
         new_symbols = [s for s, _ in filtered[:MAX_SYMBOLS]]
+
+        # ضمان وجود العملات الكبيرة دائماً في القائمة
+        GUARANTEED = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT",
+                      "DOGEUSDT","ADAUSDT","LINKUSDT","AVAXUSDT","DOTUSDT"]
+        for g in GUARANTEED:
+            if g not in new_symbols:
+                new_symbols.insert(0, g)
+        new_symbols = new_symbols[:MAX_SYMBOLS]
 
         if new_symbols:
             SYMBOLS = new_symbols
