@@ -1,18 +1,21 @@
 """
 =============================================================
-  SMART TRADING BOT v7.0
+  SMART TRADING BOT v8.0  — SCALPING EDITION
   ─────────────────────────────────────────
-  ✅ رافعة 20x
-  ✅ أقصى 4 صفقات متزامنة
-  ✅ تحليل متعدد الـ Timeframes (15m + 1h + 4h)
-  ✅ حماية داخلية كاملة (Breakeven + Trailing كل 5 ثوان)
-  ✅ SL على بايننس كشبكة أمان (2.5%)
-  ✅ Dynamic Risk + Compounding
-  ✅ RR لا تقل عن 1:2
+  ✅ إطار زمني: 5m أساسي + 1m تأكيد
+  ✅ EMA 9/21 + RSI + Volume + Support/Resistance
+  ✅ Long & Short
+  ✅ TP: 0.8%–1.5% | SL: 0.5%–0.8%
+  ✅ رافعة 5x–10x (حسب قوة الصفقة)
+  ✅ إصلاح BN-SL: STOP_MARKET مع fallback
+  ✅ Anti-loop: لا إعادة SL بعد فشل متكرر
+  ✅ Market Filter: رفض السوق العرضي
+  ✅ Max 2 صفقات متزامنة
+  ✅ Breakeven عند +0.5% | Trailing عند +0.7%
 =============================================================
 """
 
-import os, time, math, logging, threading, json, statistics, requests
+import os, time, math, logging, threading, json, requests
 from datetime import datetime, timezone
 
 from binance.client import Client
@@ -25,52 +28,59 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_API_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
-# ─── 8 عملات كبيرة فقط ───────────────────────────────────────
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "BNBUSDT", "LINKUSDT", "LTCUSDT",
-]
+# ─── عملات السكالبينج (سيولة عالية فقط) ──────────────────────
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 
 # ─── إعدادات التداول ──────────────────────────────────────────
-LEVERAGE          = 20
 MAX_OPEN_TRADES   = 2
-SCAN_INTERVAL_SEC = 60
+SCAN_INTERVAL_SEC = 15          # كل 15 ثانية للسكالبينج
 
-# ─── إدارة المخاطر ────────────────────────────────────────────
-BASE_RISK_PCT  = 0.02
-MIN_RISK_PCT   = 0.01
-MAX_RISK_PCT   = 0.04
-RISK_STEP_WIN  = 0.003
-RISK_STEP_LOSS = 0.005
+# ─── الرافعة (ديناميكية حسب قوة الصفقة) ─────────────────────
+LEVERAGE_STRONG = 10            # score >= 75
+LEVERAGE_NORMAL = 7             # score 60–74
+LEVERAGE_WEAK   = 5             # score 55–59
+
+# ─── أهداف السكالبينج ─────────────────────────────────────────
+TP_PCT         = 0.010          # 1.0%
+SL_PCT         = 0.006          # 0.6%
+TP_PCT_STRONG  = 0.015          # 1.5% للصفقات القوية
+SL_PCT_STRONG  = 0.008          # 0.8%
+MIN_RR         = 1.8            # نسبة مخاطرة مقبولة
 
 # ─── الحماية الداخلية ─────────────────────────────────────────
-ATR_SL_MULT        = 1.5
-ATR_TP_MULT        = 3.0
-ATR_SL_MAX         = 2.0
-MIN_RR             = 2.0
-BREAKEVEN_PCT      = 0.008
-TRAILING_START_PCT = 0.015
-TRAILING_STEP_PCT  = 0.005
-MAX_TRADE_HOURS    = 18
+BREAKEVEN_PCT       = 0.005     # +0.5% → SL لنقطة الدخول
+TRAILING_START_PCT  = 0.007     # +0.7% → يبدأ Trailing
+TRAILING_STEP_PCT   = 0.003     # خطوة Trailing
+MAX_TRADE_MINUTES   = 30        # أقصى مدة صفقة سكالبينج
 
-# ─── SL بايننس (شبكة أمان) ────────────────────────────────────
-BN_SL_PCT = 0.025
+# ─── إدارة المخاطر ────────────────────────────────────────────
+BASE_RISK_PCT  = 0.03           # 3% من رأس المال
+MIN_RISK_PCT   = 0.015
+MAX_RISK_PCT   = 0.05
+RISK_STEP_WIN  = 0.003
+RISK_STEP_LOSS = 0.006
 
 # ─── حماية الرصيد ─────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT = 0.04
-TOTAL_LOSS_LIMIT_PCT = 0.12
+DAILY_LOSS_LIMIT_PCT = 0.06     # 6% يومي
+TOTAL_LOSS_LIMIT_PCT = 0.15     # 15% إجمالي
+MAX_DAILY_TRADES     = 8        # أقصى صفقات يومياً
+CONSECUTIVE_LOSS_STOP = 2       # توقف بعد خسارتين متتاليتين
 
 # ─── شروط الدخول ─────────────────────────────────────────────
-MIN_SCORE = 55
+MIN_SCORE      = 55
+MIN_VOLUME_RATIO = 1.3          # فوليوم أعلى من المعدل بـ 30%
 
-LEARNING_FILE = "bot_learning.json"
+# ─── SL بايننس — قائمة العملات التي تدعم STOP_MARKET ─────────
+SL_SUPPORTED_SYMBOLS = set()    # يُملأ تلقائياً عند البدء
+
+LEARNING_FILE = "bot_learning_v8.json"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.FileHandler("bot_v8.log", encoding="utf-8"),
     ]
 )
 log = logging.getLogger(__name__)
@@ -81,6 +91,10 @@ client: Client = None
 open_trades:    dict = {}
 _filters_cache: dict = {}
 
+# ─── SL failure cache: لا نعيد المحاولة إذا فشل 3 مرات ───────
+_sl_fail_count: dict = {}
+MAX_SL_FAIL = 3
+
 bot_start_balance:   float = 0.0
 daily_start_balance: float = 0.0
 daily_reset_date           = None
@@ -88,12 +102,11 @@ bot_halted_total           = False
 bot_halted_daily           = False
 _last_report_date          = None
 _market_is_bull            = True
+_daily_trade_count         = 0
 
 learning = {
     "trade_history":      [],
     "symbol_stats":       {},
-    "atr_sl":             ATR_SL_MULT,
-    "atr_tp":             ATR_TP_MULT,
     "win_rate":           0.0,
     "total_trades":       0,
     "profitable_trades":  0,
@@ -102,6 +115,8 @@ learning = {
     "consecutive_losses": 0,
     "peak_balance":       0.0,
     "compounding_mult":   1.0,
+    "daily_trades":       0,
+    "best_hour_stats":    {},    # إحصاء أفضل ساعات التداول
 }
 
 
@@ -110,71 +125,108 @@ learning = {
 # ══════════════════════════════════════════════════════════════
 
 class TradeState:
-    def __init__(self, symbol, entry, qty, atr, rsi=50, reasons=None):
+    def __init__(self, symbol, entry, qty, direction, tp, sl, score, reasons=None):
         self.symbol    = symbol
         self.entry     = entry
         self.qty       = qty
-        self.atr       = atr
-        self.rsi       = rsi
+        self.direction = direction  # "long" or "short"
+        self.tp_price  = tp
+        self.sl_price  = sl
+        self.score     = score
         self.reasons   = reasons or []
         self.open_time = utcnow()
 
-        sl_mult       = learning["atr_sl"]
-        tp_mult       = learning["atr_tp"]
-        self.sl_price = entry - atr * sl_mult
-        self.tp_price = entry + atr * tp_mult
-
-        risk   = entry - self.sl_price
-        reward = self.tp_price - entry
-        if risk > 0 and reward / risk < MIN_RR:
-            self.tp_price = entry + risk * MIN_RR
-
         self.highest_price   = entry
+        self.lowest_price    = entry
         self.at_breakeven    = False
         self.trailing_active = False
-        self.trail_sl        = self.sl_price
+        self.trail_sl        = sl
         self.last_notif_sl   = None
 
     def update(self, price: float) -> str:
-        if price > self.highest_price:
-            self.highest_price = price
-        pnl = (price - self.entry) / self.entry
+        is_long = self.direction == "long"
 
-        if price >= self.tp_price:
-            return "tp_hit"
-        if price <= self.trail_sl:
-            return "sl_hit"
+        if is_long:
+            if price > self.highest_price:
+                self.highest_price = price
+            pnl = (price - self.entry) / self.entry
 
-        if pnl >= TRAILING_START_PCT:
-            new_trail = self.highest_price * (1 - TRAILING_STEP_PCT)
-            if new_trail > self.trail_sl:
-                self.trail_sl        = new_trail
-                self.trailing_active = True
-                if (self.last_notif_sl is None or
-                        abs(new_trail - self.last_notif_sl) / self.entry > 0.004):
-                    self.last_notif_sl = new_trail
-                    return "trailing_move"
-        elif pnl >= BREAKEVEN_PCT and not self.at_breakeven:
-            self.at_breakeven  = True
-            self.trail_sl      = self.entry * 1.0005
-            self.last_notif_sl = self.trail_sl
-            return "breakeven"
+            if price >= self.tp_price:
+                return "tp_hit"
+            if price <= self.trail_sl:
+                return "sl_hit"
+
+            if pnl >= TRAILING_START_PCT:
+                new_trail = self.highest_price * (1 - TRAILING_STEP_PCT)
+                if new_trail > self.trail_sl:
+                    self.trail_sl        = new_trail
+                    self.trailing_active = True
+                    if (self.last_notif_sl is None or
+                            abs(new_trail - self.last_notif_sl) / self.entry > 0.002):
+                        self.last_notif_sl = new_trail
+                        return "trailing_move"
+            elif pnl >= BREAKEVEN_PCT and not self.at_breakeven:
+                self.at_breakeven  = True
+                self.trail_sl      = self.entry * 1.0003
+                self.last_notif_sl = self.trail_sl
+                return "breakeven"
+        else:
+            # Short
+            if price < self.lowest_price:
+                self.lowest_price = price
+            pnl = (self.entry - price) / self.entry
+
+            if price <= self.tp_price:
+                return "tp_hit"
+            if price >= self.trail_sl:
+                return "sl_hit"
+
+            if pnl >= TRAILING_START_PCT:
+                new_trail = self.lowest_price * (1 + TRAILING_STEP_PCT)
+                if new_trail < self.trail_sl:
+                    self.trail_sl        = new_trail
+                    self.trailing_active = True
+                    if (self.last_notif_sl is None or
+                            abs(new_trail - self.last_notif_sl) / self.entry > 0.002):
+                        self.last_notif_sl = new_trail
+                        return "trailing_move"
+            elif pnl >= BREAKEVEN_PCT and not self.at_breakeven:
+                self.at_breakeven  = True
+                self.trail_sl      = self.entry * 0.9997
+                self.last_notif_sl = self.trail_sl
+                return "breakeven"
 
         return "none"
 
     def pnl_pct(self, price):
-        return (price - self.entry) / self.entry * 100 * LEVERAGE
+        leverage = self._get_leverage()
+        if self.direction == "long":
+            return (price - self.entry) / self.entry * 100 * leverage
+        else:
+            return (self.entry - price) / self.entry * 100 * leverage
 
-    def duration_hours(self):
-        return (utcnow() - self.open_time).total_seconds() / 3600
+    def _get_leverage(self):
+        if self.score >= 75:
+            return LEVERAGE_STRONG
+        elif self.score >= 60:
+            return LEVERAGE_NORMAL
+        return LEVERAGE_WEAK
+
+    def duration_minutes(self):
+        return (utcnow() - self.open_time).total_seconds() / 60
 
     def rr(self):
-        risk = self.entry - self.sl_price
-        return (self.tp_price - self.entry) / risk if risk > 0 else 0
+        if self.direction == "long":
+            risk   = self.entry - self.sl_price
+            reward = self.tp_price - self.entry
+        else:
+            risk   = self.sl_price - self.entry
+            reward = self.entry - self.tp_price
+        return reward / risk if risk > 0 else 0
 
 
 # ══════════════════════════════════════════════════════════════
-#  LEARNING
+#  UTILS
 # ══════════════════════════════════════════════════════════════
 
 def utcnow():
@@ -188,7 +240,6 @@ def load_learning():
             with open(LEARNING_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 learning.update(data)
-            learning["atr_sl"] = min(learning["atr_sl"], ATR_SL_MAX)
             log.info(f"📚 تعلم | صفقات:{learning['total_trades']} Win%:{learning['win_rate']*100:.1f}%")
     except Exception as e:
         log.error(f"load_learning: {e}")
@@ -213,8 +264,6 @@ def update_risk(won: bool, balance: float):
         learning["consecutive_wins"]    = 0
         risk = max(risk - RISK_STEP_LOSS, MIN_RISK_PCT)
 
-    if learning["consecutive_wins"] >= 2 and risk < BASE_RISK_PCT:
-        risk = BASE_RISK_PCT
     learning["current_risk_pct"] = risk
 
     if balance > learning["peak_balance"]:
@@ -225,24 +274,39 @@ def update_risk(won: bool, balance: float):
 
 
 def record_trade(trade: TradeState, exit_price: float, balance: float):
-    won = exit_price > trade.entry
-    pnl = trade.pnl_pct(exit_price)
+    is_long = trade.direction == "long"
+    won     = (exit_price > trade.entry) if is_long else (exit_price < trade.entry)
+    pnl     = trade.pnl_pct(exit_price)
+
+    # إحصاء أفضل الساعات
+    hour_key = str(trade.open_time.hour)
+    hs = learning["best_hour_stats"].setdefault(hour_key, {"wins": 0, "losses": 0})
+    if won:
+        hs["wins"] += 1
+    else:
+        hs["losses"] += 1
 
     learning["trade_history"].append({
-        "symbol":  trade.symbol,
-        "entry":   trade.entry,
-        "exit":    exit_price,
-        "pnl_pct": round(pnl, 2),
-        "won":     won,
-        "hours":   round(trade.duration_hours(), 1),
-        "ts":      utcnow().isoformat(),
+        "symbol":    trade.symbol,
+        "direction": trade.direction,
+        "entry":     trade.entry,
+        "exit":      exit_price,
+        "pnl_pct":   round(pnl, 2),
+        "won":       won,
+        "minutes":   round(trade.duration_minutes(), 1),
+        "score":     trade.score,
+        "ts":        utcnow().isoformat(),
     })
-    if len(learning["trade_history"]) > 300:
-        learning["trade_history"] = learning["trade_history"][-300:]
+    if len(learning["trade_history"]) > 500:
+        learning["trade_history"] = learning["trade_history"][-500:]
 
-    st = learning["symbol_stats"].setdefault(trade.symbol, {"wins": 0, "losses": 0, "pnl": 0.0})
+    st = learning["symbol_stats"].setdefault(trade.symbol, {"wins": 0, "losses": 0, "pnl": 0.0, "long_wins": 0, "short_wins": 0})
     if won:
         st["wins"] += 1
+        if is_long:
+            st["long_wins"] += 1
+        else:
+            st["short_wins"] += 1
     else:
         st["losses"] += 1
     st["pnl"] += pnl
@@ -253,25 +317,18 @@ def record_trade(trade: TradeState, exit_price: float, balance: float):
     learning["win_rate"] = learning["profitable_trades"] / learning["total_trades"]
 
     update_risk(won, balance)
-    _adapt_atr(won)
     save_learning()
-    log.info(f"📊 {trade.symbol} {'✅' if won else '❌'} {pnl:+.2f}% | Win%:{learning['win_rate']*100:.1f}%")
-
-
-def _adapt_atr(won: bool):
-    h = learning["trade_history"]
-    if len(h) < 10:
-        return
-    recent    = h[-20:]
-    loss_rate = sum(1 for t in recent if not t["won"]) / len(recent)
-    if loss_rate > 0.55:
-        learning["atr_sl"] = min(learning["atr_sl"] * 1.05, ATR_SL_MAX)
-    elif loss_rate < 0.25:
-        learning["atr_sl"] = max(learning["atr_sl"] * 0.97, 1.2)
+    log.info(f"📊 {trade.symbol} {trade.direction} {'✅' if won else '❌'} {pnl:+.2f}% | Win%:{learning['win_rate']*100:.1f}%")
 
 
 def get_effective_risk():
-    return min(learning["current_risk_pct"] * learning["compounding_mult"], MAX_RISK_PCT)
+    base = learning["current_risk_pct"]
+    # عقوبة الخسائر المتتالية
+    consec_loss = learning["consecutive_losses"]
+    if consec_loss >= 2:
+        base = MIN_RISK_PCT
+    mult = learning["compounding_mult"]
+    return min(base * mult, MAX_RISK_PCT)
 
 
 def sym_win_rate(symbol: str) -> float:
@@ -280,6 +337,19 @@ def sym_win_rate(symbol: str) -> float:
         return 0.5
     total = st["wins"] + st["losses"]
     return st["wins"] / total if total else 0.5
+
+
+def is_bad_hour() -> bool:
+    """تجنب الساعات ذات معدل خسارة مرتفع تاريخياً"""
+    hour_key = str(utcnow().hour)
+    hs = learning["best_hour_stats"].get(hour_key)
+    if not hs:
+        return False
+    total = hs["wins"] + hs["losses"]
+    if total < 5:
+        return False
+    wr = hs["wins"] / total
+    return wr < 0.35  # ساعة خاسرة تاريخياً
 
 
 # ══════════════════════════════════════════════════════════════
@@ -387,14 +457,70 @@ def round_price(symbol: str, price: float) -> float:
     return float(f"{price:.{prec}f}")
 
 
+def probe_sl_support(symbol: str) -> bool:
+    """اختبار إذا كان الرمز يدعم STOP_MARKET"""
+    try:
+        price = get_current_price(symbol)
+        if price <= 0:
+            return False
+        # محاولة أمر وهمي بكمية 0 — لكشف الدعم
+        test_price = round_price(symbol, price * 0.80)
+        client.futures_create_order(
+            symbol      = symbol,
+            side        = SIDE_SELL,
+            type        = "STOP_MARKET",
+            stopPrice   = test_price,
+            quantity    = round_qty(symbol, 0),  # كمية 0 → سيرفض لكن يكشف نوع الخطأ
+            reduceOnly  = True,
+            workingType = "MARK_PRICE"
+        )
+        return True
+    except Exception as e:
+        code = str(e)
+        if "-4120" in code:
+            return False
+        # أي خطأ آخر = مدعوم (الكمية 0 سترفض لكن بكود آخر)
+        return "-4120" not in code
+
+
+def detect_sl_supported_symbols():
+    """يُشغَّل مرة عند البدء لمعرفة العملات الداعمة لـ STOP_MARKET"""
+    global SL_SUPPORTED_SYMBOLS
+    log.info("🔍 كشف دعم STOP_MARKET...")
+    for sym in SYMBOLS:
+        supported = probe_sl_support(sym)
+        if supported:
+            SL_SUPPORTED_SYMBOLS.add(sym)
+        log.info(f"  {sym}: {'✅ مدعوم' if supported else '⚠️ غير مدعوم (Algo)'}")
+    log.info(f"STOP_MARKET مدعوم لـ: {SL_SUPPORTED_SYMBOLS or 'لا شيء — سنعتمد على الحماية الداخلية'}")
+
+
 # ══════════════════════════════════════════════════════════════
-#  SL على بايننس
+#  SL على بايننس — مع fallback ذكي
 # ══════════════════════════════════════════════════════════════
 
-def place_binance_sl(symbol: str, entry: float, qty: float) -> bool:
+def place_binance_sl(symbol: str, entry: float, qty: float, direction: str) -> bool:
+    """
+    ضع SL على بايننس — مع fallback إذا كان الرمز لا يدعم STOP_MARKET.
+    يراعي: Long → SELL STOP | Short → BUY STOP
+    لا يعيد المحاولة إذا وصل عدد الإخفاقات لـ MAX_SL_FAIL
+    """
     if qty <= 0:
         return False
-    sl_price = round_price(symbol, entry * (1 - BN_SL_PCT))
+
+    fail_key = f"{symbol}_{direction}"
+    if _sl_fail_count.get(fail_key, 0) >= MAX_SL_FAIL:
+        log.debug(f"⏭️ BN-SL {symbol}: تجاوز حد المحاولات — الحماية الداخلية تعمل")
+        return False
+
+    is_long = direction == "long"
+    sl_price = round_price(
+        symbol,
+        entry * (1 - 0.025) if is_long else entry * (1 + 0.025)
+    )
+    side = SIDE_SELL if is_long else SIDE_BUY
+
+    # أولاً: إلغاء الأوامر القديمة
     try:
         for o in client.futures_get_open_orders(symbol=symbol):
             if "STOP" in o.get("type", ""):
@@ -403,24 +529,46 @@ def place_binance_sl(symbol: str, entry: float, qty: float) -> bool:
                 except Exception:
                     pass
         time.sleep(0.3)
+    except Exception:
+        pass
 
-        client.futures_create_order(
-            symbol      = symbol,
-            side        = SIDE_SELL,
-            type        = "STOP_MARKET",
-            stopPrice   = sl_price,
-            quantity    = qty,
-            reduceOnly  = True,
-            workingType = "MARK_PRICE"
-        )
-        log.info(f"✅ BN-SL={sl_price} {symbol}")
-        return True
-    except Exception as e:
-        log.error(f"❌ BN-SL {symbol}: {e}")
-        return False
+    # محاولة STOP_MARKET
+    if symbol in SL_SUPPORTED_SYMBOLS or not SL_SUPPORTED_SYMBOLS:
+        try:
+            client.futures_create_order(
+                symbol      = symbol,
+                side        = side,
+                type        = "STOP_MARKET",
+                stopPrice   = sl_price,
+                quantity    = qty,
+                reduceOnly  = True,
+                workingType = "MARK_PRICE"
+            )
+            _sl_fail_count[fail_key] = 0
+            log.info(f"✅ BN-SL={sl_price} {symbol}")
+            return True
+        except Exception as e:
+            code = str(e)
+            if "-4120" in code:
+                # هذا الرمز لا يدعم STOP_MARKET
+                SL_SUPPORTED_SYMBOLS.discard(symbol)
+                log.warning(f"⚠️ {symbol}: لا يدعم STOP_MARKET — تفعيل الحماية الداخلية فقط")
+            else:
+                log.error(f"❌ BN-SL {symbol}: {e}")
+            _sl_fail_count[fail_key] = _sl_fail_count.get(fail_key, 0) + 1
+            return False
+
+    # إذا كان مدعوماً فقط بـ Algo — سجل ولا تحاول
+    log.info(f"ℹ️ {symbol}: SL محلي فقط (لا Algo API)")
+    return False
 
 
 def check_and_restore_sl(symbol: str, trade: TradeState):
+    """إعادة SL فقط إذا لم يتجاوز حد الإخفاقات"""
+    fail_key = f"{symbol}_{trade.direction}"
+    if _sl_fail_count.get(fail_key, 0) >= MAX_SL_FAIL:
+        return  # لا تعيد المحاولة
+
     try:
         orders = client.futures_get_open_orders(symbol=symbol)
         has_sl = any("STOP" in o.get("type", "") for o in orders)
@@ -428,18 +576,18 @@ def check_and_restore_sl(symbol: str, trade: TradeState):
             amt, _ = get_actual_position(symbol)
             if abs(amt) > 1e-8:
                 log.warning(f"⚠️ {symbol}: SL مفقود — إعادة")
-                place_binance_sl(symbol, trade.entry, abs(amt))
+                place_binance_sl(symbol, trade.entry, abs(amt), trade.direction)
     except Exception as e:
         log.error(f"check_sl {symbol}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
-#  TECHNICAL ANALYSIS
+#  TECHNICAL ANALYSIS — SCALPING (5m + 1m)
 # ══════════════════════════════════════════════════════════════
 
 def ema_calc(values, period):
     if len(values) < period:
-        return sum(values) / len(values)
+        return values[-1] if values else 0
     k = 2 / (period + 1)
     v = sum(values[:period]) / period
     for x in values[period:]:
@@ -457,199 +605,249 @@ def compute_rsi(closes, period=14):
         losses.append(max(-d, 0))
     ag = sum(gains[-period:]) / period
     al = sum(losses[-period:]) / period or 1e-9
-    return 100 - 100 / (1 + ag / al)
+    rs = ag / al
+    return 100 - 100 / (1 + rs)
 
 
-def compute_atr(highs, lows, closes, period=14):
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
-        trs.append(tr)
-    return sum(trs[-period:]) / min(period, len(trs)) if trs else closes[-1] * 0.01
+def find_support_resistance(highs, lows, closes, lookback=20):
+    """إيجاد أقرب دعم ومقاومة"""
+    recent_highs = highs[-lookback:]
+    recent_lows  = lows[-lookback:]
+    price        = closes[-1]
+
+    resistance = max(recent_highs)
+    support    = min(recent_lows)
+
+    # أقرب مستوى
+    closer_resistance = min((h for h in recent_highs if h > price), default=resistance)
+    closer_support    = max((l for l in recent_lows  if l < price), default=support)
+
+    return closer_support, closer_resistance
 
 
-def compute_macd(closes, fast=12, slow=26, signal=9):
-    if len(closes) < slow + signal:
-        return False, 0
-    kf, ks = 2/(fast+1), 2/(slow+1)
-    ef = es = closes[0]
-    line = []
-    for c in closes:
-        ef = c*kf + ef*(1-kf)
-        es = c*ks + es*(1-ks)
-        line.append(ef - es)
-    sig = ema_calc(line, signal)
-    hist     = line[-1] - sig
-    hist_prv = line[-2] - ema_calc(line[:-1], signal) if len(line) > signal else 0
-    bullish  = line[-1] > sig and hist > hist_prv
-    return bullish, hist
+def detect_market_structure(closes_5m, highs_5m, lows_5m):
+    """
+    تحديد هيكل السوق:
+    - TRENDING_UP: سلسلة قيعان وقمم متصاعدة
+    - TRENDING_DOWN: سلسلة قيعان وقمم متراجعة
+    - RANGING: سوق عرضي → لا ندخل
+    """
+    if len(closes_5m) < 20:
+        return "UNKNOWN"
+
+    # نقارن آخر 3 قيعان محلية و3 قمم
+    recent = closes_5m[-20:]
+    highs  = highs_5m[-20:]
+    lows   = lows_5m[-20:]
+
+    # اتجاه EMA
+    ema9  = ema_calc(closes_5m, 9)
+    ema21 = ema_calc(closes_5m, 21)
+    ema_diff_pct = abs(ema9 - ema21) / closes_5m[-1]
+
+    if ema_diff_pct < 0.001:  # EMA متلاصقة جداً → سوق عرضي
+        return "RANGING"
+
+    # تذبذب السعر
+    high_range = max(highs) - min(lows)
+    price_range_pct = high_range / closes_5m[-1]
+
+    if price_range_pct < 0.004:  # أقل من 0.4% → سوق عرضي
+        return "RANGING"
+
+    if ema9 > ema21 and closes_5m[-1] > ema21:
+        return "TRENDING_UP"
+    elif ema9 < ema21 and closes_5m[-1] < ema21:
+        return "TRENDING_DOWN"
+
+    return "RANGING"
 
 
-def compute_bb_pct(closes, period=20):
-    if len(closes) < period:
-        return 0.5
-    window = closes[-period:]
-    mid = sum(window) / period
-    std = (sum((x-mid)**2 for x in window) / period) ** 0.5
-    upper = mid + 2*std
-    lower = mid - 2*std
-    width = upper - lower or 1e-9
-    return (closes[-1] - lower) / width
-
-
-def detect_patterns(klines) -> list:
-    found = []
-    if len(klines) < 4:
-        return found
-
-    def c(k):
-        o, h, l, cl = float(k[1]), float(k[2]), float(k[3]), float(k[4])
-        body = abs(cl - o)
-        rng  = h - l or 1e-9
-        return o, h, l, cl, body, rng, h-max(o,cl), min(o,cl)-l
-
-    o2,h2,l2,c2,b2,r2,u2,lo2 = c(klines[-3])
-    o3,h3,l3,c3,b3,r3,u3,lo3 = c(klines[-2])
-    o4,h4,l4,c4,b4,r4,u4,lo4 = c(klines[-1])
-
-    if lo4 > b4*2 and u4 < b4*0.5 and c4 > o4:
-        found.append("hammer")
-    if c3 < o3 and c4 > o4 and c4 > o3 and o4 < c3:
-        found.append("engulfing")
-    if c2 < o2 and b3 < b2*0.3 and c4 > o4 and c4 > (o2+c2)/2:
-        found.append("morning_star")
-    if b4/r4 > 0.80 and c4 > o4 and lo4 < b4*0.3:
-        found.append("strong_bull")
-    return found
-
-
-def analyze_symbol(symbol: str) -> dict | None:
-    """تحليل متعدد الـ Timeframes — 15m + 1h + 4h"""
+def analyze_symbol_scalp(symbol: str) -> dict | None:
+    """
+    تحليل سكالبينج — 5m أساسي + 1m تأكيد
+    يُرجع dict للفرصة أو None
+    """
     try:
-        kl1h = client.futures_klines(symbol=symbol, interval="1h", limit=250)
-        cl1h = [float(k[4]) for k in kl1h]
-        hi1h = [float(k[2]) for k in kl1h]
-        lo1h = [float(k[3]) for k in kl1h]
-        vo1h = [float(k[5]) for k in kl1h]
+        # ── 5m البيانات ────────────────────────────────────────
+        kl5  = client.futures_klines(symbol=symbol, interval="5m", limit=100)
+        cl5  = [float(k[4]) for k in kl5]
+        hi5  = [float(k[2]) for k in kl5]
+        lo5  = [float(k[3]) for k in kl5]
+        vo5  = [float(k[5]) for k in kl5]
 
-        kl4h = client.futures_klines(symbol=symbol, interval="4h", limit=100)
-        cl4h = [float(k[4]) for k in kl4h]
+        # ── 1m التأكيد ─────────────────────────────────────────
+        kl1  = client.futures_klines(symbol=symbol, interval="1m", limit=30)
+        cl1  = [float(k[4]) for k in kl1]
 
-        kl15 = client.futures_klines(symbol=symbol, interval="15m", limit=150)
-        cl15 = [float(k[4]) for k in kl15]
-
-        ticker = client.futures_ticker(symbol=symbol)
-        price  = float(ticker["lastPrice"])
+        price = cl5[-1]
         if price <= 0:
             return None
 
-        # المؤشرات
-        ema20_1h  = ema_calc(cl1h, 20)
-        ema50_1h  = ema_calc(cl1h, 50)
-        ema200_1h = ema_calc(cl1h, 200)
-        ema50_4h  = ema_calc(cl4h, 50)
-        ema200_4h = ema_calc(cl4h, 200)
+        # ── المؤشرات ───────────────────────────────────────────
+        ema9_5m  = ema_calc(cl5, 9)
+        ema21_5m = ema_calc(cl5, 21)
+        ema9_1m  = ema_calc(cl1, 9)
+        ema21_1m = ema_calc(cl1, 21)
 
-        rsi_1h  = compute_rsi(cl1h)
-        rsi_15m = compute_rsi(cl15)
+        rsi_5m = compute_rsi(cl5)
+        rsi_1m = compute_rsi(cl1)
 
-        macd_bull_4h,  hist_4h  = compute_macd(cl4h)
-        macd_bull_1h,  hist_1h  = compute_macd(cl1h)
-        macd_bull_15m, hist_15m = compute_macd(cl15)
+        avg_vol   = sum(vo5[-20:]) / 20 or 1
+        vol_ratio = vo5[-1] / avg_vol
 
-        bb_pct = compute_bb_pct(cl1h)
-        atr_1h = compute_atr(hi1h, lo1h, cl1h)
+        support, resistance = find_support_resistance(hi5, lo5, cl5)
+        structure           = detect_market_structure(cl5, hi5, lo5)
 
-        avg_vol   = sum(vo1h[-20:]) / 20 or 1
-        vol_ratio = vo1h[-1] / avg_vol
-
-        patterns = detect_patterns(kl1h[-4:])
-
-        # ── قيود صارمة — رفض فوري ─────────────────────────
-        if not macd_bull_4h and not macd_bull_1h:
+        # ── رفض فوري ──────────────────────────────────────────
+        if structure == "RANGING":
+            log.debug(f"{symbol}: سوق عرضي — رفض")
             return None
-        if rsi_1h > 72 or rsi_15m > 75:
-            return None
-        if price < ema200_1h * 0.97:
+        if vol_ratio < MIN_VOLUME_RATIO:
+            log.debug(f"{symbol}: فوليوم منخفض {vol_ratio:.2f} — رفض")
             return None
 
-        # ── نظام النقاط ────────────────────────────────────
-        score   = 0
-        reasons = []
+        # ── قرار الاتجاه ──────────────────────────────────────
+        # هل هو تقاطع EMA 9/21 جديد؟
+        prev_ema9_5m  = ema_calc(cl5[:-1], 9)
+        prev_ema21_5m = ema_calc(cl5[:-1], 21)
+        ema_cross_up   = (prev_ema9_5m <= prev_ema21_5m) and (ema9_5m > ema21_5m)
+        ema_cross_down = (prev_ema9_5m >= prev_ema21_5m) and (ema9_5m < ema21_5m)
+        ema_above      = ema9_5m > ema21_5m
+        ema_below      = ema9_5m < ema21_5m
 
-        # الاتجاه (35)
-        if price > ema200_1h:
-            score += 12; reasons.append("↑EMA200")
-        if ema20_1h > ema50_1h:
-            score += 8;  reasons.append("EMA20>50")
-        if price > ema50_4h:
-            score += 8;  reasons.append("↑4h-EMA50")
-        if price > ema200_4h:
-            score += 7;  reasons.append("↑4h-EMA200")
+        # قرب الدعم/المقاومة
+        dist_to_support    = (price - support)    / price if support    > 0 else 1
+        dist_to_resistance = (resistance - price) / price if resistance > 0 else 1
 
-        # RSI (25)
-        if 35 <= rsi_1h <= 55:
-            score += 15; reasons.append(f"RSI1h✓{rsi_1h:.0f}")
-        elif 25 <= rsi_1h < 35:
-            score += 20; reasons.append(f"RSI1h-OS{rsi_1h:.0f}")
-        elif 55 < rsi_1h <= 65:
-            score += 8;  reasons.append(f"RSI1h~{rsi_1h:.0f}")
-        elif rsi_1h > 70:
-            score -= 20
+        # ── تحديد الاتجاه: Long أو Short ─────────────────────
+        direction = None
+        score     = 0
+        reasons   = []
 
-        if 35 <= rsi_15m <= 60:
-            score += 10; reasons.append(f"RSI15✓{rsi_15m:.0f}")
-        elif rsi_15m > 70:
-            score -= 10
+        # === LONG ===
+        if structure == "TRENDING_UP" and ema_above:
+            direction = "long"
+            score += 20; reasons.append("ترند↑")
 
-        # MACD (25)
-        if macd_bull_4h:
-            score += 15; reasons.append("MACD4h↑")
-        if macd_bull_1h:
-            score += 8;  reasons.append("MACD1h↑")
-        if macd_bull_15m:
-            score += 2;  reasons.append("MACD15↑")
+            if ema_cross_up:
+                score += 25; reasons.append("تقاطع↑جديد")
+            elif ema_above:
+                score += 10; reasons.append("EMA9>21")
 
-        # Bollinger (10)
-        if bb_pct < 0.25:
-            score += 10; reasons.append("BB-low")
-        elif bb_pct > 0.85:
-            score -= 8
+            # RSI 5m
+            if 45 <= rsi_5m <= 65:
+                score += 15; reasons.append(f"RSI5m✓{rsi_5m:.0f}")
+            elif 35 <= rsi_5m < 45:
+                score += 20; reasons.append(f"RSI5m-OS{rsi_5m:.0f}")
+            elif rsi_5m > 70:
+                score -= 25; reasons.append(f"RSI-OB{rsi_5m:.0f}")
+            elif rsi_5m < 35:
+                score += 10; reasons.append(f"RSI-Deep{rsi_5m:.0f}")
 
-        # أنماط (15)
-        pts = {"morning_star": 15, "engulfing": 10, "hammer": 8, "strong_bull": 6}
-        best = max((pts.get(p, 0) for p in patterns), default=0)
-        if best:
-            score += best; reasons.append(f"🕯️{patterns[0]}")
+            # RSI 1m تأكيد
+            if 40 <= rsi_1m <= 65:
+                score += 10; reasons.append(f"RSI1m✓{rsi_1m:.0f}")
+            elif rsi_1m > 70:
+                score -= 10
 
-        # الحجم (10)
-        if vol_ratio > 2.0:
-            score += 10; reasons.append(f"Vol×{vol_ratio:.1f}")
+            # 1m ترند تأكيد
+            if ema9_1m > ema21_1m:
+                score += 10; reasons.append("1m↑تأكيد")
+
+            # قرب الدعم
+            if dist_to_support < 0.005:
+                score += 15; reasons.append("دعم✓")
+
+            # ابتعاد عن المقاومة
+            if dist_to_resistance < 0.005:
+                score -= 15; reasons.append("قرب-مقاومة⚠️")
+
+        # === SHORT ===
+        elif structure == "TRENDING_DOWN" and ema_below:
+            direction = "short"
+            score += 20; reasons.append("ترند↓")
+
+            if ema_cross_down:
+                score += 25; reasons.append("تقاطع↓جديد")
+            elif ema_below:
+                score += 10; reasons.append("EMA9<21")
+
+            # RSI
+            if 35 <= rsi_5m <= 55:
+                score += 15; reasons.append(f"RSI5m✓{rsi_5m:.0f}")
+            elif rsi_5m > 65:
+                score += 20; reasons.append(f"RSI5m-OB{rsi_5m:.0f}")
+            elif rsi_5m < 30:
+                score -= 25; reasons.append(f"RSI-OS{rsi_5m:.0f}")
+
+            if 35 <= rsi_1m <= 60:
+                score += 10; reasons.append(f"RSI1m✓{rsi_1m:.0f}")
+            elif rsi_1m < 30:
+                score -= 10
+
+            if ema9_1m < ema21_1m:
+                score += 10; reasons.append("1m↓تأكيد")
+
+            if dist_to_resistance < 0.005:
+                score += 15; reasons.append("مقاومة✓")
+            if dist_to_support < 0.005:
+                score -= 15; reasons.append("قرب-دعم⚠️")
+        else:
+            return None  # لا اتجاه واضح
+
+        # فوليوم
+        if vol_ratio > 2.5:
+            score += 15; reasons.append(f"Vol×{vol_ratio:.1f}🔥")
         elif vol_ratio > 1.5:
-            score += 6;  reasons.append(f"Vol×{vol_ratio:.1f}")
-        elif vol_ratio < 0.5:
-            score -= 5
+            score += 8;  reasons.append(f"Vol×{vol_ratio:.1f}")
 
         # سمعة الرمز
         wr = sym_win_rate(symbol)
         if wr > 0.60:
-            score += 5;  reasons.append(f"WR{wr*100:.0f}%")
+            score += 8;  reasons.append(f"WR{wr*100:.0f}%")
         elif wr < 0.35:
-            score -= 8
+            score -= 10
 
         if score < MIN_SCORE:
-            log.info(f"{symbol}: score={score} < {MIN_SCORE} — تخطي")
+            log.info(f"{symbol} {direction}: score={score} < {MIN_SCORE} — رفض")
+            return None
+
+        # ── حساب SL / TP ───────────────────────────────────────
+        is_strong = score >= 75
+        tp_pct    = TP_PCT_STRONG if is_strong else TP_PCT
+        sl_pct    = SL_PCT_STRONG if is_strong else SL_PCT
+
+        if direction == "long":
+            tp_price = price * (1 + tp_pct)
+            sl_price = price * (1 - sl_pct)
+        else:
+            tp_price = price * (1 - tp_pct)
+            sl_price = price * (1 + sl_pct)
+
+        # فحص RR
+        if direction == "long":
+            rr = (tp_price - price) / (price - sl_price) if (price - sl_price) > 0 else 0
+        else:
+            rr = (price - tp_price) / (sl_price - price) if (sl_price - price) > 0 else 0
+
+        if rr < MIN_RR:
+            log.info(f"{symbol}: RR={rr:.2f} < {MIN_RR} — رفض")
             return None
 
         return {
-            "symbol":   symbol,
-            "score":    score,
-            "rsi_1h":   round(rsi_1h, 1),
-            "rsi_15m":  round(rsi_15m, 1),
-            "price":    price,
-            "atr":      atr_1h,
-            "reasons":  reasons,
-            "patterns": patterns,
+            "symbol":    symbol,
+            "direction": direction,
+            "score":     score,
+            "rsi_5m":    round(rsi_5m, 1),
+            "rsi_1m":    round(rsi_1m, 1),
+            "price":     price,
+            "tp_price":  round_price(symbol, tp_price),
+            "sl_price":  round_price(symbol, sl_price),
+            "rr":        round(rr, 2),
+            "vol_ratio": round(vol_ratio, 2),
+            "structure": structure,
+            "reasons":   reasons,
         }
 
     except Exception as e:
@@ -665,14 +863,14 @@ def analyze_symbol(symbol: str) -> dict | None:
 def update_market_filter():
     global _market_is_bull
     try:
-        kl    = client.futures_klines(symbol="BTCUSDT", interval="1h", limit=60)
-        cls   = [float(k[4]) for k in kl]
-        ema50 = ema_calc(cls, 50)
+        kl  = client.futures_klines(symbol="BTCUSDT", interval="15m", limit=50)
+        cls = [float(k[4]) for k in kl]
+        ema21 = ema_calc(cls, 21)
         prev  = _market_is_bull
-        _market_is_bull = cls[-1] >= ema50 * 0.97
+        _market_is_bull = cls[-1] >= ema21 * 0.98
         if prev != _market_is_bull:
             s = "🟢 صاعد" if _market_is_bull else "🔴 هابط"
-            send_telegram(f"📡 *تغيير السوق: {s}*\nBTC:`{cls[-1]:.0f}` | EMA50:`{ema50:.0f}`")
+            send_telegram(f"📡 *تغيير السوق: {s}*\nBTC:`{cls[-1]:.2f}` | EMA21:`{ema21:.2f}`")
     except Exception as e:
         log.error(f"market_filter: {e}")
 
@@ -693,18 +891,19 @@ def cancel_sl_orders(symbol: str):
         log.error(f"cancel_sl {symbol}: {e}")
 
 
-def market_close(symbol: str, qty: float) -> bool:
-    qty = abs(qty)
+def market_close(symbol: str, qty: float, direction: str) -> bool:
+    qty  = abs(qty)
     if qty <= 0:
         return False
     cancel_sl_orders(symbol)
+    side = SIDE_SELL if direction == "long" else SIDE_BUY
     for attempt in range(3):
         try:
             client.futures_create_order(
-                symbol=symbol, side=SIDE_SELL,
+                symbol=symbol, side=side,
                 type=ORDER_TYPE_MARKET, quantity=qty, reduceOnly=True,
             )
-            log.info(f"✅ إغلاق: {symbol} qty={qty}")
+            log.info(f"✅ إغلاق: {symbol} {direction} qty={qty}")
             return True
         except Exception as e:
             log.warning(f"close {symbol} #{attempt+1}: {e}")
@@ -733,7 +932,8 @@ def protection_monitor():
                 if price <= 0:
                     continue
 
-                if trade.duration_hours() >= MAX_TRADE_HOURS:
+                # timeout أقصر للسكالبينج
+                if trade.duration_minutes() >= MAX_TRADE_MINUTES:
                     _execute_close(symbol, trade, price, "timeout")
                     continue
 
@@ -745,15 +945,13 @@ def protection_monitor():
                     _execute_close(symbol, trade, price, "tp_internal")
                 elif event == "breakeven":
                     send_telegram(
-                        f"🔒 *Breakeven: {symbol}*\n"
-                        f"سعر:`{price:.4f}` SL:`{trade.trail_sl:.4f}`\n"
+                        f"🔒 *Breakeven: {symbol}* {'🟢L' if trade.direction=='long' else '🔴S'}\n"
                         f"P&L:`+{trade.pnl_pct(price):.2f}%`"
                     )
                 elif event == "trailing_move":
                     send_telegram(
                         f"📈 *Trailing ↑ {symbol}*\n"
-                        f"سعر:`{price:.4f}` | SL:`{trade.trail_sl:.4f}`\n"
-                        f"P&L:`+{trade.pnl_pct(price):.2f}%`"
+                        f"SL:`{trade.trail_sl:.4f}` | P&L:`+{trade.pnl_pct(price):.2f}%`"
                     )
 
                 check_and_restore_sl(symbol, trade)
@@ -761,7 +959,7 @@ def protection_monitor():
         except Exception as e:
             log.error(f"protection_monitor: {e}")
 
-        time.sleep(5)
+        time.sleep(3)  # أسرع للسكالبينج
 
 
 def _execute_close(symbol, trade, price, reason):
@@ -769,24 +967,24 @@ def _execute_close(symbol, trade, price, reason):
     if abs(amt) < 1e-8:
         open_trades.pop(symbol, None)
         return
-    ok = market_close(symbol, abs(amt))
+    ok = market_close(symbol, abs(amt), trade.direction)
     if ok:
         open_trades.pop(symbol, None)
         pnl     = trade.pnl_pct(price)
         emoji   = "🟢" if pnl >= 0 else "🔴"
         balance = get_futures_balance()
         record_trade(trade, price, balance)
+        dir_emoji = "📈L" if trade.direction == "long" else "📉S"
         labels  = {
             "sl_internal": "وقف الخسارة ⛔",
             "tp_internal": "جني الأرباح 💰",
-            "timeout":     f"Timeout {MAX_TRADE_HOURS}h ⏰",
+            "timeout":     f"Timeout {MAX_TRADE_MINUTES}m ⏰",
         }
         send_telegram(
-            f"{emoji} *مُغلقة: {symbol}*\n"
+            f"{emoji} *{dir_emoji} مُغلقة: {symbol}*\n"
             f"السبب: {labels.get(reason, reason)}\n"
             f"دخول:`{trade.entry:.4f}` → خروج:`{price:.4f}`\n"
-            f"P&L:`{pnl:+.2f}%` (×{LEVERAGE})\n"
-            f"المدة:`{trade.duration_hours():.1f}h` | أعلى:`{trade.highest_price:.4f}`\n"
+            f"P&L:`{pnl:+.2f}%` | مدة:`{trade.duration_minutes():.0f}m`\n"
             f"─────────────────\n"
             f"Win%:`{learning['win_rate']*100:.1f}%` Risk:`{learning['current_risk_pct']*100:.1f}%`\n"
             f"💰 رصيد:`{balance:.2f}` USDT"
@@ -813,15 +1011,28 @@ def _handle_closed_externally(symbol, trade):
 #  OPEN POSITION
 # ══════════════════════════════════════════════════════════════
 
-def open_long(candidate: dict) -> bool:
-    symbol = candidate["symbol"]
-    price  = candidate["price"]
-    atr    = candidate["atr"]
+def open_position(candidate: dict) -> bool:
+    global _daily_trade_count
+    symbol    = candidate["symbol"]
+    price     = candidate["price"]
+    direction = candidate["direction"]
+    score     = candidate["score"]
+
+    # الرافعة حسب قوة الصفقة
+    if score >= 75:
+        leverage = LEVERAGE_STRONG
+    elif score >= 60:
+        leverage = LEVERAGE_NORMAL
+    else:
+        leverage = LEVERAGE_WEAK
 
     amt, _ = get_actual_position(symbol)
     if abs(amt) > 1e-8 or symbol in open_trades:
         return False
     if len(open_trades) >= MAX_OPEN_TRADES:
+        return False
+    if _daily_trade_count >= MAX_DAILY_TRADES:
+        log.info(f"وصل الحد اليومي {MAX_DAILY_TRADES} صفقة")
         return False
 
     try:
@@ -830,27 +1041,28 @@ def open_long(candidate: dict) -> bool:
         avail   = get_available_margin()
 
         effective_risk = get_effective_risk()
-        sl_distance    = atr * learning["atr_sl"]
-        sl_pct         = sl_distance / price if price > 0 else 0.025
+        sl_pct         = SL_PCT_STRONG if score >= 75 else SL_PCT
 
         qty_by_risk  = (balance * effective_risk) / (price * sl_pct)
-        qty_by_avail = (avail * 0.80 * LEVERAGE) / price
+        qty_by_avail = (avail * 0.80 * leverage) / price
         raw_qty      = min(qty_by_risk, qty_by_avail)
         qty          = round_qty(symbol, raw_qty)
 
         if qty <= 0 or qty * price < min_notional:
-            log.info(f"{symbol}: qty={qty:.4f} أقل من الحد — تخطي")
+            log.info(f"{symbol}: qty={qty:.4f} — تخطي")
             return False
 
         try:
-            client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+            client.futures_change_leverage(symbol=symbol, leverage=leverage)
         except Exception as e:
             log.warning(f"leverage {symbol}: {e}")
+
+        side = SIDE_BUY if direction == "long" else SIDE_SELL
 
         for attempt in range(3):
             try:
                 client.futures_create_order(
-                    symbol=symbol, side=SIDE_BUY,
+                    symbol=symbol, side=side,
                     type=ORDER_TYPE_MARKET, quantity=qty
                 )
                 break
@@ -870,37 +1082,51 @@ def open_long(candidate: dict) -> bool:
         actual_qty   = abs(actual_amt)
         actual_entry = actual_entry or price
 
+        # أعد احتساب SL/TP بناءً على سعر الدخول الفعلي
+        tp_pct = TP_PCT_STRONG if score >= 75 else TP_PCT
+        if direction == "long":
+            tp = round_price(symbol, actual_entry * (1 + tp_pct))
+            sl = round_price(symbol, actual_entry * (1 - sl_pct))
+        else:
+            tp = round_price(symbol, actual_entry * (1 - tp_pct))
+            sl = round_price(symbol, actual_entry * (1 + sl_pct))
+
         trade = TradeState(
-            symbol  = symbol,
-            entry   = actual_entry,
-            qty     = actual_qty,
-            atr     = atr,
-            rsi     = candidate["rsi_1h"],
-            reasons = candidate.get("reasons", []),
+            symbol    = symbol,
+            entry     = actual_entry,
+            qty       = actual_qty,
+            direction = direction,
+            tp        = tp,
+            sl        = sl,
+            score     = score,
+            reasons   = candidate.get("reasons", []),
         )
-        open_trades[symbol] = trade
+        open_trades[symbol]    = trade
+        _daily_trade_count    += 1
 
-        bn_ok = place_binance_sl(symbol, actual_entry, actual_qty)
+        # SL على بايننس (مع ignore إذا لم يدعمه الرمز)
+        fail_key = f"{symbol}_{direction}"
+        _sl_fail_count[fail_key] = 0  # إعادة العداد للوضعية الجديدة
+        bn_ok = place_binance_sl(symbol, actual_entry, actual_qty, direction)
 
+        dir_label = "📈 Long" if direction == "long" else "📉 Short"
         send_telegram(
-            f"🚀 *دخول {symbol}*\n"
-            f"سعر:`{actual_entry:.4f}` | كمية:`{actual_qty}`\n"
-            f"─── الحماية الداخلية ───\n"
-            f"SL:`{trade.sl_price:.4f}` | TP:`{trade.tp_price:.4f}`\n"
-            f"RR:`{trade.rr():.2f}` | BE`+{BREAKEVEN_PCT*100:.1f}%` | Trail`+{TRAILING_START_PCT*100:.1f}%`\n"
-            f"─── بايننس (شبكة أمان) ───\n"
-            f"SL:`{round_price(symbol, actual_entry*(1-BN_SL_PCT))}`\n"
-            f"{'✅ SL وُضع' if bn_ok else '⚠️ SL فشل!'}\n"
+            f"🚀 *دخول {dir_label}: {symbol}*\n"
+            f"سعر:`{actual_entry:.4f}` | رافعة:`{leverage}x`\n"
+            f"TP:`{tp:.4f}` (+{tp_pct*100:.1f}%)\n"
+            f"SL:`{sl:.4f}` (-{sl_pct*100:.1f}%)\n"
+            f"RR:`{trade.rr():.2f}` | BE`+{BREAKEVEN_PCT*100:.1f}%`\n"
+            f"SL-BN: {'✅' if bn_ok else 'ℹ️ محلي فقط'}\n"
             f"─────────────────\n"
-            f"Score:`{candidate['score']}` RSI1h:`{candidate['rsi_1h']:.0f}` RSI15:`{candidate['rsi_15m']:.0f}`\n"
-            f"Risk:`{effective_risk*100:.1f}%` Comp:`×{learning['compounding_mult']:.2f}`\n"
+            f"Score:`{score}` | RSI5m:`{candidate['rsi_5m']:.0f}` RSI1m:`{candidate['rsi_1m']:.0f}`\n"
+            f"Vol:`×{candidate['vol_ratio']:.1f}` | Risk:`{effective_risk*100:.1f}%`\n"
             f"📋 {' | '.join(candidate.get('reasons', [])[:5])}"
         )
-        log.info(f"✅ {symbol} @ {actual_entry:.4f} qty={actual_qty} Risk={effective_risk*100:.1f}%")
+        log.info(f"✅ {direction} {symbol} @ {actual_entry:.4f} ×{leverage} score={score}")
         return True
 
     except Exception as e:
-        log.error(f"open_long {symbol}: {e}")
+        log.error(f"open_position {symbol}: {e}")
         return False
 
 
@@ -919,23 +1145,24 @@ def adopt_existing_positions():
 
             if abs(amt) < 1e-8 or entry == 0 or sym in open_trades:
                 continue
-            if amt < 0:
-                send_telegram(f"⚠️ SHORT في `{sym}` — راجع يدوياً")
+            if sym not in SYMBOLS:
                 continue
 
-            try:
-                kl  = client.futures_klines(symbol=sym, interval="1h", limit=30)
-                atr = compute_atr(
-                    [float(k[2]) for k in kl],
-                    [float(k[3]) for k in kl],
-                    [float(k[4]) for k in kl],
-                )
-            except Exception:
-                atr = entry * 0.015
+            direction = "long" if amt > 0 else "short"
+            tp_pct    = TP_PCT
+            sl_pct    = SL_PCT
+            if direction == "long":
+                tp = round_price(sym, entry * (1 + tp_pct))
+                sl = round_price(sym, entry * (1 - sl_pct))
+            else:
+                tp = round_price(sym, entry * (1 - tp_pct))
+                sl = round_price(sym, entry * (1 + sl_pct))
 
-            trade = TradeState(sym, entry, abs(amt), atr, reasons=["موروثة"])
+            trade = TradeState(sym, entry, abs(amt), direction, tp, sl, score=60, reasons=["موروثة"])
             open_trades[sym] = trade
-            place_binance_sl(sym, entry, abs(amt))
+            fail_key = f"{sym}_{direction}"
+            _sl_fail_count[fail_key] = 0
+            place_binance_sl(sym, entry, abs(amt), direction)
             adopted += 1
 
     except Exception as e:
@@ -943,7 +1170,7 @@ def adopt_existing_positions():
 
     msg = f"🔄 *تبنّي — {adopted} وضعية*\n"
     for sym, t in open_trades.items():
-        msg += f"  • `{sym}` @ `{t.entry:.4f}`\n"
+        msg += f"  • `{sym}` {t.direction} @ `{t.entry:.4f}`\n"
     if not open_trades:
         msg += "لا وضعيات مفتوحة."
     send_telegram(msg)
@@ -975,15 +1202,17 @@ def close_all_futures(reason: str):
 def check_protection(balance: float) -> bool:
     global bot_halted_total, bot_halted_daily
     global daily_start_balance, daily_reset_date
+    global _daily_trade_count
 
     if bot_halted_total:
         return False
 
     today = utcnow().date()
     if daily_reset_date != today:
-        daily_start_balance = balance
-        daily_reset_date    = today
-        bot_halted_daily    = False
+        daily_start_balance  = balance
+        daily_reset_date     = today
+        bot_halted_daily     = False
+        _daily_trade_count   = 0
         send_telegram(f"✅ يوم جديد | رصيد:`{balance:.2f}` USDT")
 
     if daily_start_balance > 0:
@@ -1002,6 +1231,15 @@ def check_protection(balance: float) -> bool:
             send_telegram("🚨 *البوت متوقف نهائياً*")
             return False
 
+    # وقف بعد خسارتين متتاليتين
+    if learning["consecutive_losses"] >= CONSECUTIVE_LOSS_STOP:
+        if not open_trades:
+            log.info(f"⛔ {CONSECUTIVE_LOSS_STOP} خسائر متتالية — انتظار 15 دقيقة")
+            send_telegram(f"⏸️ *{CONSECUTIVE_LOSS_STOP} خسائر متتالية — توقف 15 دق*")
+            time.sleep(900)
+            learning["consecutive_losses"] = 0
+        return False if not open_trades else True
+
     return True
 
 
@@ -1018,14 +1256,20 @@ def send_daily_report(balance: float):
         msg += f"رصيد:`{balance:.2f}` USDT\n"
         msg += f"اليوم:`{d:.2f}%` | إجمالي:`{t:.2f}%`\n"
         msg += f"Win%:`{learning['win_rate']*100:.1f}%` ({learning['total_trades']} صفقة)\n"
-        msg += f"Risk:`{learning['current_risk_pct']*100:.1f}%` Comp:`×{learning['compounding_mult']:.2f}`\n"
+        msg += f"صفقات اليوم:`{_daily_trade_count}`\n"
         msg += f"─────────────────\n"
-        for sym in SYMBOLS:
-            st = learning["symbol_stats"].get(sym)
-            if st:
-                tot = st["wins"] + st["losses"]
-                wr  = st["wins"]/tot*100 if tot else 0
-                msg += f"`{sym.replace('USDT','')}`: {st['wins']}✅/{st['losses']}❌ WR:{wr:.0f}%\n"
+        # أفضل الساعات
+        best_hours = sorted(
+            [(h, s) for h, s in learning["best_hour_stats"].items()
+             if (s["wins"]+s["losses"]) >= 3],
+            key=lambda x: x[1]["wins"]/(x[1]["wins"]+x[1]["losses"]),
+            reverse=True
+        )[:3]
+        if best_hours:
+            msg += "⏰ أفضل ساعات:\n"
+            for h, s in best_hours:
+                tot = s["wins"] + s["losses"]
+                msg += f"  {h}:00 — WR:{s['wins']/tot*100:.0f}% ({tot} صفقة)\n"
         send_telegram(msg)
     except Exception as e:
         log.error(f"daily_report: {e}")
@@ -1038,12 +1282,15 @@ def send_daily_report(balance: float):
 def main_loop():
     global bot_start_balance, daily_start_balance, daily_reset_date, client
 
-    log.info("🚀 بوت v7.0 — 8 عملات | 20x | 2 صفقات")
+    log.info("🚀 بوت v8.0 SCALPING — BTC ETH SOL XRP | 5m+1m")
     client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
     load_learning()
 
     for sym in SYMBOLS:
         get_filters(sym)
+
+    # كشف دعم STOP_MARKET لكل رمز
+    detect_sl_supported_symbols()
 
     initial = get_futures_balance()
     if learning["peak_balance"] == 0:
@@ -1055,17 +1302,21 @@ def main_loop():
 
     threading.Thread(target=protection_monitor, daemon=True, name="ProtMon").start()
 
+    lev_str = f"L:{LEVERAGE_STRONG}x/N:{LEVERAGE_NORMAL}x/W:{LEVERAGE_WEAK}x"
     send_telegram(
-        f"🤖 *بوت v7.0* ✅\n"
+        f"🤖 *بوت v8.0 SCALPING* ✅\n"
         f"رصيد:`{initial:.2f}` USDT\n"
-        f"عملات: BTC ETH SOL XRP DOGE BNB LINK LTC\n"
-        f"رافعة:`{LEVERAGE}x` | أقصى:`{MAX_OPEN_TRADES}` صفقات\n"
+        f"عملات: BTC ETH SOL XRP\n"
+        f"إطار: 5m+1m | Long & Short\n"
+        f"─── الأهداف ───\n"
+        f"TP:`0.8-1.5%` SL:`0.5-0.8%` RR≥`{MIN_RR}`\n"
+        f"─── الرافعة ───\n"
+        f"{lev_str}\n"
         f"─── الحماية ───\n"
-        f"SL داخلي×`{learning['atr_sl']:.2f}` | BE`+{BREAKEVEN_PCT*100:.1f}%` | Trail`+{TRAILING_START_PCT*100:.1f}%`\n"
-        f"SL بايننس:`{BN_SL_PCT*100:.1f}%`\n"
-        f"─── المخاطرة ───\n"
-        f"Risk:`{learning['current_risk_pct']*100:.1f}%` | RR_min:`1:{MIN_RR:.0f}`\n"
-        f"يومي:`{DAILY_LOSS_LIMIT_PCT*100:.0f}%` | إجمالي:`{TOTAL_LOSS_LIMIT_PCT*100:.0f}%`"
+        f"BE`+{BREAKEVEN_PCT*100:.1f}%` Trail`+{TRAILING_START_PCT*100:.1f}%`\n"
+        f"Max:`{MAX_TRADE_MINUTES}m` | يومي:`{DAILY_LOSS_LIMIT_PCT*100:.0f}%`\n"
+        f"─── SL بايننس ───\n"
+        f"مدعوم: {', '.join(SL_SUPPORTED_SYMBOLS) or 'لا شيء (حماية داخلية)'}"
     )
 
     adopt_existing_positions()
@@ -1084,12 +1335,11 @@ def main_loop():
             log.info(
                 f"══ #{cycle} | رصيد:{balance:.2f} متاح:{avail:.2f} "
                 f"صفقات:{len(open_trades)}/{MAX_OPEN_TRADES} | "
-                f"Risk:{learning['current_risk_pct']*100:.1f}% "
-                f"Comp:×{learning['compounding_mult']:.2f} | "
-                f"{'🟢BULL' if _market_is_bull else '🔴BEAR'} ══"
+                f"{'🟢' if _market_is_bull else '🔴'} "
+                f"Win%:{learning['win_rate']*100:.1f}% ══"
             )
 
-            if mf_cycle >= 15:
+            if mf_cycle >= 20:  # كل 5 دقائق (20×15s)
                 update_market_filter()
                 mf_cycle = 0
 
@@ -1097,16 +1347,16 @@ def main_loop():
                 time.sleep(SCAN_INTERVAL_SEC)
                 continue
 
-            if not _market_is_bull:
-                log.info("🔴 سوق هابط — انتظار")
-                time.sleep(SCAN_INTERVAL_SEC)
-                continue
-
             if avail < 2.0 or len(open_trades) >= MAX_OPEN_TRADES:
                 time.sleep(SCAN_INTERVAL_SEC)
                 continue
 
-            # ── تحليل الـ 8 عملات ────────────────────────────
+            if is_bad_hour():
+                log.info("⏰ ساعة ضعيفة تاريخياً — انتظار")
+                time.sleep(SCAN_INTERVAL_SEC)
+                continue
+
+            # ── مسح العملات ───────────────────────────────────
             candidates = []
             for sym in SYMBOLS:
                 if sym in open_trades:
@@ -1114,27 +1364,32 @@ def main_loop():
                 amt, _ = get_actual_position(sym)
                 if abs(amt) > 1e-8:
                     continue
-                result = analyze_symbol(sym)
+
+                # Long فقط في سوق صاعد، Short فقط في هابط
+                result = analyze_symbol_scalp(sym)
                 if result:
-                    candidates.append(result)
-                    log.info(
-                        f"✅ {sym}: {result['score']}pts "
-                        f"RSI1h={result['rsi_1h']:.0f} "
-                        f"RSI15={result['rsi_15m']:.0f}"
-                    )
+                    dir_ok = (result["direction"] == "long" and _market_is_bull) or \
+                             (result["direction"] == "short" and not _market_is_bull)
+                    # لكن نسمح بالاتجاهين إذا كان السكور عالياً جداً (>80)
+                    if dir_ok or result["score"] >= 80:
+                        candidates.append(result)
+                        log.info(
+                            f"✅ {sym} {result['direction']}: {result['score']}pts "
+                            f"RSI5m={result['rsi_5m']:.0f} Vol×{result['vol_ratio']:.1f}"
+                        )
 
             if candidates:
-                candidates.sort(key=lambda x: (-x["score"], x["rsi_1h"]))
-                log.info(f"مرشحون: {[(c['symbol'], c['score']) for c in candidates]}")
+                # ترتيب: أعلى سكور، ثم RR
+                candidates.sort(key=lambda x: (-x["score"], -x["rr"]))
                 for c in candidates:
                     if len(open_trades) >= MAX_OPEN_TRADES:
                         break
                     if get_available_margin() < 2.0:
                         break
-                    if open_long(c):
-                        time.sleep(3)
+                    if open_position(c):
+                        time.sleep(2)
             else:
-                log.info("لا فرص الآن — انتظار شروط أفضل.")
+                log.info("لا فرص الآن.")
 
             now = utcnow()
             if now.hour == 0 and now.minute < 1:
@@ -1156,10 +1411,11 @@ def home():
     bal  = get_futures_balance()
     bull = "🟢 صاعد" if _market_is_bull else "🔴 هابط"
     lines = [
-        f"<b>🤖 Bot v7.0</b> | {bull}",
+        f"<b>🤖 Bot v8.0 SCALPING</b> | {bull}",
         f"رصيد: <b>{bal:.2f} USDT</b> | مفتوحة: {len(open_trades)}/{MAX_OPEN_TRADES}",
-        f"Win%: {learning['win_rate']*100:.1f}% ({learning['total_trades']} صفقة)",
+        f"Win%: {learning['win_rate']*100:.1f}% ({learning['total_trades']} صفقة) | اليوم: {_daily_trade_count}/{MAX_DAILY_TRADES}",
         f"Risk: {learning['current_risk_pct']*100:.1f}% | Comp: ×{learning['compounding_mult']:.2f}",
+        f"SL مدعوم: {', '.join(SL_SUPPORTED_SYMBOLS) or 'لا شيء'}",
         "<hr>",
     ]
     for sym, t in open_trades.items():
@@ -1170,10 +1426,11 @@ def home():
         if t.at_breakeven:    flags.append("🔒BE")
         if t.trailing_active: flags.append("📈Trail")
         lines.append(
-            f"• <b>{sym}</b> @ {t.entry:.4f} | "
+            f"• <b>{sym}</b> {t.direction} @ {t.entry:.4f} | "
             f"<span style='color:{color}'>{pnl:+.2f}%</span> | "
             f"SL:{t.trail_sl:.4f} TP:{t.tp_price:.4f} | "
-            f"RR:{t.rr():.2f} | {' '.join(flags)}"
+            f"RR:{t.rr():.2f} | {t.duration_minutes():.0f}m | "
+            f"{' '.join(flags)}"
         )
     return "<br>".join(lines)
 
@@ -1184,15 +1441,17 @@ def trades_route():
     for sym, t in open_trades.items():
         cp = get_current_price(sym)
         result[sym] = {
-            "entry":    t.entry,
-            "current":  cp,
-            "pnl_pct":  round(t.pnl_pct(cp), 2),
-            "sl":       round(t.trail_sl, 6),
-            "tp":       round(t.tp_price, 6),
-            "rr":       round(t.rr(), 2),
+            "direction": t.direction,
+            "entry":     t.entry,
+            "current":   cp,
+            "pnl_pct":   round(t.pnl_pct(cp), 2),
+            "sl":        round(t.trail_sl, 6),
+            "tp":        round(t.tp_price, 6),
+            "rr":        round(t.rr(), 2),
             "breakeven": t.at_breakeven,
             "trailing":  t.trailing_active,
-            "hours":    round(t.duration_hours(), 2),
+            "minutes":   round(t.duration_minutes(), 1),
+            "score":     t.score,
         }
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -1204,10 +1463,12 @@ def stats_route():
         st    = learning["symbol_stats"].get(sym, {"wins": 0, "losses": 0, "pnl": 0.0})
         total = st["wins"] + st["losses"]
         result[sym] = {
-            "wins":    st["wins"],
-            "losses":  st["losses"],
-            "win_rate": round(st["wins"]/total*100, 1) if total else 0,
-            "pnl":     round(st["pnl"], 2),
+            "wins":       st["wins"],
+            "losses":     st["losses"],
+            "win_rate":   round(st["wins"]/total*100, 1) if total else 0,
+            "pnl":        round(st["pnl"], 2),
+            "long_wins":  st.get("long_wins", 0),
+            "short_wins": st.get("short_wins", 0),
         }
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -1218,7 +1479,7 @@ def learning_route():
         k: learning[k] for k in [
             "win_rate", "total_trades", "current_risk_pct",
             "compounding_mult", "consecutive_wins", "consecutive_losses",
-            "atr_sl", "atr_tp", "peak_balance",
+            "peak_balance", "best_hour_stats",
         ]
     }, ensure_ascii=False, indent=2)
 
