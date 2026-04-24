@@ -33,10 +33,17 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 SYMBOLS: list = []                  # لا تعدل هنا
 
 # ─── معايير اختيار العملات تلقائياً ─────────────────────────
-MIN_QUOTE_VOLUME_24H = 50_000_000   # أدنى حجم تداول يومي 50M USDT
+MIN_QUOTE_VOLUME_24H = 200_000_000  # 200M USDT — يضمن سيولة عالية فقط
+MAX_SYMBOLS          = 30           # أقصى عدد عملات للمسح
 EXCLUDE_SYMBOLS      = {            # عملات مستثناة
-    "USDCUSDT","BUSDUSDT","TUSDUSDT","USDTUSDT",
+    # Stablecoins
+    "USDCUSDT","BUSDUSDT","TUSDUSDT","USDTUSDT","DAIUSDT","FDUSDUSDT",
+    # معادن / commodities
+    "XAUUSDT","XAGUSDT",
+    # Leveraged / index tokens
     "BTCDOMUSDT","DEFIUSDT","BNBDOMUSDT",
+    # عملات حجمها مصطنع أو صغيرة جداً
+    "CLUSDT","ZECUSDT","CHIPUSDT","KATUSDT",
 }
 
 # ─── إعدادات التداول ──────────────────────────────────────────
@@ -493,41 +500,50 @@ def probe_sl_support(symbol: str) -> bool:
 
 def load_symbols_dynamic():
     """
-    يجلب كل عملات Futures المقترنة بـ USDT،
+    يجلب عملات Futures المقترنة بـ USDT،
     يرتبها بحجم التداول اليومي تنازلياً،
-    ويحتفظ بأعلى 40 عملة سيولة (مع استثناء الـ stablecoins).
-    يُشغَّل مرة عند البدء + يتجدد كل 6 ساعات.
+    يطبق فلاتر صارمة، ويحتفظ بأفضل MAX_SYMBOLS عملة.
     """
     global SYMBOLS
     try:
-        tickers = client.futures_ticker()           # 24h stats لكل الرموز
+        tickers = client.futures_ticker()
         filtered = []
         for t in tickers:
             sym = t["symbol"]
+            # شرط 1: USDT فقط
             if not sym.endswith("USDT"):
                 continue
+            # شرط 2: ليس في القائمة المستثناة
             if sym in EXCLUDE_SYMBOLS:
                 continue
+            # شرط 3: لا يحتوي على أرقام في اسم العملة (مثل 1000SHIBUSDT مقبول لكن CHIP3USDT مرفوض)
+            base = sym.replace("USDT", "")
+            if any(c.isdigit() for c in base) and not base.startswith("1000"):
+                continue
+            # شرط 4: حجم تداول كافٍ
             vol = float(t.get("quoteVolume", 0))
             if vol < MIN_QUOTE_VOLUME_24H:
                 continue
+            # شرط 5: تغير السعر معقول (ليس 0% = عملة ميتة)
+            price_change = abs(float(t.get("priceChangePercent", 0)))
+            if price_change < 0.1:
+                continue
+
             filtered.append((sym, vol))
 
         # ترتيب تنازلي حسب الحجم
         filtered.sort(key=lambda x: -x[1])
-        new_symbols = [s for s, _ in filtered[:40]]
+        new_symbols = [s for s, _ in filtered[:MAX_SYMBOLS]]
 
         if new_symbols:
             SYMBOLS = new_symbols
-            log.info(f"📊 عملات محملة ({len(SYMBOLS)}): {' '.join(SYMBOLS[:10])}...")
-            # جلب filters للعملات الجديدة
+            log.info(f"📊 عملات محملة ({len(SYMBOLS)}): {' | '.join(SYMBOLS)}")
             for sym in SYMBOLS:
                 if sym not in _filters_cache:
                     get_filters(sym)
         else:
-            # fallback آمن
             SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","DOGEUSDT"]
-            log.warning("⚠️ فشل جلب العملات — استخدام القائمة الافتراضية")
+            log.warning("⚠️ فشل جلب العملات — القائمة الافتراضية")
 
     except Exception as e:
         log.error(f"load_symbols_dynamic: {e}")
@@ -1188,22 +1204,46 @@ def open_position(candidate: dict) -> bool:
 # ══════════════════════════════════════════════════════════════
 
 def adopt_existing_positions():
-    log.info("🔍 جلب الوضعيات...")
+    log.info("🔍 جلب الوضعيات المفتوحة...")
     adopted = 0
+    closed_external = 0
     try:
         for p in get_all_positions():
             sym   = p["symbol"]
             amt   = float(p["positionAmt"])
             entry = float(p["entryPrice"])
 
-            if abs(amt) < 1e-8 or entry == 0 or sym in open_trades:
+            if abs(amt) < 1e-8 or entry == 0:
                 continue
-            if sym not in SYMBOLS:
+            if sym in open_trades:
                 continue
 
             direction = "long" if amt > 0 else "short"
-            tp_pct    = TP_PCT
-            sl_pct    = SL_PCT
+
+            # إذا كانت العملة خارج SYMBOLS → أغلقها فوراً لتحرير المارجن
+            if sym not in SYMBOLS:
+                log.warning(f"⚠️ {sym}: وضعية خارجية — إغلاق لتحرير المارجن")
+                side = SIDE_SELL if amt > 0 else SIDE_BUY
+                cancel_sl_orders(sym)
+                try:
+                    client.futures_create_order(
+                        symbol=sym, side=side, type=ORDER_TYPE_MARKET,
+                        quantity=abs(amt), reduceOnly=True
+                    )
+                    price = get_current_price(sym)
+                    closed_external += 1
+                    send_telegram(
+                        f"🔄 *أُغلقت وضعية خارجية: {sym}*\n"
+                        f"direction:`{direction}` qty:`{abs(amt):.4f}`\n"
+                        f"سعر:`{price:.4f}` | سبب: تحرير المارجن"
+                    )
+                except Exception as e:
+                    log.error(f"close external {sym}: {e}")
+                continue
+
+            # وضعية ضمن SYMBOLS → تبنّيها
+            tp_pct = TP_PCT
+            sl_pct = SL_PCT
             if direction == "long":
                 tp = round_price(sym, entry * (1 + tp_pct))
                 sl = round_price(sym, entry * (1 - sl_pct))
@@ -1221,11 +1261,12 @@ def adopt_existing_positions():
     except Exception as e:
         log.error(f"adopt: {e}")
 
-    msg = f"🔄 *تبنّي — {adopted} وضعية*\n"
+    msg = f"🔄 *فحص الوضعيات*\n"
+    msg += f"تبنّي: {adopted} | مُغلقة (خارجية): {closed_external}\n"
     for sym, t in open_trades.items():
         msg += f"  • `{sym}` {t.direction} @ `{t.entry:.4f}`\n"
-    if not open_trades:
-        msg += "لا وضعيات مفتوحة."
+    if not open_trades and closed_external == 0:
+        msg += "لا وضعيات مفتوحة — جاهز للتداول ✅"
     send_telegram(msg)
 
 
@@ -1332,6 +1373,37 @@ def send_daily_report(balance: float):
 #  MAIN LOOP
 # ══════════════════════════════════════════════════════════════
 
+def _close_external_positions():
+    """يغلق أي وضعية مفتوحة على بايننس خارج قائمة SYMBOLS — لتحرير المارجن"""
+    try:
+        for p in get_all_positions():
+            sym = p["symbol"]
+            amt = float(p["positionAmt"])
+            if abs(amt) < 1e-8:
+                continue
+            if sym in SYMBOLS or sym in open_trades:
+                continue
+            # وضعية خارجية — أغلقها
+            side = SIDE_SELL if amt > 0 else SIDE_BUY
+            cancel_sl_orders(sym)
+            try:
+                client.futures_create_order(
+                    symbol=sym, side=side, type=ORDER_TYPE_MARKET,
+                    quantity=abs(amt), reduceOnly=True
+                )
+                price = get_current_price(sym)
+                log.warning(f"🔄 أُغلقت خارجية: {sym} qty={abs(amt):.4f} @ {price:.4f}")
+                send_telegram(
+                    f"🔄 *وضعية خارجية مُغلقة: {sym}*\n"
+                    f"qty:`{abs(amt):.4f}` @ `{price:.4f}`\n"
+                    f"سبب: تحرير المارجن للبوت"
+                )
+            except Exception as e:
+                log.error(f"close_external {sym}: {e}")
+    except Exception as e:
+        log.error(f"_close_external_positions: {e}")
+
+
 def main_loop():
     global bot_start_balance, daily_start_balance, daily_reset_date, client
 
@@ -1376,12 +1448,13 @@ def main_loop():
     adopt_existing_positions()
     update_market_filter()
 
-    cycle = mf_cycle = sym_cycle = 0
+    cycle = mf_cycle = sym_cycle = ext_cycle = 0
 
     while True:
         cycle     += 1
         mf_cycle  += 1
         sym_cycle += 1
+        ext_cycle += 1
 
         try:
             balance = get_futures_balance()
@@ -1403,6 +1476,11 @@ def main_loop():
                 log.info("🔄 تجديد قائمة العملات...")
                 load_symbols_dynamic()
                 sym_cycle = 0
+
+            # فحص وضعيات خارجية كل دقيقتين (8 دورات × 15s)
+            if ext_cycle >= 8:
+                _close_external_positions()
+                ext_cycle = 0
 
             if not check_protection(balance):
                 time.sleep(SCAN_INTERVAL_SEC)
