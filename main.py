@@ -50,41 +50,43 @@ MAX_OPEN_TRADES   = 2
 SCAN_INTERVAL_SEC = 15          # كل 15 ثانية للسكالبينج
 
 # ─── الرافعة (ديناميكية حسب قوة الصفقة) ─────────────────────
-LEVERAGE_STRONG = 10            # score >= 75
-LEVERAGE_NORMAL = 7             # score 60–74
-LEVERAGE_WEAK   = 5             # score 55–59
+LEVERAGE_STRONG = 7             # score >= 75 — خفضنا من 10
+LEVERAGE_NORMAL = 5             # score 60–74 — خفضنا من 7
+LEVERAGE_WEAK   = 3             # score 55–59 — خفضنا من 5
 
 # ─── أهداف السكالبينج ─────────────────────────────────────────
-TP_PCT         = 0.010          # 1.0%
-SL_PCT         = 0.006          # 0.6%
-TP_PCT_STRONG  = 0.015          # 1.5% للصفقات القوية
-SL_PCT_STRONG  = 0.008          # 0.8%
-MIN_RR         = 1.8            # نسبة مخاطرة مقبولة
+TP_PCT         = 0.012          # 1.2%
+SL_PCT         = 0.006          # 0.6% → RR = 2.0
+TP_PCT_STRONG  = 0.015          # 1.5%
+SL_PCT_STRONG  = 0.007          # 0.7% → RR = 2.14
+MIN_RR         = 1.8
 
 # ─── الحماية الداخلية ─────────────────────────────────────────
-BREAKEVEN_PCT       = 0.005     # +0.5% → SL لنقطة الدخول
-TRAILING_START_PCT  = 0.007     # +0.7% → يبدأ Trailing
-TRAILING_STEP_PCT   = 0.003     # خطوة Trailing
-MAX_TRADE_MINUTES   = 30        # أقصى مدة صفقة سكالبينج
+BREAKEVEN_PCT       = 0.004     # +0.4% → SL لنقطة الدخول
+TRAILING_START_PCT  = 0.006     # +0.6% → يبدأ Trailing
+TRAILING_STEP_PCT   = 0.003
+MAX_TRADE_MINUTES   = 20        # خفضنا من 30 — السكالبينج أسرع
 
 # ─── إدارة المخاطر ────────────────────────────────────────────
-BASE_RISK_PCT  = 0.03           # 3% من رأس المال
-MIN_RISK_PCT   = 0.015
-MAX_RISK_PCT   = 0.05
-RISK_STEP_WIN  = 0.003
-RISK_STEP_LOSS = 0.006
+BASE_RISK_PCT  = 0.015          # 1.5% فقط — خفضنا من 3%
+MIN_RISK_PCT   = 0.01           # 1% حد أدنى
+MAX_RISK_PCT   = 0.025          # 2.5% حد أقصى
+RISK_STEP_WIN  = 0.002
+RISK_STEP_LOSS = 0.005
 
 # ─── حماية الرصيد ─────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT = 0.06     # 6% يومي
-TOTAL_LOSS_LIMIT_PCT = 0.15     # 15% إجمالي
-MAX_DAILY_TRADES     = 8        # أقصى صفقات يومياً
-CONSECUTIVE_LOSS_STOP = 2       # توقف بعد خسارتين متتاليتين
+DAILY_LOSS_LIMIT_PCT  = 0.04    # 4% يومي — خفضنا من 6%
+TOTAL_LOSS_LIMIT_PCT  = 0.10    # 10% إجمالي — خفضنا من 15%
+MAX_DAILY_TRADES      = 6       # خفضنا من 8
+CONSECUTIVE_LOSS_STOP = 2
 
-# ─── شروط الدخول ─────────────────────────────────────────────
-MIN_SCORE      = 45             # خفضنا من 55 لنكتشف الفرص أكثر
-MIN_VOLUME_RATIO = 1.0          # خفضنا من 1.3 — السوق الهادئ فوليومه أقل
+# ─── شروط الدخول — صارمة ─────────────────────────────────────
+MIN_SCORE        = 60           # رفعنا من 40 — جودة فقط
+MIN_VOLUME_RATIO = 1.2          # فوليوم أعلى من المعدل بـ 20%
 
-# ─── SL بايننس — قائمة العملات التي تدعم STOP_MARKET ─────────
+# ─── ساعات التداول المسموحة (UTC) ────────────────────────────
+# تجنب 1:00–6:00 UTC (السوق هادئ + إشارات كاذبة)
+NO_TRADE_HOURS_UTC = set(range(1, 6))  # 1,2,3,4,5 فجراً UTC
 SL_SUPPORTED_SYMBOLS = set()    # يُملأ تلقائياً عند البدء
 
 LEARNING_FILE = "bot_learning_v8.json"
@@ -722,14 +724,14 @@ def detect_market_structure(closes_5m, highs_5m, lows_5m):
     ema21 = ema_calc(closes_5m, 21)
     ema_diff_pct = abs(ema9 - ema21) / closes_5m[-1]
 
-    if ema_diff_pct < 0.0003:  # خففنا من 0.001 — كان يرفض كثيراً
+    if ema_diff_pct < 0.00005:  # صارم جداً — فقط EMA متطابقة تماماً
         return "RANGING"
 
     # تذبذب السعر
     high_range = max(highs) - min(lows)
     price_range_pct = high_range / closes_5m[-1]
 
-    if price_range_pct < 0.002:  # خففنا من 0.004
+    if price_range_pct < 0.001:  # أقل من 0.1% فقط يُرفض
         return "RANGING"
 
     if ema9 > ema21 and closes_5m[-1] > ema21:
@@ -1504,8 +1506,16 @@ def main_loop():
                 time.sleep(SCAN_INTERVAL_SEC)
                 continue
 
+            # فلتر ساعات الليل الهادئة
+            if utcnow().hour in NO_TRADE_HOURS_UTC:
+                if cycle % 40 == 0:
+                    log.info(f"🌙 ساعة {utcnow().hour} UTC — وقت راحة (1-6 فجراً)")
+                time.sleep(SCAN_INTERVAL_SEC)
+                continue
+
             # ── مسح العملات ───────────────────────────────────
             candidates = []
+            scan_summary = []
             for sym in SYMBOLS:
                 if sym in open_trades:
                     continue
@@ -1513,18 +1523,21 @@ def main_loop():
                 if abs(amt) > 1e-8:
                     continue
 
-                # Long فقط في سوق صاعد، Short فقط في هابط
                 result = analyze_symbol_scalp(sym)
                 if result:
                     dir_ok = (result["direction"] == "long" and _market_is_bull) or \
                              (result["direction"] == "short" and not _market_is_bull)
-                    # لكن نسمح بالاتجاهين إذا كان السكور عالياً جداً (>80)
                     if dir_ok or result["score"] >= 80:
                         candidates.append(result)
                         log.info(
                             f"✅ {sym} {result['direction']}: {result['score']}pts "
                             f"RSI5m={result['rsi_5m']:.0f} Vol×{result['vol_ratio']:.1f}"
                         )
+                    else:
+                        log.info(f"🚫 {sym}: اتجاه عكسي ({result['direction']} في سوق {'🟢' if _market_is_bull else '🔴'})")
+
+            if not candidates and cycle % 20 == 0:  # كل 5 دقائق
+                log.info(f"📊 السوق: {'🟢BULL' if _market_is_bull else '🔴BEAR'} | عملات مفحوصة: {len(SYMBOLS)}")
 
             if candidates:
                 # ترتيب: أعلى سكور، ثم RR
