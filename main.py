@@ -81,8 +81,8 @@ MAX_DAILY_TRADES      = 6       # خفضنا من 8
 CONSECUTIVE_LOSS_STOP = 2
 
 # ─── شروط الدخول — صارمة ─────────────────────────────────────
-MIN_SCORE        = 60           # رفعنا من 40 — جودة فقط
-MIN_VOLUME_RATIO = 1.2          # فوليوم أعلى من المعدل بـ 20%
+MIN_SCORE        = 60
+MIN_VOLUME_RATIO = 0.5           # خفضنا — الشمعة الأخيرة دائماً أقل من المعدل
 
 # ─── ساعات التداول المسموحة (UTC) ────────────────────────────
 # تجنب 1:00–6:00 UTC (السوق هادئ + إشارات كاذبة)
@@ -724,7 +724,7 @@ def detect_market_structure(closes_5m, highs_5m, lows_5m):
     ema21 = ema_calc(closes_5m, 21)
     ema_diff_pct = abs(ema9 - ema21) / closes_5m[-1]
 
-    if ema_diff_pct < 0.00005:  # صارم جداً — فقط EMA متطابقة تماماً
+    if ema_diff_pct < 0.00005:  # EMA متطابقة تماماً فقط → عرضي
         return "RANGING"
 
     # تذبذب السعر
@@ -772,8 +772,8 @@ def analyze_symbol_scalp(symbol: str) -> dict | None:
         rsi_5m = compute_rsi(cl5)
         rsi_1m = compute_rsi(cl1)
 
-        avg_vol   = sum(vo5[-20:]) / 20 or 1
-        vol_ratio = vo5[-1] / avg_vol
+        avg_vol   = sum(vo5[-21:-1]) / 20 or 1   # معدل آخر 20 شمعة مكتملة
+        vol_ratio = vo5[-2] / avg_vol             # آخر شمعة مكتملة (مش الحالية)
 
         support, resistance = find_support_resistance(hi5, lo5, cl5)
         structure           = detect_market_structure(cl5, hi5, lo5)
