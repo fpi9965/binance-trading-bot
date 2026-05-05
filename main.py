@@ -722,8 +722,10 @@ def analyze(symbol):
         if struct_1h == "RANGING" and struct_15 == "RANGING":
             log.info(f"🔕 {symbol}: سوق عرضي — رفض")
             return None
-        if vol_r < 0.6:
-            log.info(f"🔕 {symbol}: فوليوم {vol_r:.2f} — رفض")
+        # 🔧 العملات الكبيرة المضمونة تحصل على تخفيف فلتر الفوليوم
+        vol_threshold = 0.4 if symbol in set(GUARANTEED) else 0.6
+        if vol_r < vol_threshold:
+            log.info(f"🔕 {symbol}: فوليوم {vol_r:.2f} < {vol_threshold} — رفض")
             return None
 
         direction = None; score = 0; reasons = []
@@ -923,11 +925,25 @@ def open_pos(cand):
         risk = effective_risk()
         sl_dist = abs(prc - cand["sl"]) / prc
         if sl_dist < 0.001: sl_dist = 0.01
-        q_risk  = (bal*risk)/(prc*sl_dist)
-        q_avail = (av*0.80*lev)/prc
-        qty     = rqty(sym, min(q_risk,q_avail))
-        if qty<=0 or qty*prc<min_n:
-            log.info(f"{sym}: qty={qty:.4f} صغير — تخطي")
+
+        q_risk  = (bal * risk) / (prc * sl_dist)
+        q_avail = (av * 0.90 * lev) / prc   # ← رفعنا من 80% إلى 90%
+
+        qty = rqty(sym, min(q_risk, q_avail))
+
+        # 🔧 لو الكمية أقل من الحد الأدنى → نستخدم الحد الأدنى مباشرة
+        if qty * prc < min_n:
+            min_qty = rqty(sym, (min_n * 1.05) / prc)
+            log.info(f"{sym}: qty صغير {qty:.4f} → نجرب الحد الأدنى {min_qty:.4f}")
+            # نتحقق أن الهامش يكفي
+            needed_margin = (min_qty * prc) / lev
+            if needed_margin > av * 0.95:
+                log.info(f"{sym}: هامش غير كافٍ ({needed_margin:.2f} > {av*0.95:.2f}) — تخطي")
+                return False
+            qty = min_qty
+
+        if qty <= 0:
+            log.info(f"{sym}: qty=0 — تخطي")
             return False
         try: client.futures_change_leverage(symbol=sym, leverage=lev)
         except: pass
@@ -1326,9 +1342,16 @@ def main_loop():
 
             if candidates:
                 candidates.sort(key=lambda x: (-x["score"], -x["rr"]))
+                log.info(f"🏆 أفضل مرشح: {candidates[0]['symbol']} score={candidates[0]['score']} RR={candidates[0]['rr']}")
                 for c in candidates:
-                    if len(open_trades) >= MAX_OPEN_TRADES: break
-                    if avail_margin() < 2.0: break
+                    if len(open_trades) >= MAX_OPEN_TRADES:
+                        log.info(f"⛔ وصلنا الحد الأقصى للصفقات ({MAX_OPEN_TRADES})")
+                        break
+                    av_now = avail_margin()
+                    if av_now < 2.0:
+                        log.info(f"⛔ هامش غير كافٍ: {av_now:.2f}$")
+                        break
+                    log.info(f"▶️ محاولة فتح {c['symbol']} {c['direction']} score={c['score']}")
                     if open_pos(c):
                         _tv_signals.pop(c["symbol"], None)
                         time.sleep(3)
