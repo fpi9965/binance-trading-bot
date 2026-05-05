@@ -1,15 +1,11 @@
 """
 =============================================================
-  SMART TRADING BOT v9.0  — PROFESSIONAL EDITION
+  SMART TRADING BOT v9.1  — FIXED EDITION
   ─────────────────────────────────────────────
-  ✅ تحليل تقني احترافي (EMA/RSI/MACD/BB/Supertrend/ATR)
-  ✅ Polymarket sentiment كفلتر + وزن في النقاط
-  ✅ Multi-timeframe: 1h اتجاه + 15m دخول + 5m تأكيد
-  ✅ Long & Short مع Market Structure
-  ✅ Dynamic Risk + Compounding
-  ✅ Breakeven + Trailing محلي
-  ✅ فلترة عملات ديناميكية (أعلى 30 بحجم)
-  ✅ إغلاق وضعيات خارجية تلقائي
+  🔧 إصلاح #1: Polymarket — fallback آمن لو فشل API
+  🔧 إصلاح #2: TV_REQUIRED — وضع هجين (TV + تحليل داخلي)
+  🔧 إصلاح #3: رسالة Webhook الصحيحة موثقة بالكود
+  ✅ كل ميزات v9.0 محفوظة
 =============================================================
 """
 
@@ -26,16 +22,24 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT")
 
 # ─── TradingView Webhook ──────────────────────────────────────
-TV_SECRET          = os.getenv("TV_SECRET", "my_secret_123")  # ضعه في Render env
-# مدة صلاحية الإشارة: 3 دقائق — بعدها تُهمل
-TV_SIGNAL_TTL_SEC  = 180
-# إذا TV أرسل إشارة → ننتظر تأكيد التحليل الداخلي
-# إذا ما جاءت إشارة TV → لا ندخل أبداً (Webhook-first mode)
-TV_REQUIRED        = True   # اجعله False للعودة للتحليل الداخلي فقط
+TV_SECRET         = os.getenv("TV_SECRET", "my_secret_123")
+TV_SIGNAL_TTL_SEC = 180   # صلاحية الإشارة 3 دقائق
+
+# ──────────────────────────────────────────────────────────────
+# 🔧 إصلاح #2: وضع هجين بدل TV_REQUIRED الصارم
+#
+#   TV_MODE = "strict"  → لا يدخل إلا بإشارة TV  (الوضع القديم)
+#   TV_MODE = "hybrid"  → TV يُعزز النقاط، لكن لو ما جاءت إشارة
+#                          يشتغل بالتحليل الداخلي بعد TV_FALLBACK_MIN دقيقة
+#   TV_MODE = "off"     → تحليل داخلي فقط
+# ──────────────────────────────────────────────────────────────
+TV_MODE           = "hybrid"   # ← الوضع المناسب لك
+TV_FALLBACK_MIN   = 10         # بعد 10 دق بدون إشارة TV → تحليل داخلي
+_tv_last_signal_t = None       # آخر وقت وصلت فيه إشارة TV
 
 # ─── عملات ───────────────────────────────────────────────────
 SYMBOLS: list = []
-MIN_VOLUME_24H   = 300_000_000   # 300M USDT
+MIN_VOLUME_24H   = 300_000_000
 MIN_TRADES_24H   = 80_000
 MAX_SYMBOLS      = 25
 EXCLUDE_SYMBOLS  = {
@@ -49,59 +53,60 @@ GUARANTEED = [
 
 # ─── إعدادات التداول ──────────────────────────────────────────
 MAX_OPEN_TRADES   = 2
-SCAN_INTERVAL_SEC = 30          # كل 30 ثانية (swing أهدأ)
+SCAN_INTERVAL_SEC = 30
 
 # ─── الأطر الزمنية ────────────────────────────────────────────
-TF_TREND  = "1h"               # اتجاه عام
-TF_ENTRY  = "15m"              # نقطة الدخول
-TF_CONFIRM= "5m"               # تأكيد
+TF_TREND  = "1h"
+TF_ENTRY  = "15m"
+TF_CONFIRM= "5m"
 
 # ─── الرافعة ─────────────────────────────────────────────────
-LEVERAGE_STRONG = 8             # score >= 80
-LEVERAGE_NORMAL = 5             # score 65-79
-LEVERAGE_WEAK   = 3             # score 55-64
+LEVERAGE_STRONG = 8
+LEVERAGE_NORMAL = 5
+LEVERAGE_WEAK   = 3
 
 # ─── TP / SL ─────────────────────────────────────────────────
-ATR_TP_MULT    = 2.5            # TP = ATR × 2.5
-ATR_SL_MULT    = 1.2            # SL = ATR × 1.2
+ATR_TP_MULT    = 2.5
+ATR_SL_MULT    = 1.2
 MIN_RR         = 1.8
-MAX_TRADE_HRS  = 12             # أقصى مدة صفقة
+MAX_TRADE_HRS  = 12
 
 # ─── Breakeven / Trailing ─────────────────────────────────────
-BE_PCT         = 0.006          # +0.6% → breakeven
-TRAIL_START    = 0.010          # +1.0% → trailing
+BE_PCT         = 0.006
+TRAIL_START    = 0.010
 TRAIL_STEP     = 0.004
 
 # ─── إدارة المخاطر ────────────────────────────────────────────
-BASE_RISK      = 0.015          # 1.5% لكل صفقة
+BASE_RISK      = 0.015
 MIN_RISK       = 0.008
 MAX_RISK       = 0.025
 RISK_WIN_STEP  = 0.002
 RISK_LOSS_STEP = 0.004
 
 # ─── حماية الرصيد ─────────────────────────────────────────────
-DAILY_LOSS_LIM = 0.04           # 4%
-TOTAL_LOSS_LIM = 0.10           # 10%
+DAILY_LOSS_LIM = 0.04
+TOTAL_LOSS_LIM = 0.10
 MAX_DAILY_TR   = 6
 CONSEC_LOSS_ST = 2
-PAUSE_AFTER_LOSS_MIN = 20       # راحة بعد خسارتين
+PAUSE_AFTER_LOSS_MIN = 20
 
 # ─── شروط الدخول ─────────────────────────────────────────────
 MIN_SCORE      = 60
 
-# ─── Polymarket ───────────────────────────────────────────────
-POLY_ENABLED   = True
-POLY_BEAR_THRESHOLD = 0.60      # لو احتمال الهبوط > 60% → لا long
-POLY_BULL_THRESHOLD = 0.60      # لو احتمال الصعود > 60% → لا short
-POLY_CACHE_MIN = 15             # تحديث كل 15 دقيقة
-POLY_URL       = "https://clob.polymarket.com/markets"
+# ──────────────────────────────────────────────────────────────
+# 🔧 إصلاح #1: Polymarket — منطق آمن مع fallback
+# ──────────────────────────────────────────────────────────────
+POLY_ENABLED        = True
+POLY_BEAR_THRESHOLD = 0.60
+POLY_BULL_THRESHOLD = 0.60
+POLY_CACHE_MIN      = 15
+POLY_URL            = "https://clob.polymarket.com/markets"
 
 # ─── ساعات راحة (UTC) ─────────────────────────────────────────
-NO_TRADE_HOURS = {2, 3, 4}      # 2-4 فجراً UTC هادئ
+NO_TRADE_HOURS = {2, 3, 4}
 
 LEARNING_FILE  = "bot_v9_learning.json"
 
-# ─── Logging ─────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -129,15 +134,17 @@ _last_report_dt = None
 _market_bull    = True
 _daily_trades   = 0
 
-# ─── Polymarket cache ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# 🔧 إصلاح #1: Polymarket cache — قيم افتراضية محايدة 50/50
+#    بدل 40/60 اللي كانت تتسبب في قراءة خاطئة
+# ──────────────────────────────────────────────────────────────
 _poly_cache = {
-    "btc_bear_prob": 0.40,      # احتمالية هبوط BTC
-    "btc_bull_prob": 0.60,
-    "last_update": None,
+    "btc_bear_prob": 0.50,   # ← محايد افتراضياً
+    "btc_bull_prob": 0.50,   # ← محايد افتراضياً
+    "last_update":   None,
+    "fetch_ok":      False,  # هل نجح آخر جلب؟
 }
 
-# ─── TradingView pending signals ─────────────────────────────
-# {symbol: {"direction":"long"/"short","ts":datetime,"price":float,"tf":str}}
 _tv_signals: dict = {}
 
 learning = {
@@ -297,7 +304,6 @@ def record_trade(trade, exit_price, balance):
     learning["total_trades"] += 1
     if won: learning["profitable_trades"] += 1
     learning["win_rate"] = learning["profitable_trades"] / learning["total_trades"]
-    # adapt risk
     r = learning["current_risk"]
     if won:
         learning["consec_wins"]   += 1
@@ -312,7 +318,6 @@ def record_trade(trade, exit_price, balance):
     if learning["peak_balance"] > 0 and bot_start_bal > 0:
         g = learning["peak_balance"] / bot_start_bal
         learning["comp_mult"] = max(1.0, min(g, 1.4))
-    # adapt ATR SL multiplier
     recent = learning["trade_history"][-20:]
     if len(recent) >= 10:
         lr = sum(1 for t in recent if not t["won"]) / len(recent)
@@ -345,64 +350,97 @@ def bad_hour():
 
 
 # ══════════════════════════════════════════════════════════════
-#  POLYMARKET
+#  🔧 POLYMARKET — إصلاح شامل
 # ══════════════════════════════════════════════════════════════
 def update_polymarket():
-    """يجلب احتمالية صعود/هبوط BTC من Polymarket"""
+    """
+    يجلب احتمالية BTC من Polymarket.
+    🔧 إصلاح: لو فشل API → يبقى على 50/50 (محايد) بدل Bear=100%
+    """
     if not POLY_ENABLED: return
-    now = utcnow()
+    now  = utcnow()
     last = _poly_cache["last_update"]
     if last and (now - last).total_seconds() < POLY_CACHE_MIN * 60:
         return
+
     try:
-        # نبحث عن market "Will BTC be above X at end of month"
         resp = requests.get(
             POLY_URL,
             params={"tag": "crypto", "active": "true"},
             timeout=8
         )
         if resp.status_code != 200:
+            log.warning(f"Polymarket HTTP {resp.status_code} — الإبقاء على القيم الحالية")
+            _poly_cache["last_update"] = now  # لا نعيد المحاولة فوراً
             return
+
         markets = resp.json().get("data", [])
         btc_markets = [
             m for m in markets
             if "bitcoin" in m.get("question","").lower() or "btc" in m.get("question","").lower()
         ]
         if not btc_markets:
+            log.warning("Polymarket: لا يوجد market BTC — إبقاء 50/50")
+            _poly_cache["last_update"] = now
             return
-        # نأخذ أول market ذو سيولة
-        bull_prob = 0.5
+
+        bull_prob = None
         for m in btc_markets[:5]:
             tokens = m.get("tokens", [])
             for t in tokens:
                 outcome = t.get("outcome","").lower()
-                price   = float(t.get("price", 0.5))
+                raw_price = t.get("price")
+                if raw_price is None: continue
+                price = float(raw_price)
+                # تجاهل قيم غير منطقية (0 أو 1 تماماً = بيانات خاطئة)
+                if price <= 0.01 or price >= 0.99: continue
                 if "yes" in outcome or "above" in outcome or "up" in outcome:
                     bull_prob = price
                     break
-            if bull_prob != 0.5: break
+            if bull_prob is not None: break
+
+        if bull_prob is None:
+            log.warning("Polymarket: قيم متطرفة (0% أو 100%) — إبقاء 50/50")
+            _poly_cache["last_update"] = now
+            _poly_cache["fetch_ok"]    = False
+            return
 
         _poly_cache["btc_bull_prob"] = bull_prob
         _poly_cache["btc_bear_prob"] = 1 - bull_prob
         _poly_cache["last_update"]   = now
+        _poly_cache["fetch_ok"]      = True
         log.info(f"🎯 Polymarket: BTC Bull={bull_prob*100:.0f}% Bear={(1-bull_prob)*100:.0f}%")
+
     except Exception as e:
-        log.warning(f"Polymarket: {e}")
+        log.warning(f"Polymarket error: {e} — إبقاء القيم الحالية")
+        _poly_cache["last_update"] = now  # لا نعيد المحاولة فوراً
+
 
 def poly_score_bonus(direction):
-    """يعطي +10 إذا Polymarket يوافق الاتجاه، -15 إذا يعاكسه"""
+    """
+    🔧 إصلاح: لو fetch_ok=False → لا نعطي bonus ولا penalty
+    """
+    if not _poly_cache["fetch_ok"]:
+        return 0, "Poly⚪N/A"
+
     bull = _poly_cache["btc_bull_prob"]
     bear = _poly_cache["btc_bear_prob"]
     if direction == "long":
-        if bull > POLY_BULL_THRESHOLD:  return +10, f"Poly🟢{bull*100:.0f}%"
-        if bear > POLY_BEAR_THRESHOLD:  return -15, f"Poly🔴{bear*100:.0f}%"
+        if bull > POLY_BULL_THRESHOLD: return +10, f"Poly🟢{bull*100:.0f}%"
+        if bear > POLY_BEAR_THRESHOLD: return -15, f"Poly🔴{bear*100:.0f}%"
     else:
-        if bear > POLY_BEAR_THRESHOLD:  return +10, f"Poly🔴{bear*100:.0f}%"
-        if bull > POLY_BULL_THRESHOLD:  return -15, f"Poly🟢{bull*100:.0f}%"
+        if bear > POLY_BEAR_THRESHOLD: return +10, f"Poly🔴{bear*100:.0f}%"
+        if bull > POLY_BULL_THRESHOLD: return -15, f"Poly🟢{bull*100:.0f}%"
     return 0, ""
 
+
 def poly_hard_block(direction):
-    """يرفض الصفقة كلياً إذا Polymarket يعاكسها بقوة"""
+    """
+    🔧 إصلاح: لو fetch_ok=False → لا نحجب أي صفقة
+    """
+    if not _poly_cache["fetch_ok"]:
+        return False  # ← لا تحجب لو البيانات غير موثوقة
+
     bull = _poly_cache["btc_bull_prob"]
     bear = _poly_cache["btc_bear_prob"]
     if direction == "long"  and bear > 0.70: return True
@@ -451,9 +489,9 @@ def get_filters(symbol):
             lot = tick = None; notional = 5.0
             for f in s["filters"]:
                 ft = f["filterType"]
-                if ft == "LOT_SIZE":    lot = float(f["stepSize"])
-                elif ft == "PRICE_FILTER": tick = float(f["tickSize"])
-                elif ft == "MIN_NOTIONAL": notional = float(f["notional"])
+                if ft == "LOT_SIZE":       lot     = float(f["stepSize"])
+                elif ft == "PRICE_FILTER": tick    = float(f["tickSize"])
+                elif ft == "MIN_NOTIONAL": notional= float(f["notional"])
             if lot and tick:
                 _filters_cache[symbol] = (lot, tick, notional)
                 return _filters_cache[symbol]
@@ -577,17 +615,13 @@ def bollinger(closes, period=20):
     return pct, closes[-1]<lo*1.005, closes[-1]>up*0.995
 
 def supertrend(highs, lows, closes, period=10, mult=3.0):
-    """Supertrend indicator — يعطي اتجاه واضح"""
     if len(closes)<period+1: return True
     atr_val = atr(highs, lows, closes, period)
     mid = (highs[-1]+lows[-1])/2
-    upper = mid + mult*atr_val
     lower = mid - mult*atr_val
-    # تبسيط: إذا السعر فوق lower → صاعد
     return closes[-1] > lower
 
 def detect_structure(closes, highs, lows):
-    """Market Structure: TRENDING_UP / TRENDING_DOWN / RANGING"""
     if len(closes)<30: return "RANGING"
     e9  = ema(closes,9)
     e21 = ema(closes,21)
@@ -602,77 +636,52 @@ def detect_structure(closes, highs, lows):
 
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN ANALYSIS
+#  FIBONACCI
 # ══════════════════════════════════════════════════════════════
 def fibonacci_levels(highs, lows, closes, lookback=50):
-    """
-    يحسب مستويات فيبوناتشي على آخر swing واضح.
-    يُرجع:
-      - fib_levels: dict بالمستويات (0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0)
-      - near_support: السعر قريب من دعم فيبو (long signal)
-      - near_resistance: السعر قريب من مقاومة فيبو (short signal)
-      - nearest_level: أقرب مستوى فيبو والنسبة
-    """
     if len(closes) < lookback:
         return {}, False, False, (0.5, 0.0)
-
     window_h = highs[-lookback:]
     window_l = lows[-lookback:]
     price    = closes[-1]
-
     swing_high = max(window_h)
     swing_low  = min(window_l)
     rng        = swing_high - swing_low
-
     if rng < 1e-9:
         return {}, False, False, (0.5, 0.0)
-
-    # مستويات فيبو الأساسية
     ratios = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
-    # الاتجاه: إذا الإغلاق الأخير أعلى من المنتصف → uptrend → فيبو من low إلى high
     is_uptrend = closes[-1] > (swing_high + swing_low) / 2
-
     levels = {}
     if is_uptrend:
-        # Retracement في uptrend: 0% = swing_high, 100% = swing_low
-        for r in ratios:
-            levels[r] = swing_high - r * rng
+        for r in ratios: levels[r] = swing_high - r * rng
     else:
-        # Retracement في downtrend: 0% = swing_low, 100% = swing_high
-        for r in ratios:
-            levels[r] = swing_low + r * rng
-
-    # أقرب مستوى فيبو للسعر الحالي
+        for r in ratios: levels[r] = swing_low + r * rng
     nearest_ratio = min(ratios, key=lambda r: abs(levels[r] - price))
     nearest_dist  = abs(levels[nearest_ratio] - price) / price
-
-    # هل السعر قريب من مستوى فيبو? (±0.4%)
     TOLERANCE = 0.004
-    near_any   = nearest_dist < TOLERANCE
-
-    # دعم: مستويات 0.382 / 0.5 / 0.618 في uptrend
+    near_any  = nearest_dist < TOLERANCE
     support_ratios    = {0.382, 0.5, 0.618}
     resistance_ratios = {0.236, 0.382, 0.5}
-
     near_support    = near_any and nearest_ratio in support_ratios    and is_uptrend
     near_resistance = near_any and nearest_ratio in resistance_ratios and not is_uptrend
-
     return levels, near_support, near_resistance, (nearest_ratio, nearest_dist)
 
 
+# ══════════════════════════════════════════════════════════════
+#  MAIN ANALYSIS
+# ══════════════════════════════════════════════════════════════
 def analyze(symbol):
     try:
-        # ── جلب البيانات ─────────────────────────────────────
         k1h  = client.futures_klines(symbol=symbol, interval=TF_TREND,   limit=150)
         k15m = client.futures_klines(symbol=symbol, interval=TF_ENTRY,   limit=100)
         k5m  = client.futures_klines(symbol=symbol, interval=TF_CONFIRM, limit=60)
 
         def parse(k):
             return (
-                [float(x[4]) for x in k],  # close
-                [float(x[2]) for x in k],  # high
-                [float(x[3]) for x in k],  # low
-                [float(x[5]) for x in k],  # volume
+                [float(x[4]) for x in k],
+                [float(x[2]) for x in k],
+                [float(x[3]) for x in k],
+                [float(x[5]) for x in k],
             )
 
         cl1h,hi1h,lo1h,vo1h = parse(k1h)
@@ -682,7 +691,6 @@ def analyze(symbol):
         price = cl15[-1]
         if price <= 0: return None
 
-        # ── مؤشرات 1h (اتجاه) ────────────────────────────────
         e9_1h   = ema(cl1h, 9)
         e21_1h  = ema(cl1h, 21)
         e50_1h  = ema(cl1h, 50)
@@ -694,11 +702,9 @@ def analyze(symbol):
         st_bull_1h = supertrend(hi1h, lo1h, cl1h)
         struct_1h  = detect_structure(cl1h, hi1h, lo1h)
 
-        # ── فيبوناتشي (على بيانات 1h) ────────────────────────
         fib_lvls, fib_sup, fib_res, (fib_ratio, fib_dist) = fibonacci_levels(hi1h, lo1h, cl1h, lookback=60)
-        fib_near = fib_dist < 0.004  # قريب من مستوى فيبو
+        fib_near = fib_dist < 0.004
 
-        # ── مؤشرات 15m (دخول) ────────────────────────────────
         e9_15   = ema(cl15, 9)
         e21_15  = ema(cl15, 21)
         rsi_15  = rsi(cl15)
@@ -706,81 +712,55 @@ def analyze(symbol):
         atr_15  = atr(hi15, lo15, cl15)
         struct_15 = detect_structure(cl15, hi15, lo15)
 
-        # حجم
         avg_vol = sum(vo15[-21:-1])/20 or 1
         vol_r   = vo15[-2]/avg_vol
 
-        # ── مؤشرات 5m (تأكيد) ────────────────────────────────
         rsi_5   = rsi(cl5)
         e9_5    = ema(cl5, 9)
         e21_5   = ema(cl5, 21)
 
-        # ── رفض فوري ──────────────────────────────────────────
         if struct_1h == "RANGING" and struct_15 == "RANGING":
-            log.info(f"🔕 {symbol}: سوق عرضي كامل — رفض")
+            log.info(f"🔕 {symbol}: سوق عرضي — رفض")
             return None
         if vol_r < 0.6:
             log.info(f"🔕 {symbol}: فوليوم {vol_r:.2f} — رفض")
             return None
 
-        # ── تحديد الاتجاه ─────────────────────────────────────
         direction = None; score = 0; reasons = []
 
-        # === LONG ===
-        long_ok = (
-            struct_1h in ("TRENDING_UP","RANGING") and
-            e9_1h > e21_1h and
-            price > e50_1h
-        )
-        short_ok = (
-            struct_1h in ("TRENDING_DOWN","RANGING") and
-            e9_1h < e21_1h and
-            price < e50_1h
-        )
+        long_ok = (struct_1h in ("TRENDING_UP","RANGING") and e9_1h > e21_1h and price > e50_1h)
+        short_ok = (struct_1h in ("TRENDING_DOWN","RANGING") and e9_1h < e21_1h and price < e50_1h)
 
-        if long_ok and not short_ok:
-            direction = "long"
-        elif short_ok and not long_ok:
-            direction = "short"
-        elif long_ok and short_ok:
-            direction = "long" if rsi_1h < 50 else "short"
+        if long_ok and not short_ok:      direction = "long"
+        elif short_ok and not long_ok:    direction = "short"
+        elif long_ok and short_ok:        direction = "long" if rsi_1h < 50 else "short"
         else:
-            log.info(f"🔕 {symbol}: لا اتجاه — EMA9={'↑' if e9_1h>e21_1h else '↓'} RSI1h={rsi_1h:.0f}")
+            log.info(f"🔕 {symbol}: لا اتجاه واضح")
             return None
 
-        # ── نقاط الدخول ───────────────────────────────────────
         if direction == "long":
-            # 1h اتجاه
             if struct_1h == "TRENDING_UP":     score+=15; reasons.append("1h↑")
             if e9_1h>e21_1h:                   score+=8;  reasons.append("EMA9>21_1h")
             if price>e200_1h:                  score+=10; reasons.append("↑EMA200")
             if st_bull_1h:                     score+=10; reasons.append("ST🟢")
             if macd_bull_1h:                   score+=8;  reasons.append("MACD1h↑")
-            # RSI
             if 40<=rsi_1h<=60:                 score+=12; reasons.append(f"RSI1h✓{rsi_1h:.0f}")
             elif 30<=rsi_1h<40:                score+=18; reasons.append(f"RSI1h-OS{rsi_1h:.0f}")
             elif rsi_1h>70:                    score-=20
-            # Bollinger
             if bb_low:                         score+=12; reasons.append("BB-Low🎯")
             elif bb_pct<0.30:                  score+=6;  reasons.append("BB-low")
             if bb_high:                        score-=10
-            # فيبوناتشي
-            if fib_sup:
-                score+=15; reasons.append(f"Fib-دعم{fib_ratio*100:.0f}%🟡")
-            elif fib_near and fib_ratio in (0.382, 0.5, 0.618):
-                score+=8;  reasons.append(f"Fib{fib_ratio*100:.0f}%")
-            if fib_res:
-                score-=10; reasons.append("Fib-مقاومة⚠️")
-            # 15m
+            if fib_sup:                        score+=15; reasons.append(f"Fib-دعم{fib_ratio*100:.0f}%🟡")
+            elif fib_near and fib_ratio in (0.382, 0.5, 0.618): score+=8; reasons.append(f"Fib{fib_ratio*100:.0f}%")
+            if fib_res:                        score-=10; reasons.append("Fib-مقاومة⚠️")
             if struct_15=="TRENDING_UP":       score+=10; reasons.append("15m↑")
             if e9_15>e21_15:                   score+=6;  reasons.append("EMA_15↑")
             if macd_bull_15:                   score+=5;  reasons.append("MACD15↑")
             if 40<=rsi_15<=60:                 score+=8;  reasons.append(f"RSI15✓{rsi_15:.0f}")
             elif rsi_15>70:                    score-=10
-            # 5m تأكيد
             if e9_5>e21_5:                     score+=5;  reasons.append("5m↑تأكيد")
             if 40<=rsi_5<=65:                  score+=5;  reasons.append(f"RSI5✓{rsi_5:.0f}")
-        else:  # short
+        else:
             if struct_1h == "TRENDING_DOWN":   score+=15; reasons.append("1h↓")
             if e9_1h<e21_1h:                   score+=8;  reasons.append("EMA9<21_1h")
             if price<e200_1h:                  score+=10; reasons.append("↓EMA200")
@@ -792,13 +772,9 @@ def analyze(symbol):
             if bb_high:                        score+=12; reasons.append("BB-High🎯")
             elif bb_pct>0.70:                  score+=6;  reasons.append("BB-high")
             if bb_low:                         score-=10
-            # فيبوناتشي
-            if fib_res:
-                score+=15; reasons.append(f"Fib-مقاومة{fib_ratio*100:.0f}%🟡")
-            elif fib_near and fib_ratio in (0.236, 0.382, 0.5):
-                score+=8;  reasons.append(f"Fib{fib_ratio*100:.0f}%")
-            if fib_sup:
-                score-=10; reasons.append("Fib-دعم⚠️")
+            if fib_res:                        score+=15; reasons.append(f"Fib-مقاومة{fib_ratio*100:.0f}%🟡")
+            elif fib_near and fib_ratio in (0.236, 0.382, 0.5): score+=8; reasons.append(f"Fib{fib_ratio*100:.0f}%")
+            if fib_sup:                        score-=10; reasons.append("Fib-دعم⚠️")
             if struct_15=="TRENDING_DOWN":     score+=10; reasons.append("15m↓")
             if e9_15<e21_15:                   score+=6;  reasons.append("EMA_15↓")
             if not macd_bull_15:               score+=5;  reasons.append("MACD15↓")
@@ -807,30 +783,26 @@ def analyze(symbol):
             if e9_5<e21_5:                     score+=5;  reasons.append("5m↓تأكيد")
             if 35<=rsi_5<=60:                  score+=5;  reasons.append(f"RSI5✓{rsi_5:.0f}")
 
-        # حجم
         if vol_r>2.5:   score+=12; reasons.append(f"Vol×{vol_r:.1f}🔥")
         elif vol_r>1.5: score+=6;  reasons.append(f"Vol×{vol_r:.1f}")
 
-        # سمعة العملة
         wr = sym_wr(symbol)
         if wr>0.60:   score+=8;  reasons.append(f"WR{wr*100:.0f}%")
         elif wr<0.35: score-=8
 
-        # ── Polymarket ─────────────────────────────────────────
         if POLY_ENABLED:
             bonus, label = poly_score_bonus(direction)
             if bonus != 0:
                 score += bonus
                 if label: reasons.append(label)
             if poly_hard_block(direction):
-                log.info(f"🚫 {symbol}: Polymarket يعاكس {direction} بقوة — رفض")
+                log.info(f"🚫 {symbol}: Polymarket يعاكس {direction} — رفض")
                 return None
 
         if score < MIN_SCORE:
             log.info(f"🔕 {symbol} {direction}: score={score} < {MIN_SCORE}")
             return None
 
-        # ── TP / SL بالـ ATR ──────────────────────────────────
         sl_mult = learning["atr_sl_mult"]
         if direction == "long":
             sl_p = price - atr_1h * sl_mult
@@ -885,7 +857,7 @@ def update_market():
     try:
         kl  = client.futures_klines(symbol="BTCUSDT", interval="1h", limit=60)
         cls = [float(k[4]) for k in kl]
-        e50 = ema(cls,50); e200 = ema(cls,200)
+        e50 = ema(cls,50)
         prev = _market_bull
         _market_bull = cls[-1] >= e50*0.98
         if prev != _market_bull:
@@ -983,6 +955,7 @@ def open_pos(cand):
         fib_str = ""
         if cand.get("fib_near"):
             fib_str = f"Fib `{cand['fib_ratio']*100:.0f}%` (±`{cand['fib_dist']:.2f}%`)\n"
+        poly_status = f"Poly:{'✅' if _poly_cache['fetch_ok'] else '⚪N/A'} Bull:{_poly_cache['btc_bull_prob']*100:.0f}%"
         tg(
             f"🚀 *{dl}: {sym}*\n"
             f"سعر:`{re:.4f}` | رافعة:`{lev}x`\n"
@@ -994,7 +967,7 @@ def open_pos(cand):
             f"Vol:`×{cand['vol_r']:.1f}` | Struct:`{cand['struct']}`\n"
             f"{fib_str}"
             f"🎯 {' | '.join(cand['reasons'][:6])}\n"
-            f"💰 Poly Bull:{_poly_cache['btc_bull_prob']*100:.0f}%"
+            f"💰 {poly_status}"
         )
         log.info(f"✅ {dire} {sym} @ {re:.4f} ×{lev} score={sc}")
         return True
@@ -1065,7 +1038,7 @@ def close_external():
             try:
                 client.futures_create_order(symbol=sym,side=side,type=ORDER_TYPE_MARKET,quantity=abs(amt),reduceOnly=True)
                 log.warning(f"🔄 خارجية مُغلقة: {sym}")
-                tg(f"🔄 *خارجية مُغلقة: {sym}* qty:`{abs(amt):.4f}` — تحرير مارجن")
+                tg(f"🔄 *خارجية مُغلقة: {sym}* qty:`{abs(amt):.4f}`")
             except Exception as e:
                 log.error(f"close_ext {sym}: {e}")
     except Exception as e:
@@ -1095,7 +1068,6 @@ def protection_monitor():
                     tg(f"🔒 *BE {sym}* {'🟢L' if tr.direction=='long' else '🔴S'}\nP&L:`+{tr.pnl_pct(p):.2f}%`")
                 elif ev=="trailing":
                     tg(f"📈 *Trail {sym}*\nSL:`{tr.trail_sl:.4f}` P&L:`+{tr.pnl_pct(p):.2f}%`")
-                # فحص SL
                 fail_key=f"{sym}_{tr.direction}"
                 if _sl_fail_count.get(fail_key,0)<MAX_SL_FAIL:
                     try:
@@ -1131,7 +1103,7 @@ def check_protection(bal):
             halted_total=True; close_all(f"خسارة إجمالية {t*100:.1f}%")
             tg("🚨 *البوت متوقف نهائياً*"); return False
     if learning["consec_losses"]>=CONSEC_LOSS_ST and not open_trades:
-        log.info(f"⛔ خسارتان متتاليتان — راحة {PAUSE_AFTER_LOSS_MIN} دقيقة")
+        log.info(f"⛔ خسارتان — راحة {PAUSE_AFTER_LOSS_MIN} دقيقة")
         tg(f"⏸️ *خسارتان متتاليتان — راحة {PAUSE_AFTER_LOSS_MIN} دق*")
         time.sleep(PAUSE_AFTER_LOSS_MIN*60)
         learning["consec_losses"]=0
@@ -1146,11 +1118,12 @@ def daily_report(bal):
     try:
         d=(daily_start_bal-bal)/daily_start_bal*100 if daily_start_bal else 0
         t=(bot_start_bal-bal)/bot_start_bal*100 if bot_start_bal else 0
+        poly_st = f"✅ Bull:{_poly_cache['btc_bull_prob']*100:.0f}%" if _poly_cache["fetch_ok"] else "⚪ N/A (محايد)"
         msg  = f"📊 *تقرير {today}*\n"
         msg += f"رصيد:`{bal:.2f}` | اليوم:`{d:.2f}%` | إجمالي:`{t:.2f}%`\n"
         msg += f"Win%:`{learning['win_rate']*100:.1f}%` ({learning['total_trades']} صفقة)\n"
         msg += f"صفقات اليوم:`{_daily_trades}` | Risk:`{learning['current_risk']*100:.1f}%`\n"
-        msg += f"🎯 Poly Bull:{_poly_cache['btc_bull_prob']*100:.0f}%\n"
+        msg += f"🎯 Poly {poly_st}\n"
         bh = sorted(
             [(h,s) for h,s in learning["hour_stats"].items() if s["w"]+s["l"]>=3],
             key=lambda x:x[1]["w"]/(x[1]["w"]+x[1]["l"]), reverse=True
@@ -1208,12 +1181,12 @@ def adopt_existing():
 
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN LOOP
+#  🔧 MAIN LOOP — وضع هجين
 # ══════════════════════════════════════════════════════════════
 def main_loop():
-    global bot_start_bal,daily_start_bal,daily_reset_dt,client,_market_bull
+    global bot_start_bal,daily_start_bal,daily_reset_dt,client,_market_bull,_tv_last_signal_t
 
-    log.info("🚀 Bot v9.0 — Multi-TF + Polymarket")
+    log.info("🚀 Bot v9.1 — Hybrid TV + Polymarket Fixed")
     client=Client(BINANCE_API_KEY,BINANCE_API_SECRET)
     load_learning()
     load_symbols()
@@ -1225,17 +1198,20 @@ def main_loop():
 
     threading.Thread(target=protection_monitor,daemon=True).start()
 
+    poly_st = f"Bull:{_poly_cache['btc_bull_prob']*100:.0f}%" if _poly_cache["fetch_ok"] else "⚪ N/A"
     tg(
-        f"🤖 *Bot v9.0* ✅\n"
+        f"🤖 *Bot v9.1* ✅\n"
         f"رصيد:`{ini:.2f}` USDT\n"
         f"عملات:{len(SYMBOLS)} | Swing 1h+15m+5m\n"
+        f"─── الوضع ───\n"
+        f"TV Mode:`{TV_MODE}` | Fallback:`{TV_FALLBACK_MIN} دق`\n"
         f"─── الرافعة ───\n"
         f"Strong:{LEVERAGE_STRONG}x | Normal:{LEVERAGE_NORMAL}x | Weak:{LEVERAGE_WEAK}x\n"
         f"─── الحماية ───\n"
         f"BE`+{BE_PCT*100:.1f}%` Trail`+{TRAIL_START*100:.1f}%`\n"
         f"يومي:{DAILY_LOSS_LIM*100:.0f}% | إجمالي:{TOTAL_LOSS_LIM*100:.0f}%\n"
         f"─── Polymarket ───\n"
-        f"BTC Bull:{_poly_cache['btc_bull_prob']*100:.0f}% Bear:{_poly_cache['btc_bear_prob']*100:.0f}%"
+        f"{poly_st}"
     )
 
     update_market()
@@ -1255,9 +1231,9 @@ def main_loop():
                 f"Risk:{learning['current_risk']*100:.1f}% ══"
             )
             if mf>=20: update_market(); mf=0
-            if sc>=720: load_symbols(); sc=0       # كل 6 ساعات
-            if ec>=8:  close_external(); ec=0      # كل 4 دقائق
-            if pc>=30: update_polymarket(); pc=0   # كل 15 دقيقة
+            if sc>=720: load_symbols(); sc=0
+            if ec>=8:  close_external(); ec=0
+            if pc>=30: update_polymarket(); pc=0
 
             if not check_protection(bal):
                 time.sleep(SCAN_INTERVAL_SEC); continue
@@ -1275,45 +1251,70 @@ def main_loop():
                 _tv_signals.pop(s, None)
                 log.info(f"⌛ TV Signal {s}: انتهت صلاحيتها")
 
+            # ══ منطق TV_MODE الهجين ════════════════════════════
+            now_t = utcnow()
+            has_tv_signals = bool(_tv_signals)
+
+            # حساب الوقت منذ آخر إشارة TV
+            mins_since_tv = 9999
+            if _tv_last_signal_t:
+                mins_since_tv = (now_t - _tv_last_signal_t).total_seconds() / 60
+
+            if TV_MODE == "strict":
+                # الوضع القديم: ننتظر TV فقط
+                if not has_tv_signals:
+                    if cy % 20 == 0:
+                        log.info("⏳ Strict: لا إشارات TV — ننتظر")
+                    time.sleep(SCAN_INTERVAL_SEC); continue
+                scan_list  = list(_tv_signals.keys())
+                tv_boost   = True   # TV يعزز النقاط لو وُجد
+
+            elif TV_MODE == "hybrid":
+                # الوضع الهجين: TV أولوية، بعد X دقيقة → تحليل داخلي
+                if has_tv_signals:
+                    scan_list = list(_tv_signals.keys())
+                    tv_boost  = True
+                    log.info(f"📡 Hybrid: إشارات TV {list(_tv_signals.keys())}")
+                elif mins_since_tv < TV_FALLBACK_MIN:
+                    remaining = TV_FALLBACK_MIN - mins_since_tv
+                    if cy % 10 == 0:
+                        log.info(f"⏳ Hybrid: انتظار TV fallback — {remaining:.0f} دق متبقية")
+                    time.sleep(SCAN_INTERVAL_SEC); continue
+                else:
+                    # fallback → تحليل داخلي
+                    scan_list = SYMBOLS
+                    tv_boost  = False
+                    if cy % 10 == 0:
+                        log.info("🔍 Hybrid-Fallback: تحليل داخلي (لا إشارات TV)")
+
+            else:  # off
+                scan_list = SYMBOLS
+                tv_boost  = False
+
             # ── مسح ──────────────────────────────────────────
             candidates = []
-
-            # العملات المرشحة = التي وصل لها إشارة TV فقط (إذا TV_REQUIRED)
-            if TV_REQUIRED:
-                active_sigs = {s: sig for s,sig in _tv_signals.items()
-                               if (now_t-sig["ts"]).total_seconds() <= TV_SIGNAL_TTL_SEC}
-                scan_list = list(active_sigs.keys())
-                if not scan_list:
-                    if cy % 20 == 0:
-                        log.info("⏳ لا إشارات TV معلقة — ننتظر TradingView")
-                    time.sleep(SCAN_INTERVAL_SEC); continue
-            else:
-                scan_list = SYMBOLS
-
             for sym in scan_list:
-                if sym not in SYMBOLS: continue   # خارج قائمتنا
+                if sym not in SYMBOLS: continue
                 if sym in open_trades: continue
                 amt,_ = get_position(sym)
                 if abs(amt) > 1e-8: continue
 
-                # ── تحليل داخلي ───────────────────────────────
                 r = analyze(sym)
                 if not r:
-                    if TV_REQUIRED:
-                        log.info(f"🔕 {sym}: TV أشار لكن التحليل رفض — لا دخول")
+                    if tv_boost and sym in _tv_signals:
+                        log.info(f"🔕 {sym}: TV أشار لكن التحليل رفض")
                     continue
 
-                # ── تأكيد اتجاه TV مع التحليل ─────────────────
-                if TV_REQUIRED and sym in _tv_signals:
+                # تأكيد اتجاه TV لو موجود
+                if tv_boost and sym in _tv_signals:
                     tv_dir = _tv_signals[sym]["direction"]
                     if r["direction"] != tv_dir:
-                        log.info(f"⚡ {sym}: TV={tv_dir} vs تحليل={r['direction']} — تعارض، رفض")
+                        log.info(f"⚡ {sym}: TV={tv_dir} vs تحليل={r['direction']} — تعارض")
                         tg(f"⚡ *تعارض {sym}*\nTV:`{tv_dir}` ↔ تحليل:`{r['direction']}` — رُفض")
                         continue
-                    # إشارة TV تعزز النقاط
                     r["score"] += 10
                     r["reasons"].insert(0, f"TV✅{_tv_signals[sym]['tf']}")
-                    log.info(f"✅ TV+تحليل متوافقان: {sym} {tv_dir} score={r['score']}")
+                    log.info(f"✅ TV+تحليل: {sym} {tv_dir} score={r['score']}")
 
                 dok = (r["direction"]=="long"  and _market_bull) or \
                       (r["direction"]=="short" and not _market_bull)
@@ -1329,7 +1330,6 @@ def main_loop():
                     if len(open_trades) >= MAX_OPEN_TRADES: break
                     if avail_margin() < 2.0: break
                     if open_pos(c):
-                        # احذف الإشارة بعد الدخول
                         _tv_signals.pop(c["symbol"], None)
                         time.sleep(3)
             else:
@@ -1350,20 +1350,40 @@ def main_loop():
 @app.route("/webhook", methods=["POST"])
 def tv_webhook():
     """
-    يستقبل إشارات TradingView عبر Webhook.
-    صيغة JSON المتوقعة:
+    ══════════════════════════════════════════════
+    🔧 رسالة Webhook الصحيحة في TradingView:
+    ══════════════════════════════════════════════
     {
         "secret":    "my_secret_123",
-        "symbol":    "BTCUSDT",
-        "direction": "long",          ← أو "short" أو "close"
-        "price":     "94500.0",       ← اختياري
-        "tf":        "1h"             ← الإطار الزمني
+        "symbol":    "{{ticker}}",
+        "direction": "long",
+        "price":     "{{close}}",
+        "tf":        "{{interval}}"
     }
+
+    للـ Short:
+    {
+        "secret":    "my_secret_123",
+        "symbol":    "{{ticker}}",
+        "direction": "short",
+        "price":     "{{close}}",
+        "tf":        "{{interval}}"
+    }
+
+    للإغلاق:
+    {
+        "secret":    "my_secret_123",
+        "symbol":    "{{ticker}}",
+        "direction": "close",
+        "price":     "{{close}}",
+        "tf":        "{{interval}}"
+    }
+    ══════════════════════════════════════════════
     """
+    global _tv_last_signal_t
     try:
         data = flask_request.get_json(force=True, silent=True) or {}
 
-        # ── تحقق من السر ──────────────────────────────────────
         if data.get("secret") != TV_SECRET:
             log.warning(f"⚠️ Webhook: سر خاطئ من {flask_request.remote_addr}")
             return {"status": "unauthorized"}, 401
@@ -1380,19 +1400,17 @@ def tv_webhook():
             sym += "USDT"
 
         now = utcnow()
+        _tv_last_signal_t = now  # تحديث وقت آخر إشارة
 
-        # ── إشارة إغلاق ───────────────────────────────────────
         if dire == "close":
             _tv_signals.pop(sym, None)
             if sym in open_trades:
                 trade = open_trades[sym]
                 cp    = cur_price(sym)
                 execute_close(sym, trade, cp, f"TV-Close({tf})")
-                log.info(f"📡 TV Close: {sym}")
                 return {"status": "closed", "symbol": sym}
             return {"status": "no_position", "symbol": sym}
 
-        # ── إشارة دخول ────────────────────────────────────────
         _tv_signals[sym] = {
             "direction": dire,
             "ts":        now,
@@ -1400,7 +1418,7 @@ def tv_webhook():
             "tf":        tf,
         }
         log.info(f"📡 TV Signal: {sym} {dire} @ {prc} TF={tf}")
-        tg(f"📡 *TV Signal: {sym}*\n{dire.upper()} @ `{prc}` TF:`{tf}`\n⏳ انتظار تأكيد التحليل...")
+        tg(f"📡 *TV Signal: {sym}*\n{dire.upper()} @ `{prc}` TF:`{tf}`\n⏳ تحليل...")
         return {"status": "received", "symbol": sym, "direction": dire}
 
     except Exception as e:
@@ -1410,7 +1428,6 @@ def tv_webhook():
 
 @app.route("/signals")
 def signals_r():
-    """يعرض إشارات TradingView المعلقة"""
     now = utcnow()
     out = {}
     for sym, sig in _tv_signals.items():
@@ -1427,27 +1444,24 @@ def signals_r():
 
 @app.route("/")
 def home():
-    bal=balance()
-    bull="🟢 صاعد" if _market_bull else "🔴 هابط"
+    bal  = balance()
+    bull = "🟢 صاعد" if _market_bull else "🔴 هابط"
+    poly_st = f"✅ Bull:{_poly_cache['btc_bull_prob']*100:.0f}%" if _poly_cache["fetch_ok"] else "⚪ N/A (محايد)"
     lines=[
-        f"<b>🤖 Bot v10.0 — TV+Poly+Fib</b> | {bull}",
+        f"<b>🤖 Bot v9.1 — Hybrid TV + Poly Fixed</b> | {bull}",
         f"رصيد:<b>{bal:.2f} USDT</b> | مفتوحة:{len(open_trades)}/{MAX_OPEN_TRADES}",
         f"Win%:{learning['win_rate']*100:.1f}% ({learning['total_trades']} صفقة) | يوم:{_daily_trades}/{MAX_DAILY_TR}",
         f"Risk:{learning['current_risk']*100:.1f}% | Comp:×{learning['comp_mult']:.2f}",
-        f"🎯 Poly Bull:{_poly_cache['btc_bull_prob']*100:.0f}% | TV Mode:{'🟢 ON' if TV_REQUIRED else '🟡 OFF'}",
-        f"<b>📡 إشارات TV معلقة: {len(_tv_signals)}</b>",
+        f"TV Mode:<b>{TV_MODE}</b> | Fallback:{TV_FALLBACK_MIN} دق | Poly: {poly_st}",
+        f"<b>📡 إشارات TV: {len(_tv_signals)}</b>",
         "<hr>",
     ]
-    # عرض إشارات TV المعلقة
     now_t = utcnow()
     for sym, sig in _tv_signals.items():
-        age = int((now_t - sig["ts"]).total_seconds())
-        valid = age < TV_SIGNAL_TTL_SEC
+        age    = int((now_t - sig["ts"]).total_seconds())
+        valid  = age < TV_SIGNAL_TTL_SEC
         status = "🟢 فعالة" if valid else "🔴 منتهية"
-        lines.append(
-            f"📡 <b>{sym}</b> {sig['direction'].upper()} TF:{sig['tf']} "
-            f"| {age}s | {status}"
-        )
+        lines.append(f"📡 <b>{sym}</b> {sig['direction'].upper()} TF:{sig['tf']} | {age}s | {status}")
     if _tv_signals: lines.append("<hr>")
     for sym,t in open_trades.items():
         p=cur_price(sym); pnl=t.pnl_pct(p)
@@ -1485,7 +1499,6 @@ def stats_r():
 
 @app.route("/fib/<symbol>")
 def fib_r(symbol):
-    """يعرض مستويات فيبوناتشي الحالية لأي عملة"""
     try:
         sym = symbol.upper()
         if not sym.endswith("USDT"): sym += "USDT"
@@ -1510,11 +1523,17 @@ def fib_r(symbol):
 
 @app.route("/poly")
 def poly_r():
-    return json.dumps(_poly_cache,ensure_ascii=False,indent=2)
+    return json.dumps({**_poly_cache, "last_update": str(_poly_cache["last_update"])},
+                      ensure_ascii=False, indent=2)
 
 @app.route("/learning")
 def learn_r():
-    return json.dumps({k:learning[k] for k in ["win_rate","total_trades","current_risk","comp_mult","consec_wins","consec_losses","atr_sl_mult","peak_balance"]},ensure_ascii=False,indent=2)
+    return json.dumps(
+        {k:learning[k] for k in ["win_rate","total_trades","current_risk",
+                                  "comp_mult","consec_wins","consec_losses",
+                                  "atr_sl_mult","peak_balance"]},
+        ensure_ascii=False, indent=2
+    )
 
 if __name__=="__main__":
     threading.Thread(target=main_loop,daemon=True).start()
