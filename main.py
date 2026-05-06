@@ -972,11 +972,17 @@ def open_pos(cand):
             tg(f"❌ *فشل دخول {sym}*\nراجع السجلات")
             return False
 
-        time.sleep(1.5)
-        ra,re = get_position(sym)
-        log.info(f"🔍 {sym}: وضعية بعد الأمر amt={ra:.4f} entry={re:.4f}")
-        if abs(ra)<1e-8:
-            log.error(f"❌ {sym}: الأمر نُفّذ لكن لا وضعية — تحقق من Binance!")
+        # انتظر حتى تظهر الوضعية — Binance تحتاج وقتاً أحياناً
+        ra, re = 0.0, 0.0
+        for attempt in range(6):   # نحاول 6 مرات × 1 ثانية = 6 ثواني
+            time.sleep(1.0)
+            ra, re = get_position(sym)
+            log.info(f"🔍 {sym}: محاولة {attempt+1}/6 amt={ra:.6f} entry={re:.4f}")
+            if abs(ra) > 1e-8:
+                break
+        if abs(ra) < 1e-8:
+            log.error(f"❌ {sym}: الأمر نُفّذ (orderId) لكن الوضعية لا تظهر بعد 6 ثواني!")
+            tg(f"⚠️ *{sym}*: أمر مُرسل لكن الوضعية غير مؤكدة — تحقق يدوياً")
             return False
         rq = abs(ra); re = re or prc
         trade = TradeState(sym,re,rq,dire,cand["tp"],cand["sl"],cand["atr"],sc,cand["reasons"])
