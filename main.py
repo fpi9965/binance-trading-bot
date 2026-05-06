@@ -1343,18 +1343,30 @@ def main_loop():
             if candidates:
                 candidates.sort(key=lambda x: (-x["score"], -x["rr"]))
                 log.info(f"🏆 أفضل مرشح: {candidates[0]['symbol']} score={candidates[0]['score']} RR={candidates[0]['rr']}")
-                for c in candidates:
-                    if len(open_trades) >= MAX_OPEN_TRADES:
-                        log.info(f"⛔ وصلنا الحد الأقصى للصفقات ({MAX_OPEN_TRADES})")
-                        break
-                    av_now = avail_margin()
-                    if av_now < 2.0:
-                        log.info(f"⛔ هامش غير كافٍ: {av_now:.2f}$")
-                        break
-                    log.info(f"▶️ محاولة فتح {c['symbol']} {c['direction']} score={c['score']}")
-                    if open_pos(c):
-                        _tv_signals.pop(c["symbol"], None)
-                        time.sleep(3)
+
+                # ── نفتح صفقة واحدة فقط لكل دورة ──────────────
+                # نتحقق أولاً من الحدود قبل أي محاولة
+                if len(open_trades) >= MAX_OPEN_TRADES:
+                    log.info(f"⛔ وصلنا الحد الأقصى ({MAX_OPEN_TRADES}) — لا دخول")
+                elif avail_margin() < 2.0:
+                    log.info(f"⛔ هامش غير كافٍ — لا دخول")
+                else:
+                    # نأخذ أفضل مرشح واحد فقط
+                    best = candidates[0]
+                    log.info(f"▶️ محاولة فتح {best['symbol']} {best['direction']} score={best['score']}")
+                    if open_pos(best):
+                        _tv_signals.pop(best["symbol"], None)
+                        time.sleep(5)   # انتظر 5 ثواني بعد الدخول
+
+                        # لو مازال فيه مكان → نفتح الثاني في نفس الدورة
+                        if len(open_trades) < MAX_OPEN_TRADES and avail_margin() >= 2.0 and len(candidates) > 1:
+                            second = candidates[1]
+                            # تأكد ما هي نفس العملة ولم تُفتح بعد
+                            if second["symbol"] not in open_trades:
+                                log.info(f"▶️ محاولة فتح ثانية: {second['symbol']} score={second['score']}")
+                                if open_pos(second):
+                                    _tv_signals.pop(second["symbol"], None)
+                                    time.sleep(3)
             else:
                 if cy % 10 == 0: log.info("لا فرص الآن.")
 
