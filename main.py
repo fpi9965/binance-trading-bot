@@ -519,16 +519,23 @@ def cancel_stops(symbol):
                 except: pass
     except: pass
 
+_sl_no_support: set = set()   # عملات لا تدعم STOP_MARKET — لا نحاول مجدداً
+
 def place_sl(symbol, entry, qty, direction):
+    # لو العملة في القائمة السوداء → تخطي بصمت
+    if symbol in _sl_no_support:
+        return False
+
     fail_key = f"{symbol}_{direction}"
-    if _sl_fail_count.get(fail_key,0) >= MAX_SL_FAIL: return False
+    if _sl_fail_count.get(fail_key,0) >= MAX_SL_FAIL:
+        return False
+
     is_long = direction == "long"
     sl_p = rprice(symbol, entry*(1-0.025) if is_long else entry*(1+0.025))
     side = SIDE_SELL if is_long else SIDE_BUY
     cancel_stops(symbol)
     time.sleep(0.3)
 
-    # نجرب MARK_PRICE أولاً، لو فشل نجرب CONTRACT_PRICE
     for working_type in ("MARK_PRICE", "CONTRACT_PRICE"):
         try:
             client.futures_create_order(
@@ -541,15 +548,16 @@ def place_sl(symbol, entry, qty, direction):
             return True
         except Exception as e:
             code = str(e)
-            if "-4120" in code:
-                log.warning(f"⚠️ {symbol}: STOP_MARKET رُفض [{working_type}] — نجرب البديل")
+            if "-4120" in code or "does not support" in code.lower():
                 continue
             else:
                 log.error(f"❌ BN-SL {symbol} [{working_type}]: {e}")
-                break
+                _sl_fail_count[fail_key] = _sl_fail_count.get(fail_key,0) + 1
+                return False
 
-    log.warning(f"⚠️ {symbol}: SL على Binance فشل — حماية داخلية فقط")
-    _sl_fail_count[fail_key] = _sl_fail_count.get(fail_key,0) + 1
+    # كلا النوعين فشلا → قائمة سوداء، لا نكرر
+    _sl_no_support.add(symbol)
+    log.warning(f"⚠️ {symbol}: لا يدعم BN-SL — حماية داخلية فقط (مُضاف للقائمة السوداء)")
     return False
 
 def mkt_close(symbol, qty, direction):
@@ -1116,7 +1124,8 @@ def protection_monitor():
                 elif ev=="trailing":
                     tg(f"📈 *Trail {sym}*\nSL:`{tr.trail_sl:.4f}` P&L:`+{tr.pnl_pct(p):.2f}%`")
                 fail_key=f"{sym}_{tr.direction}"
-                if _sl_fail_count.get(fail_key,0)<MAX_SL_FAIL:
+                # لا نعيد محاولة SL للعملات في القائمة السوداء أو التي تجاوزت الحد
+                if sym not in _sl_no_support and _sl_fail_count.get(fail_key,0)<MAX_SL_FAIL:
                     try:
                         orders=client.futures_get_open_orders(symbol=sym)
                         if not any("STOP" in o.get("type","") for o in orders):
