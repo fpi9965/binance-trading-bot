@@ -527,22 +527,30 @@ def place_sl(symbol, entry, qty, direction):
     side = SIDE_SELL if is_long else SIDE_BUY
     cancel_stops(symbol)
     time.sleep(0.3)
-    try:
-        client.futures_create_order(
-            symbol=symbol, side=side, type="STOP_MARKET",
-            stopPrice=sl_p, quantity=qty, reduceOnly=True, workingType="MARK_PRICE"
-        )
-        _sl_fail_count[fail_key] = 0
-        log.info(f"✅ BN-SL {symbol}={sl_p}")
-        return True
-    except Exception as e:
-        code = str(e)
-        if "-4120" in code:
-            log.warning(f"⚠️ {symbol}: STOP_MARKET غير مدعوم — حماية داخلية فقط")
-        else:
-            log.error(f"❌ BN-SL {symbol}: {e}")
-        _sl_fail_count[fail_key] = _sl_fail_count.get(fail_key,0) + 1
-        return False
+
+    # نجرب MARK_PRICE أولاً، لو فشل نجرب CONTRACT_PRICE
+    for working_type in ("MARK_PRICE", "CONTRACT_PRICE"):
+        try:
+            client.futures_create_order(
+                symbol=symbol, side=side, type="STOP_MARKET",
+                stopPrice=sl_p, quantity=qty, reduceOnly=True,
+                workingType=working_type
+            )
+            _sl_fail_count[fail_key] = 0
+            log.info(f"✅ BN-SL {symbol}={sl_p} [{working_type}]")
+            return True
+        except Exception as e:
+            code = str(e)
+            if "-4120" in code:
+                log.warning(f"⚠️ {symbol}: STOP_MARKET رُفض [{working_type}] — نجرب البديل")
+                continue
+            else:
+                log.error(f"❌ BN-SL {symbol} [{working_type}]: {e}")
+                break
+
+    log.warning(f"⚠️ {symbol}: SL على Binance فشل — حماية داخلية فقط")
+    _sl_fail_count[fail_key] = _sl_fail_count.get(fail_key,0) + 1
+    return False
 
 def mkt_close(symbol, qty, direction):
     qty = abs(qty)
