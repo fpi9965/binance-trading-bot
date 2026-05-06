@@ -945,21 +945,38 @@ def open_pos(cand):
         if qty <= 0:
             log.info(f"{sym}: qty=0 — تخطي")
             return False
-        try: client.futures_change_leverage(symbol=sym, leverage=lev)
-        except: pass
+
+        log.info(f"📋 {sym}: bal={bal:.2f} av={av:.2f} lev={lev}x qty={qty} price={prc} min_n={min_n}")
+
+        try:
+            client.futures_change_leverage(symbol=sym, leverage=lev)
+            log.info(f"⚙️ {sym}: رافعة {lev}x مضبوطة")
+        except Exception as e:
+            log.warning(f"⚙️ {sym}: فشل ضبط الرافعة: {e}")
+
         side = SIDE_BUY if dire=="long" else SIDE_SELL
+        order_ok = False
         for i in range(3):
             try:
-                client.futures_create_order(symbol=sym,side=side,type=ORDER_TYPE_MARKET,quantity=qty)
+                res = client.futures_create_order(
+                    symbol=sym, side=side, type=ORDER_TYPE_MARKET, quantity=qty
+                )
+                log.info(f"📨 {sym}: أمر مُرسل orderId={res.get('orderId','?')}")
+                order_ok = True
                 break
             except Exception as e:
-                log.warning(f"entry {sym} #{i+1}: {e}")
+                log.warning(f"❌ entry {sym} #{i+1}: {e}")
                 time.sleep(1)
-                if i==2: return False
+        if not order_ok:
+            log.error(f"❌ {sym}: فشل إرسال الأمر بعد 3 محاولات")
+            tg(f"❌ *فشل دخول {sym}*\nراجع السجلات")
+            return False
+
         time.sleep(1.5)
         ra,re = get_position(sym)
+        log.info(f"🔍 {sym}: وضعية بعد الأمر amt={ra:.4f} entry={re:.4f}")
         if abs(ra)<1e-8:
-            log.error(f"❌ {sym}: لا وضعية!")
+            log.error(f"❌ {sym}: الأمر نُفّذ لكن لا وضعية — تحقق من Binance!")
             return False
         rq = abs(ra); re = re or prc
         trade = TradeState(sym,re,rq,dire,cand["tp"],cand["sl"],cand["atr"],sc,cand["reasons"])
