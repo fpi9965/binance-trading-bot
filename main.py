@@ -52,7 +52,7 @@ GUARANTEED = [
 ]
 
 # ─── إعدادات التداول ──────────────────────────────────────────
-MAX_OPEN_TRADES   = 2
+MAX_OPEN_TRADES   = 4
 SCAN_INTERVAL_SEC = 30
 
 # ─── الأطر الزمنية ────────────────────────────────────────────
@@ -61,9 +61,9 @@ TF_ENTRY  = "15m"
 TF_CONFIRM= "5m"
 
 # ─── الرافعة ─────────────────────────────────────────────────
-LEVERAGE_STRONG = 8
-LEVERAGE_NORMAL = 5
-LEVERAGE_WEAK   = 3
+LEVERAGE_STRONG = 20             # score >= 80
+LEVERAGE_NORMAL = 15             # score 65-79
+LEVERAGE_WEAK   = 10             # score 55-64
 
 # ─── TP / SL ─────────────────────────────────────────────────
 ATR_TP_MULT    = 2.5
@@ -77,21 +77,21 @@ TRAIL_START    = 0.010
 TRAIL_STEP     = 0.004
 
 # ─── إدارة المخاطر ────────────────────────────────────────────
-BASE_RISK      = 0.015
-MIN_RISK       = 0.008
-MAX_RISK       = 0.025
+BASE_RISK      = 0.012           # ← خُفِّض لأن الرافعة أعلى
+MIN_RISK       = 0.006
+MAX_RISK       = 0.018
 RISK_WIN_STEP  = 0.002
 RISK_LOSS_STEP = 0.004
 
 # ─── حماية الرصيد ─────────────────────────────────────────────
-DAILY_LOSS_LIM = 0.04
-TOTAL_LOSS_LIM = 0.10
-MAX_DAILY_TR   = 6
-CONSEC_LOSS_ST = 2
-PAUSE_AFTER_LOSS_MIN = 20
+DAILY_LOSS_LIM = 0.06            # ← رُفع لـ 6% مع 4 صفقات
+TOTAL_LOSS_LIM = 0.15            # ← رُفع لـ 15%
+MAX_DAILY_TR   = 10              # ← رُفع لـ 10 صفقات يومياً
+CONSEC_LOSS_ST = 3               # ← راحة بعد 3 خسائر متتالية
+PAUSE_AFTER_LOSS_MIN = 15
 
 # ─── شروط الدخول ─────────────────────────────────────────────
-MIN_SCORE      = 60
+MIN_SCORE      = 55              # ← خُفِّض من 60 إلى 55
 
 # ──────────────────────────────────────────────────────────────
 # 🔧 إصلاح #1: Polymarket — منطق آمن مع fallback
@@ -1256,13 +1256,15 @@ def main_loop():
 
     poly_st = f"Bull:{_poly_cache['btc_bull_prob']*100:.0f}%" if _poly_cache["fetch_ok"] else "⚪ N/A"
     tg(
-        f"🤖 *Bot v9.1* ✅\n"
+        f"🤖 *Bot v9.2* ✅\n"
         f"رصيد:`{ini:.2f}` USDT\n"
         f"عملات:{len(SYMBOLS)} | Swing 1h+15m+5m\n"
         f"─── الوضع ───\n"
         f"TV Mode:`{TV_MODE}` | Fallback:`{TV_FALLBACK_MIN} دق`\n"
         f"─── الرافعة ───\n"
         f"Strong:{LEVERAGE_STRONG}x | Normal:{LEVERAGE_NORMAL}x | Weak:{LEVERAGE_WEAK}x\n"
+        f"─── الصفقات ───\n"
+        f"حد أقصى:`{MAX_OPEN_TRADES}` | Score:`{MIN_SCORE}+`\n"
         f"─── الحماية ───\n"
         f"BE`+{BE_PCT*100:.1f}%` Trail`+{TRAIL_START*100:.1f}%`\n"
         f"يومي:{DAILY_LOSS_LIM*100:.0f}% | إجمالي:{TOTAL_LOSS_LIM*100:.0f}%\n"
@@ -1384,29 +1386,23 @@ def main_loop():
                 candidates.sort(key=lambda x: (-x["score"], -x["rr"]))
                 log.info(f"🏆 أفضل مرشح: {candidates[0]['symbol']} score={candidates[0]['score']} RR={candidates[0]['rr']}")
 
-                # ── نفتح صفقة واحدة فقط لكل دورة ──────────────
-                # نتحقق أولاً من الحدود قبل أي محاولة
-                if len(open_trades) >= MAX_OPEN_TRADES:
+                slots = MAX_OPEN_TRADES - len(open_trades)
+                if slots <= 0:
                     log.info(f"⛔ وصلنا الحد الأقصى ({MAX_OPEN_TRADES}) — لا دخول")
                 elif avail_margin() < 2.0:
                     log.info(f"⛔ هامش غير كافٍ — لا دخول")
                 else:
-                    # نأخذ أفضل مرشح واحد فقط
-                    best = candidates[0]
-                    log.info(f"▶️ محاولة فتح {best['symbol']} {best['direction']} score={best['score']}")
-                    if open_pos(best):
-                        _tv_signals.pop(best["symbol"], None)
-                        time.sleep(5)   # انتظر 5 ثواني بعد الدخول
-
-                        # لو مازال فيه مكان → نفتح الثاني في نفس الدورة
-                        if len(open_trades) < MAX_OPEN_TRADES and avail_margin() >= 2.0 and len(candidates) > 1:
-                            second = candidates[1]
-                            # تأكد ما هي نفس العملة ولم تُفتح بعد
-                            if second["symbol"] not in open_trades:
-                                log.info(f"▶️ محاولة فتح ثانية: {second['symbol']} score={second['score']}")
-                                if open_pos(second):
-                                    _tv_signals.pop(second["symbol"], None)
-                                    time.sleep(3)
+                    opened = 0
+                    for c in candidates:
+                        if opened >= slots: break
+                        if len(open_trades) >= MAX_OPEN_TRADES: break
+                        if avail_margin() < 2.0: break
+                        if c["symbol"] in open_trades: continue
+                        log.info(f"▶️ محاولة فتح {c['symbol']} {c['direction']} score={c['score']}")
+                        if open_pos(c):
+                            _tv_signals.pop(c["symbol"], None)
+                            opened += 1
+                            time.sleep(3)
             else:
                 if cy % 10 == 0: log.info("لا فرص الآن.")
 
