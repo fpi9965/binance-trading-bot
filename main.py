@@ -61,37 +61,37 @@ TF_ENTRY  = "15m"
 TF_CONFIRM= "5m"
 
 # ─── الرافعة ─────────────────────────────────────────────────
-LEVERAGE_STRONG = 20             # score >= 80
-LEVERAGE_NORMAL = 15             # score 65-79
-LEVERAGE_WEAK   = 10             # score 55-64
+LEVERAGE_STRONG = 10             # score >= 80  ← آمن مع عملات صغيرة
+LEVERAGE_NORMAL = 7              # score 65-79
+LEVERAGE_WEAK   = 5              # score 55-64
 
 # ─── TP / SL ─────────────────────────────────────────────────
 ATR_TP_MULT    = 2.5
-ATR_SL_MULT    = 1.2
-MIN_RR         = 1.8
-MAX_TRADE_HRS  = 12
+ATR_SL_MULT    = 1.0             # ← ضيّقنا SL لحماية أسرع
+MIN_RR         = 2.0             # ← رفعنا RR لجودة أعلى
+MAX_TRADE_HRS  = 8               # ← أقصر مدة للصفقة
 
 # ─── Breakeven / Trailing ─────────────────────────────────────
-BE_PCT         = 0.006
-TRAIL_START    = 0.010
-TRAIL_STEP     = 0.004
+BE_PCT         = 0.005           # ← breakeven أسرع
+TRAIL_START    = 0.008
+TRAIL_STEP     = 0.003
 
 # ─── إدارة المخاطر ────────────────────────────────────────────
-BASE_RISK      = 0.012           # ← خُفِّض لأن الرافعة أعلى
+BASE_RISK      = 0.010           # 1% لكل صفقة
 MIN_RISK       = 0.006
-MAX_RISK       = 0.018
-RISK_WIN_STEP  = 0.002
-RISK_LOSS_STEP = 0.004
+MAX_RISK       = 0.015
+RISK_WIN_STEP  = 0.001
+RISK_LOSS_STEP = 0.003
 
 # ─── حماية الرصيد ─────────────────────────────────────────────
-DAILY_LOSS_LIM = 0.06            # ← رُفع لـ 6% مع 4 صفقات
-TOTAL_LOSS_LIM = 0.15            # ← رُفع لـ 15%
-MAX_DAILY_TR   = 10              # ← رُفع لـ 10 صفقات يومياً
-CONSEC_LOSS_ST = 3               # ← راحة بعد 3 خسائر متتالية
-PAUSE_AFTER_LOSS_MIN = 15
+DAILY_LOSS_LIM = 0.05            # 5%
+TOTAL_LOSS_LIM = 0.12            # 12%
+MAX_DAILY_TR   = 10
+CONSEC_LOSS_ST = 2               # ← راحة بعد خسارتين
+PAUSE_AFTER_LOSS_MIN = 30        # ← راحة أطول
 
 # ─── شروط الدخول ─────────────────────────────────────────────
-MIN_SCORE      = 55              # ← خُفِّض من 60 إلى 55
+MIN_SCORE      = 65              # ← رُفع لجودة أعلى
 
 # ──────────────────────────────────────────────────────────────
 # 🔧 إصلاح #1: Polymarket — منطق آمن مع fallback
@@ -105,7 +105,12 @@ POLY_URL            = "https://clob.polymarket.com/markets"
 # ─── ساعات راحة (UTC) ─────────────────────────────────────────
 NO_TRADE_HOURS = {2, 3, 4}
 
-LEARNING_FILE  = "bot_v9_learning.json"
+# ─── عملات محظورة من التداول (صغيرة ومتذبذبة) ──────────────────
+BLACKLIST_SYMBOLS = {
+    "FILUSDT", "CLUSDT", "LABUSDT", "SKYAIUSDT",
+    "BZUSDT", "RAVEUSDT", "BSBUSDT", "TAOUSDT",
+    "IOUSDT", "WIFUSDT", "DOGSUSDT", "TSTUSDT",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1354,6 +1359,8 @@ def main_loop():
             for sym in scan_list:
                 if sym not in SYMBOLS: continue
                 if sym in open_trades: continue
+                if sym in BLACKLIST_SYMBOLS:
+                    continue   # عملة محظورة
                 amt,_ = get_position(sym)
                 if abs(amt) > 1e-8: continue
 
