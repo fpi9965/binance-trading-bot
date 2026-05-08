@@ -1,11 +1,12 @@
 """
 =============================================================
-  SMART TRADING BOT v9.1  — FIXED EDITION
+  SMART TRADING BOT v9.3  — SPOT + FUTURES EDITION
   ─────────────────────────────────────────────
-  🔧 إصلاح #1: Polymarket — fallback آمن لو فشل API
-  🔧 إصلاح #2: TV_REQUIRED — وضع هجين (TV + تحليل داخلي)
-  🔧 إصلاح #3: رسالة Webhook الصحيحة موثقة بالكود
-  ✅ كل ميزات v9.0 محفوظة
+  ✅ Futures Trading مع رافعة ذكية
+  ✅ Spot Trading (شراء فوري بدون رافعة)
+  ✅ تحليل محسّن مرتبط بحالة السوق العام
+  ✅ قائمة سوداء للعملات المتذبذبة
+  ✅ Polymarket + Fibonacci + Multi-TF
 =============================================================
 """
 
@@ -23,19 +24,18 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT")
 
 # ─── TradingView Webhook ──────────────────────────────────────
 TV_SECRET         = os.getenv("TV_SECRET", "my_secret_123")
-TV_SIGNAL_TTL_SEC = 180   # صلاحية الإشارة 3 دقائق
+TV_SIGNAL_TTL_SEC = 180
 
-# ──────────────────────────────────────────────────────────────
-# 🔧 إصلاح #2: وضع هجين بدل TV_REQUIRED الصارم
-#
-#   TV_MODE = "strict"  → لا يدخل إلا بإشارة TV  (الوضع القديم)
-#   TV_MODE = "hybrid"  → TV يُعزز النقاط، لكن لو ما جاءت إشارة
-#                          يشتغل بالتحليل الداخلي بعد TV_FALLBACK_MIN دقيقة
-#   TV_MODE = "off"     → تحليل داخلي فقط
-# ──────────────────────────────────────────────────────────────
-TV_MODE           = "hybrid"   # ← الوضع المناسب لك
-TV_FALLBACK_MIN   = 10         # بعد 10 دق بدون إشارة TV → تحليل داخلي
-_tv_last_signal_t = None       # آخر وقت وصلت فيه إشارة TV
+TV_MODE           = "hybrid"
+TV_FALLBACK_MIN   = 10
+_tv_last_signal_t = None
+
+# ─── Spot Trading ─────────────────────────────────────────────
+SPOT_ENABLED      = True         # ← تفعيل Spot
+SPOT_BUDGET_PCT   = 0.30         # 30% من الرصيد للـ Spot
+SPOT_MIN_SCORE    = 70           # score أعلى للـ Spot (أكثر أماناً)
+SPOT_MAX_TRADES   = 2            # صفقتان Spot كحد أقصى
+spot_trades: dict = {}           # {symbol: {"entry":x,"qty":y,"tp":z}}
 
 # ─── عملات ───────────────────────────────────────────────────
 SYMBOLS: list = []
@@ -751,8 +751,25 @@ def analyze(symbol):
 
         direction = None; score = 0; reasons = []
 
-        long_ok = (struct_1h in ("TRENDING_UP","RANGING") and e9_1h > e21_1h and price > e50_1h)
-        short_ok = (struct_1h in ("TRENDING_DOWN","RANGING") and e9_1h < e21_1h and price < e50_1h)
+        # 🔧 ربط التحليل بحالة السوق العام
+        # لو السوق صاعد → نبحث عن long فقط (إلا لو score short أعلى بكثير)
+        # لو السوق هابط → نبحث عن short فقط
+        long_ok = (
+            struct_1h in ("TRENDING_UP", "RANGING") and
+            e9_1h > e21_1h and
+            price > e50_1h
+        )
+        short_ok = (
+            struct_1h in ("TRENDING_DOWN", "RANGING") and
+            e9_1h < e21_1h and
+            price < e50_1h
+        )
+
+        # فلتر السوق العام: لو السوق صاعد → لا short إلا في حالة اتجاه هبوطي واضح
+        if _market_bull and short_ok and struct_1h != "TRENDING_DOWN":
+            short_ok = False   # ← منع short في سوق صاعد عرضي
+        if not _market_bull and long_ok and struct_1h != "TRENDING_UP":
+            long_ok = False    # ← منع long في سوق هابط عرضي
 
         if long_ok and not short_ok:      direction = "long"
         elif short_ok and not long_ok:    direction = "short"
@@ -1106,6 +1123,96 @@ def close_external():
 
 
 # ══════════════════════════════════════════════════════════════
+#  SPOT TRADING
+# ══════════════════════════════════════════════════════════════
+def spot_balance_usdt():
+    try:
+        info = client.get_account()
+        for b in info["balances"]:
+            if b["asset"] == "USDT":
+                return float(b["free"])
+    except Exception as e:
+        log.error(f"spot_balance: {e}")
+    return 0.0
+
+def spot_open(cand):
+    if not SPOT_ENABLED: return False
+    if cand["direction"] != "long": return False
+    if cand["score"] < SPOT_MIN_SCORE: return False
+    if len(spot_trades) >= SPOT_MAX_TRADES: return False
+    sym = cand["symbol"]
+    if sym in spot_trades: return False
+    try:
+        s_bal  = spot_balance_usdt()
+        slots  = max(1, SPOT_MAX_TRADES - len(spot_trades))
+        budget = (s_bal * SPOT_BUDGET_PCT) / slots
+        if budget < 5:
+            log.info(f"Spot {sym}: رصيد Spot غير كافٍ ({s_bal:.2f}$)")
+            return False
+        prc = cand["price"]
+        qty_raw = budget / prc
+        try:
+            info = client.get_symbol_info(sym)
+            step = float(next(f["stepSize"] for f in info["filters"] if f["filterType"]=="LOT_SIZE"))
+            prec = max(0, round(-math.log10(step)))
+            qty  = float(f"{qty_raw:.{prec}f}")
+        except:
+            qty = round(qty_raw, 4)
+        if qty <= 0: return False
+        client.order_market_buy(symbol=sym, quantity=qty)
+        tp_p = prc * (1 + 0.05)   # TP 5%
+        sl_p = prc * (1 - 0.025)  # SL 2.5%
+        spot_trades[sym] = {
+            "entry": prc, "qty": qty,
+            "tp": tp_p, "sl": sl_p,
+            "open_time": utcnow(), "score": cand["score"],
+        }
+        tg(
+            f"🛒 *Spot شراء: {sym}*\n"
+            f"سعر:`{prc:.4f}` | كمية:`{qty}`\n"
+            f"TP:`{tp_p:.4f}` (+5%) | SL:`{sl_p:.4f}` (-2.5%)\n"
+            f"Score:`{cand['score']}` | ميزانية:`{budget:.2f}$`"
+        )
+        log.info(f"🛒 Spot {sym} @ {prc:.4f} qty={qty}")
+        return True
+    except Exception as e:
+        log.error(f"spot_open {sym}: {e}")
+        return False
+
+def spot_monitor():
+    while True:
+        try:
+            for sym in list(spot_trades.keys()):
+                tr = spot_trades[sym]
+                try:
+                    price = float(client.get_symbol_ticker(symbol=sym)["price"])
+                except:
+                    continue
+                pnl = (price - tr["entry"]) / tr["entry"] * 100
+                hrs = (utcnow() - tr["open_time"]).total_seconds() / 3600
+                reason = None
+                if price >= tr["tp"]:   reason = "TP جني 💰"
+                elif price <= tr["sl"]: reason = "SL وقف ⛔"
+                elif hrs >= MAX_TRADE_HRS: reason = f"Timeout ⏰"
+                if reason:
+                    try:
+                        asset = sym.replace("USDT","")
+                        ab = client.get_asset_balance(asset=asset)
+                        sell_qty = float(ab["free"]) if ab else tr["qty"]
+                        if sell_qty > 0:
+                            client.order_market_sell(symbol=sym, quantity=sell_qty)
+                        spot_trades.pop(sym, None)
+                        em = "🟢" if pnl >= 0 else "🔴"
+                        tg(f"{em} *Spot {sym}* {reason}\nدخول:`{tr['entry']:.4f}` → خروج:`{price:.4f}`\nP&L:`{pnl:+.2f}%`")
+                        log.info(f"🛒 Spot إغلاق {sym} {pnl:+.2f}% [{reason}]")
+                    except Exception as e:
+                        log.error(f"spot_close {sym}: {e}")
+        except Exception as e:
+            log.error(f"spot_monitor: {e}")
+        time.sleep(10)
+
+
+# ══════════════════════════════════════════════════════════════
 #  PROTECTION MONITOR
 # ══════════════════════════════════════════════════════════════
 def protection_monitor():
@@ -1258,6 +1365,9 @@ def main_loop():
     bot_start_bal=ini; daily_start_bal=ini; daily_reset_dt=utcnow().date()
 
     threading.Thread(target=protection_monitor,daemon=True).start()
+    if SPOT_ENABLED:
+        threading.Thread(target=spot_monitor,daemon=True).start()
+        log.info(f"🛒 Spot Trading مُفعّل | ميزانية:{SPOT_BUDGET_PCT*100:.0f}% | Score>{SPOT_MIN_SCORE}")
 
     poly_st = f"Bull:{_poly_cache['btc_bull_prob']*100:.0f}%" if _poly_cache["fetch_ok"] else "⚪ N/A"
     tg(
@@ -1412,6 +1522,18 @@ def main_loop():
                             time.sleep(3)
             else:
                 if cy % 10 == 0: log.info("لا فرص الآن.")
+
+            # ── Spot Trading ──────────────────────────────────
+            if SPOT_ENABLED and _market_bull and len(spot_trades) < SPOT_MAX_TRADES:
+                # نأخذ أفضل long candidate لـ Spot
+                spot_candidates = [c for c in candidates
+                                   if c["direction"] == "long"
+                                   and c["score"] >= SPOT_MIN_SCORE
+                                   and c["symbol"] not in spot_trades]
+                if spot_candidates:
+                    best_spot = spot_candidates[0]
+                    if spot_open(best_spot):
+                        log.info(f"🛒 Spot مفتوح: {best_spot['symbol']}")
 
             now=utcnow()
             if now.hour==0 and now.minute<1: daily_report(bal)
