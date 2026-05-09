@@ -20,7 +20,7 @@
   • TP = ATR × 3.0 (RR = 2.0 minimum)
   • Breakeven عند +0.8%
   • Trailing عند +1.5%
-  • رافعة ثابتة 10x (آمنة)
+  • رافعة ثابتة 5x (آمنة)
   • حد أقصى 3 صفقات مفتوحة
 =============================================================
 """
@@ -495,9 +495,9 @@ def find_breakout(closes, highs, lows, lookback=20):
     if rng < 1e-9: return False, False, resistance, support, 0
 
     # هل كسر المقاومة؟ (السعر الحالي أعلى من أعلى قمة)
-    bullish_break = price > resistance * 1.001   # كسر بـ 0.1%
+    bullish_break = price > resistance * 1.0005   # كسر بـ 0.05% فقط
     # هل كسر الدعم؟
-    bearish_break = price < support * 0.999
+    bearish_break = price < support * 0.9995
 
     # قوة الكسر (كم تجاوز المستوى)
     if bullish_break:
@@ -568,11 +568,11 @@ def analyze(symbol):
             log.info(f"🔕 {symbol}: long في سوق هابط — رفض")
             return None
 
-        # ── RSI Filter ────────────────────────────────────────
-        if direction == "long"  and rsi_1h > RSI_MAX:
+        # ── RSI Filter — أكثر مرونة ──────────────────────────
+        if direction == "long"  and rsi_1h > 78:
             log.info(f"🔕 {symbol}: RSI ذروة شراء {rsi_1h:.0f}")
             return None
-        if direction == "short" and rsi_1h < RSI_MIN:
+        if direction == "short" and rsi_1h < 22:
             log.info(f"🔕 {symbol}: RSI ذروة بيع {rsi_1h:.0f}")
             return None
 
@@ -625,10 +625,12 @@ def analyze(symbol):
             score += 15; reasons.append("MACD↓")
 
         # RSI في المنطقة المثالية
-        if 40 <= rsi_1h <= 60:
+        if 40 <= rsi_1h <= 65:
             score += 15; reasons.append(f"RSI✓{rsi_1h:.0f}")
         elif direction == "long"  and 35 <= rsi_1h < 40:
             score += 10; reasons.append(f"RSI-low{rsi_1h:.0f}")
+        elif direction == "long"  and 65 < rsi_1h <= 78:
+            score += 5;  reasons.append(f"RSI-high{rsi_1h:.0f}")
         elif direction == "short" and 60 < rsi_1h <= 65:
             score += 10; reasons.append(f"RSI-high{rsi_1h:.0f}")
 
