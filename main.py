@@ -592,24 +592,38 @@ def analyze(symbol):
             log.info(f"🔕 {symbol}: RSI ذروة بيع {rsi_1h:.0f}")
             return None
 
-        # ── طبقة 2: Breakout / Pullback على 15m ──────────────
-        bull_break, bear_break, resist, support, b_strength, entry_type = find_breakout(
-            cl15, hi15, lo15, lookback=BREAKOUT_LOOKBACK
-        )
+        # ── طبقة 2: تأكيد الدخول (بسيط وفعّال) ─────────────────
+        # نستخدم EMA على 15m + موقع السعر من النطاق
+        e9_15  = ema(cl15, 9)
+        e21_15 = ema(cl15, 21)
+        rsi_15 = rsi(cl15)
 
-        # يجب أن يتطابق مع الاتجاه
-        if direction == "long"  and not bull_break:
-            log.info(f"🔕 {symbol}: لا breakout/pullback صاعد (مقاومة={resist:.4f} دعم={support:.4f} سعر={price:.4f})")
-            return None
-        if direction == "short" and not bear_break:
-            log.info(f"🔕 {symbol}: لا breakout/pullback هابط (مقاومة={resist:.4f} دعم={support:.4f} سعر={price:.4f})")
-            return None
+        # حساب النطاق من آخر 20 شمعة
+        resist = max(hi15[-21:-1])
+        support= min(lo15[-21:-1])
+        rng    = resist - support or 1e-9
+        pos    = (price - support) / rng   # 0=دعم, 1=مقاومة
+
+        if direction == "long":
+            # الدخول عندما EMA15 صاعدة والسعر ليس في ذروة
+            entry_ok = e9_15 > e21_15 and pos < 0.85
+            if not entry_ok:
+                log.info(f"🔕 {symbol}: 15m لا يؤكد long (EMA15={'↑' if e9_15>e21_15 else '↓'} pos={pos:.2f})")
+                return None
+        else:
+            entry_ok = e9_15 < e21_15 and pos > 0.15
+            if not entry_ok:
+                log.info(f"🔕 {symbol}: 15m لا يؤكد short (EMA15={'↓' if e9_15<e21_15 else '↑'} pos={pos:.2f})")
+                return None
+
+        b_strength = 1.0 - abs(pos - 0.5) * 2   # أعلى نقطة عند المنتصف
+        entry_type = "ema_confirm"
 
         # ── طبقة 3: حجم ───────────────────────────────────────
         avg_vol = sum(vo15[-21:-1]) / 20 or 1
         vol_r   = vo15[-2] / avg_vol
-        if vol_r < MIN_VOL_RATIO:
-            log.info(f"🔕 {symbol}: حجم ضعيف {vol_r:.2f} < {MIN_VOL_RATIO}")
+        if vol_r < 1.0:
+            log.info(f"🔕 {symbol}: حجم ضعيف جداً {vol_r:.2f}")
             return None
 
         # ── Sentiment ─────────────────────────────────────────
@@ -630,13 +644,20 @@ def analyze(symbol):
             score += 25
             reasons.append("EMA9<21<50✅")
 
-        # Breakout strength + نوع الدخول
+        # تأكيد EMA 15m
         if entry_type == "breakout":
             score += int(b_strength * 25)
             reasons.append(f"Break↑×{b_strength:.1f}")
-        else:
+        elif entry_type == "pullback":
             score += int(b_strength * 15)
             reasons.append(f"Pull↑×{b_strength:.1f}")
+        else:
+            score += 15
+            reasons.append(f"EMA15✅")
+
+        # موقع السعر في النطاق
+        if direction == "long"  and pos < 0.40: score += 10; reasons.append(f"Near-Support")
+        if direction == "short" and pos > 0.60: score += 10; reasons.append(f"Near-Resist")
 
         # MACD
         if direction == "long"  and (macd_up   or macd_hist > 0):
