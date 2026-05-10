@@ -473,41 +473,57 @@ def macd_signal(closes, fast=12, slow=26, sig=9):
 # ══════════════════════════════════════════════════════════════
 def find_breakout(closes, highs, lows, lookback=20):
     """
-    يشوف إذا السعر كسر مستوى مقاومة أو دعم.
-    يرجع:
-      bullish_break: كسر مقاومة صاعد
-      bearish_break: كسر دعم هابط
-      resistance: مستوى المقاومة
-      support: مستوى الدعم
-      strength: قوة الكسر (0-1)
+    وضعان للدخول:
+    1. BREAKOUT: السعر يكسر أعلى قمة (قوي)
+    2. PULLBACK: السعر يرتد من منتصف النطاق صاعداً (أكثر تكراراً)
     """
     if len(closes) < lookback + 2:
-        return False, False, 0, 0, 0
+        return False, False, 0, 0, 0, "none"
 
-    window_h = highs[-lookback-1:-1]   # آخر N شمعة باستثناء الحالية
+    window_h = highs[-lookback-1:-1]
     window_l = lows[-lookback-1:-1]
 
-    resistance = max(window_h)         # أعلى قمة
-    support    = min(window_l)         # أدنى قاع
+    resistance = max(window_h)
+    support    = min(window_l)
+    mid        = (resistance + support) / 2
+    rng        = resistance - support
+    if rng < 1e-9:
+        return False, False, resistance, support, 0, "none"
 
     price = closes[-1]
-    rng   = resistance - support
-    if rng < 1e-9: return False, False, resistance, support, 0
 
-    # هل كسر المقاومة؟ (السعر الحالي أعلى من أعلى قمة)
-    bullish_break = price > resistance * 1.0005   # كسر بـ 0.05% فقط
-    # هل كسر الدعم؟
+    # ── وضع 1: Breakout حقيقي ─────────────────────────────────
+    bullish_break = price > resistance * 1.0005
     bearish_break = price < support * 0.9995
 
-    # قوة الكسر (كم تجاوز المستوى)
     if bullish_break:
-        strength = min((price - resistance) / (rng * 0.1), 1.0)
-    elif bearish_break:
-        strength = min((support - price) / (rng * 0.1), 1.0)
-    else:
-        strength = 0
+        strength = min((price - resistance) / (rng * 0.1 + 1e-9), 1.0)
+        return True, False, resistance, support, strength, "breakout"
+    if bearish_break:
+        strength = min((support - price) / (rng * 0.1 + 1e-9), 1.0)
+        return False, True, resistance, support, strength, "breakout"
 
-    return bullish_break, bearish_break, resistance, support, strength
+    # ── وضع 2: Pullback من دعم/مقاومة ────────────────────────
+    # Long: السعر في الثلث السفلي من النطاق ويتحرك صاعد
+    in_lower_third  = price < support + rng * 0.35
+    in_upper_third  = price > resistance - rng * 0.35
+
+    # تأكيد الحركة: الشمعة الأخيرة خضراء (close > open)
+    last_green = closes[-1] > closes[-2]
+    last_red   = closes[-1] < closes[-2]
+
+    # قوة الـ pullback بناءً على المسافة من الدعم
+    if in_lower_third and last_green:
+        dist_from_support = (price - support) / rng
+        strength = max(0.3, 1.0 - dist_from_support * 2)
+        return True, False, resistance, support, strength * 0.7, "pullback"
+
+    if in_upper_third and last_red:
+        dist_from_resist = (resistance - price) / rng
+        strength = max(0.3, 1.0 - dist_from_resist * 2)
+        return False, True, resistance, support, strength * 0.7, "pullback"
+
+    return False, False, resistance, support, 0, "none"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -576,17 +592,17 @@ def analyze(symbol):
             log.info(f"🔕 {symbol}: RSI ذروة بيع {rsi_1h:.0f}")
             return None
 
-        # ── طبقة 2: Breakout على 15m ──────────────────────────
-        bull_break, bear_break, resist, support, b_strength = find_breakout(
+        # ── طبقة 2: Breakout / Pullback على 15m ──────────────
+        bull_break, bear_break, resist, support, b_strength, entry_type = find_breakout(
             cl15, hi15, lo15, lookback=BREAKOUT_LOOKBACK
         )
 
-        # يجب أن يتطابق Breakout مع الاتجاه
+        # يجب أن يتطابق مع الاتجاه
         if direction == "long"  and not bull_break:
-            log.info(f"🔕 {symbol}: لا breakout صاعد (مقاومة={resist:.4f} سعر={price:.4f})")
+            log.info(f"🔕 {symbol}: لا breakout/pullback صاعد (مقاومة={resist:.4f} دعم={support:.4f} سعر={price:.4f})")
             return None
         if direction == "short" and not bear_break:
-            log.info(f"🔕 {symbol}: لا breakout هابط (دعم={support:.4f} سعر={price:.4f})")
+            log.info(f"🔕 {symbol}: لا breakout/pullback هابط (مقاومة={resist:.4f} دعم={support:.4f} سعر={price:.4f})")
             return None
 
         # ── طبقة 3: حجم ───────────────────────────────────────
@@ -614,9 +630,13 @@ def analyze(symbol):
             score += 25
             reasons.append("EMA9<21<50✅")
 
-        # Breakout strength
-        score += int(b_strength * 20)
-        reasons.append(f"Break×{b_strength:.1f}")
+        # Breakout strength + نوع الدخول
+        if entry_type == "breakout":
+            score += int(b_strength * 25)
+            reasons.append(f"Break↑×{b_strength:.1f}")
+        else:
+            score += int(b_strength * 15)
+            reasons.append(f"Pull↑×{b_strength:.1f}")
 
         # MACD
         if direction == "long"  and (macd_up   or macd_hist > 0):
@@ -670,26 +690,26 @@ def analyze(symbol):
             return None
 
         log.info(
-            f"🎯 {symbol} {direction} score={score} RR={rr:.2f} "
-            f"Break={'↑' if bull_break else '↓'}×{b_strength:.1f} "
+            f"🎯 {symbol} {direction} [{entry_type}] score={score} RR={rr:.2f} "
             f"RSI={rsi_1h:.0f} Vol×{vol_r:.1f}"
         )
 
         return {
-            "symbol":    symbol,
-            "direction": direction,
-            "score":     score,
-            "price":     price,
-            "tp":        rprice(symbol, tp_p),
-            "sl":        rprice(symbol, sl_p),
-            "atr":       atr_1h,
-            "rr":        round(rr, 2),
-            "rsi_1h":    round(rsi_1h, 1),
-            "vol_r":     round(vol_r, 1),
-            "resist":    round(resist, 4),
-            "support":   round(support, 4),
-            "b_str":     round(b_strength, 2),
-            "reasons":   reasons,
+            "symbol":     symbol,
+            "direction":  direction,
+            "score":      score,
+            "price":      price,
+            "tp":         rprice(symbol, tp_p),
+            "sl":         rprice(symbol, sl_p),
+            "atr":        atr_1h,
+            "rr":         round(rr, 2),
+            "rsi_1h":     round(rsi_1h, 1),
+            "vol_r":      round(vol_r, 1),
+            "resist":     round(resist, 4),
+            "support":    round(support, 4),
+            "b_str":      round(b_strength, 2),
+            "entry_type": entry_type,
+            "reasons":    reasons,
         }
 
     except Exception as e:
