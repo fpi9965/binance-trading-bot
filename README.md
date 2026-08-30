@@ -1,255 +1,132 @@
-# 🤖 بوت التداول الآلي على Binance
+# 🤖 Binance Futures Trading Bot — v11
 
-بوت تداول تلقائي متطور يعمل على مدار الساعة، يقوم بتحليل العملات المشفرة وتنفيذ الصفقات تلقائياً.
+بوت تداول آلي على **Binance USDT-M Futures** (ليس Spot).
 
-## ✨ المميزات
-
-- 📊 **تحليل فني متقدم**: RSI, MACD, Bollinger Bands, SMAs
-- 🟢 **توصيات ذكية**: يختار أفضل العملات للشراء
-- ⚡ **تنفيذ تلقائي**: يفتح ويغلق الصفقات تلقائياً
-- 🛑 **إدارة المخاطر**:
-  - Stop Loss تلقائي
-  - Trailing Stop متحرك
-  - جني الأرباح عند 10%
-- 📱 **إشعارات Telegram**: تنبيهات فورية لكل العمليات
-- 🔄 **يعمل 24/7**: على Render أو أي استضافة سحابية
+> ⚠️ **تحذير:** يتداول بمال حقيقي فور تشغيله. **لا يوجد وضع تجريبي.**
+> للتجربة الآمنة استخدم مفاتيح **Binance Futures Testnet**.
 
 ---
 
-## 📋 المتطلبات
+## الاستراتيجية (كما ينفّذها الكود فعلياً)
 
-1. **حساب Binance** مع:
-   - API Key (مع صلاحية التداول)
-   - API Secret
+| الطبقة | الشرط |
+|---|---|
+| 1. الاتجاه (1h) | `EMA9 > EMA21 > EMA50` للـ long، والعكس للـ short |
+| 2. التأكيد (15m) | `EMA9/EMA21` بنفس الاتجاه + السعر ليس في طرف النطاق |
+| 3. RSI (1h) | لا long فوق 78، لا short تحت 22 |
+| 4. الحجم | ≥ متوسط آخر 20 شمعة |
+| 5. Sentiment | Fear & Greed لا يعاكس الاتجاه |
+| 6. اتجاه BTC | سوق صاعد → long فقط، هابط → short فقط |
+| 7. النقاط | `score ≥ 60` |
 
-2. **بوت Telegram** مع:
-   - Bot Token (من @BotFather)
-   - Chat ID
+**لا يوجد Breakout في منطق الدخول.** النسخ السابقة ادّعت ذلك في التوثيق بينما الكود يستخدم تأكيد EMA فقط.
 
-3. **استضافة** (أحد الخيارات):
-   - **Render.com** (موصى به) - لهاش paid plan
-   - Railway
-   - Heroku
-   - أي VPS
+## إدارة الصفقة
+
+- `SL = ATR × 1.5` و `TP = ATR × 3.0` → **أمران حقيقيان على Binance** (`closePosition=true`)
+- Breakeven عند `+0.8%` ثم Trailing عند `+1.5%` — الـ SL يتحرك على البورصة لا في الذاكرة فقط
+- إغلاق إجباري بعد 10 ساعات
+- رافعة ثابتة `5x` | 3 صفقات مفتوحة كحد أقصى | 12 صفقة يومياً
+- حدود الخسارة: `5%` يومياً و`12%` إجمالياً — **محسوبة على الرصيد شاملاً الخسائر المفتوحة**
+
+## القياس
+
+الربح يُقرأ من `futures_income()` وليس من فرق السعر:
+`REALIZED_PNL + COMMISSION + FUNDING_FEE` → **صافي بعد الرسوم**.
+صفقة تربح `+0.05%` سعرياً تُسجَّل خسارة إن أكلتها العمولات.
+لو تعذّر القياس، تُعلَّم الصفقة بـ `src: "تقديري"` ويزيد عدّاد `unmeasured`.
 
 ---
 
-## 🚀 خطوات التشغيل
+## التشغيل
 
-### الخطوة 1: تحميل الملفات
+### 1. مفاتيح Binance
+Settings → API Management → أنشئ مفتاحاً مع **Enable Futures**.
+قيّد المفتاح بعنوان IP الخادم. **لا تفعّل صلاحية السحب.**
 
-حمّل جميع ملفات المشروع:
-- `main.py`
-- `config.py`
-- `binance_client.py`
-- `technical_analysis.py`
-- `trading_manager.py`
-- `telegram_notifier.py`
-- `requirements.txt`
+### 2. متغيرات البيئة
 
-### الخطوة 2: إنشاء حساب Binance
+| المتغير | إلزامي | الوصف |
+|---|---|---|
+| `BINANCE_API_KEY` | ✅ | مفتاح Futures |
+| `BINANCE_API_SECRET` | ✅ | السر |
+| `DATA_DIR` | ⭐ | مسار قرص دائم (`/var/data`). بدونه تُمسح البيانات مع كل deploy |
+| `TELEGRAM_TOKEN` | — | من @BotFather |
+| `TELEGRAM_CHAT_ID` | — | من @userinfobot |
+| `TV_SECRET` | — | بدونه يُعطَّل ويبهوك TradingView |
+| `MARKET_FILTER` | — | `false` لتعطيل فلتر اتجاه BTC (افتراضي `true`) |
+| `MAX_DAILY_TRADES` | — | افتراضي `12` |
+| `PORT` | — | افتراضي `10000` |
 
-1. اذهب إلى [Binance](https://www.binance.com)
-2. سجل دخول → Settings → API Management
-3. أنشئ API Key جديد
-4. **مهم**: فعّل "Enable Spot & Margin Trading"
-5. انسخ API Key و API Secret
+### 3. النشر
 
-### الخطوة 3: إنشاء بوت Telegram
+**استضافة مجانية 24/7:** اتبع [`DEPLOY.md`](DEPLOY.md) — Oracle Cloud (منطقة جدة/الرياض) أو جهاز في البيت.
 
-1. افتح Telegram → ابحث عن @BotFather
-2. أرسل `/newbot`
-3. اختر اسم للبوت
-4. احصل على Bot Token (شكله: `123456789:ABCdef...`)
-5. الآن ابحث عن @userinfobot أو @getidsbot
-6. أرسل أي رسالة واحصل على Chat ID (رقم مثل: `123456789`)
-
-### الخطوة 4: رفع الملفات على GitHub
-
+تثبيت بأمر واحد على خادم Ubuntu نظيف:
 ```bash
-# 1. أنشئ مجلد جديد
-mkdir crypto-trading-bot
-cd crypto-trading-bot
+curl -sL https://raw.githubusercontent.com/fpi9965/binance-trading-bot/main/setup.sh | bash
+```
+ثم `bash check.sh` للتحقق من الحالة.
 
-# 2. أنشئ الملفات (أنشئ كل ملف بالكود المناسب)
-
-# 3.初始化 Git
-git init
-git add .
-git commit -m "Initial commit"
-
-# 4. أنشئ مستودع على GitHub
-# اذهب إلى github.com وأنشئ مستودع جديد
-
-# 5. ارفع الكود
-git remote add origin https://github.com/YOUR_USERNAME/crypto-trading-bot.git
-git push -u origin main
+⚠️ **Binance يحظر عناوين IP الأمريكية** (خطأ 451). اختبر قبل أي تثبيت:
+```bash
+curl -s https://fapi.binance.com/fapi/v1/ping
 ```
 
-### الخطوة 5: النشر على Render
+على Render: Start Command `python main.py` + Persistent Disk. الخطة المجانية تنام بعد 15 دقيقة.
+إن استخدمت gunicorn فليكن `--workers 1`، وإلا شُغّل بوت مستقل لكل عامل.
 
-#### 5.1: إنشاء Account على Render
+### 4. التحقق بعد أول صفقة
 
-1. اذهب إلى [Render.com](https://render.com)
-2. سجّل باستخدام GitHub
-3. **مهم**: اختر خطة **paid** (Eagle أو выше)
-   - الخطة المجانية تنام بعد 15 دقيقة!
-
-#### 5.2: إنشاء Web Service
-
-1. اضغط **New +** → **Web Service**
-2. اربط مستودع GitHub
-3.填写 الإعدادات:
-   - **Name**: `crypto-trading-bot`
-   - **Region**: Singapore (الأقرب لك)
-   - **Branch**: main
-   - **Root Directory**: (اتركها فارغة)
-   - **Runtime**: Python
-   - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `python main.py`
-
-#### 5.3: إضافة Environment Variables
-
-اضغط **Environment** وأضف:
-
-| المتغير | القيمة | ملاحظة |
-|---------|--------|--------|
-| `BINANCE_API_KEY` | مفتاح Binance API | من الخطوة 2 |
-| `BINANCE_API_SECRET` | سر Binance API | من الخطوة 2 |
-| `TELEGRAM_BOT_TOKEN` | رمز بوت Telegram | من الخطوة 3 |
-| `TELEGRAM_CHAT_ID` | معرف المحادثة | من الخطوة 3 |
-| `TEST_MODE` | `false` | **هام!** التعليق false للتداول الحقيقي |
-| `TRADE_AMOUNT_USD` | `10` | مبلغ كل صفقة |
-| `PORT` | `10000` | المنفذ المطلوب |
-| `PYTHON_VERSION` | `3.11` | إصدار Python |
-
-#### 5.4: النشر
-
-اضغط **Create Web Service**
-
-**مهم جداً**: تأكد من `TEST_MODE = false`!
+على Binance يجب أن ترى **أمرين معلّقين** لكل صفقة: `STOP_MARKET` + `TAKE_PROFIT_MARKET`.
+أمر واحد فقط = خلل، راجع السجلات.
 
 ---
 
-## ⚠️ إعدادات مهمة
+## المراقبة
 
-### ملف config.py
+| المسار | المحتوى |
+|---|---|
+| `/` | الصفقات المفتوحة، الصافي، الرسوم |
+| `/trades` | تفاصيل JSON لكل صفقة مفتوحة |
+| `/stats` | `net_usdt`, `fees_usdt`, `fees_pct_of_gross`, `avg_net_per_trade`, `unmeasured` |
+| `/webhook` | إغلاق يدوي من TradingView (`direction: "close"` فقط) |
 
-```python
-# إعدادات التداول
-TRADE_AMOUNT_USD = 10  # مبلغ كل صفقة بالدولار
-TIMEFRAME = "15m"      # الإطار الزمني
+**راقب `fees_pct_of_gross`.** تجاوزه 30% يعني أن المشكلة في كثرة الصفقات وقصر مدتها، لا في جودة الإشارات.
 
-# العملات المراد تحليلها
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
-    "XRPUSDT", "ADAUSDT", "DOGEUSDT", "MATICUSDT"
-]
-
-# إدارة المخاطر
-STOP_LOSS_PERCENT = 2.0      # 2% Stop Loss
-TAKE_PROFIT_PERCENT = 10.0  # 10%جني الأرباح
-TRAILING_STOP_PERCENT = 1.5  # 1.5% Trailing Stop
-```
-
-### متغير TEST_MODE
-
-**هذا هو السبب الأكثر شيوعاً لعدم تنفيذ الصفقات!**
-
-- `TEST_MODE = true` → فقط يرسل إشارات، لا ينفذ صفقات
-- `TEST_MODE = false` → ينفذ صفقات حقيقية
-
-**تأكد من:**
-1. في `config.py`: `TEST_MODE = False` (حرف F كبير)
-2. في متغيرات Render: `TEST_MODE = false` (حرف f صغير)
+الفتح عبر الويبهوك **غير مدعوم عمداً** — يتجاوز كل فلاتر المخاطر.
 
 ---
 
-## 🔧oubleshooting (حل المشاكل)
+## بعد إعادة التشغيل
 
-### المشكلة: البوت يرسل إشارات لكن لا ينفذ صفقات
+`recover_trades()` تعمل عند كل إقلاع. **مصدر الحقيقة هو Binance لا الملف:**
+تقرأ الوضعيات المفتوحة فعلياً، تعيد بناء حالة كل صفقة، وتضع SL/TP إن نقصا.
 
-1. **تأكد من TEST_MODE = false** في Render
-2. تأكد أن API Keys صحيحة
-3. تأكد أن الرصيد كافي (USDT)
-4. تحقق من logs على Render
+---
 
-### المشكلة: خطأ في API
+## الملفات
 
 ```
-BinanceAPIException: APIError(code=-2015): Invalid API-key...
+main.py           البوت كاملاً (ملف واحد)
+setup.sh          تثبيت بأمر واحد على Ubuntu
+check.sh          فحص حالة البوت على الخادم
+DEPLOY.md         دليل الاستضافة المجانية
+requirements.txt
+Procfile          web: python main.py
+runtime.txt       python-3.11.9
+Dockerfile
 ```
 
-- المفتاح غير صحيح
-- أو المفتاح لا يملك صلاحية التداول
-
-### المشكلة: Service keeps sleeping
-
-- تحتاج **خطة مدفوعة** على Render
-- الخطة المجانية تنام بعد 15 دقيقة
-
-### المشكلة: لا توجد إشعارات Telegram
-
-- تأكد من Bot Token الصحيح
-- تأكد من Chat ID الصحيح
-- جرب إرسال رسالة من BotFather للبوت
+ملفات النسخة القديمة (`config.py`, `binance_client.py`, `trading_manager.py`,
+`technical_analysis.py`, `telegram_notifier.py`) كانت لبوت **Spot** مختلف تماماً،
+ولم يكن `main.py` يستوردها. حُذفت. موجودة في تاريخ git إن احتجتها.
 
 ---
 
-## 📊 كيف يعمل البوت
+## تحذيرات
 
-```
-كل 60 ثانية:
-1. فحص الرصيد
-2. إذا توجد صفقة مفتوحة → مراقبة وتحديث Stop Loss
-3. إذا لا توجد صفقة:
-   a. تحليل جميع العملات
-   b. إرسال إشارات BUY للتليقرام
-   c. اختيار أفضل عملة
-   d. فتح صفقة شراء
-   e. انتظار حتى تتحقق الشروط
-```
-
-### شروط الشراء
-- RSI < 45
-- MACD إيجابي (MACD > Signal)
-- السعر فوق المتوسطات المتحركة
-- الدرجة ≥ 40/100
-
-### شروط البيع
-- الوصول لـ 10% ربح
-- أو Stop Loss (2%)
-- أو Trailing Stop (1.5%)
-
----
-
-## 🛡️ تحذيرات أمان
-
-⚠️ **مهم جداً**:
-1. لا تشارك API Keys مع أحد
-2. ابدأ بمبلغ صغير (مثل $10)
-3. فعّل 2FA على حساب Binance
-4. راقب البوت في الأيام الأولى
-5. افهم المخاطر - التداول ينطوي على خسارة
-
----
-
-## 📝 ملاحظات
-
-- البوت يعمل على Binance Spot (ليس Futures)
-- لا يستخدم Multi-Assets Mode
-- يتطلب رصيد USDT للتداول
-
----
-
-## 📞 المساعدة
-
-إذا واجهت مشكلة:
-1. تحقق من logs على Render
-2. تأكد من جميع المتغيرات
-3. تأكد أن TEST_MODE = false
-4. تأكد من صحة API Keys
-
----
-
-**صُنع بـ ❤️ للتداول الآلي**
+1. ابدأ بأصغر مبلغ ممكن، وراقب أول 10 صفقات يدوياً
+2. فعّل 2FA وقيّد مفتاح API بـ IP
+3. لا تتدخّل يدوياً على عملة لديها صفقة مفتوحة — يفسد قياس الربح
+4. التداول بالرافعة ينطوي على خسارة كاملة لرأس المال
