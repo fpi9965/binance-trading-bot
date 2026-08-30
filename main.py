@@ -1,27 +1,22 @@
 """
 =============================================================
-  SMART TRADING BOT v10.0  — REBUILD FROM SCRATCH
+  SMART TRADING BOT v11.0  — Binance USDT-M Futures
   ─────────────────────────────────────────────────
-  استراتيجية مزدوجة موثوقة:
+  الاستراتيجية الفعلية (كما ينفّذها الكود، لا كما نتمناه):
 
-  1) EMA CROSSOVER  → تحديد الاتجاه (1h)
-  2) BREAKOUT       → تأكيد الدخول (15m)
-  3) SENTIMENT      → فلتر الأخبار (Fear & Greed Index)
+  1) اتجاه على 1h  → EMA9 > EMA21 > EMA50 (long) أو العكس (short)
+  2) تأكيد على 15m → EMA9/EMA21 بنفس الاتجاه + السعر ليس في طرف النطاق
+  3) فلاتر         → RSI، حجم التداول، Fear&Greed، اتجاه BTC العام
+  4) نقاط (score)  → لا دخول تحت MIN_SCORE
 
-  قواعد الدخول الصارمة:
-  ✅ EMA 9 يقطع EMA 21 من الأسفل (long) أو من الأعلى (short)
-  ✅ السعر يكسر مستوى مقاومة/دعم واضح
-  ✅ RSI بين 40-60 (لا ذروة شراء/بيع)
-  ✅ Sentiment لا يعاكس الاتجاه
-  ✅ حجم أعلى من المتوسط ×1.5
+  ⚠️ لا يوجد Breakout في منطق الدخول. الوصف القديم كان خاطئاً.
 
   إدارة الصفقة:
-  • SL = ATR × 1.5 (ضيق ومحكم)
-  • TP = ATR × 3.0 (RR = 2.0 minimum)
-  • Breakeven عند +0.8%
-  • Trailing عند +1.5%
-  • رافعة ثابتة 5x (آمنة)
-  • حد أقصى 3 صفقات مفتوحة
+  • SL = ATR × 1.5  و TP = ATR × 3.0  → أمران حقيقيان على Binance
+  • Breakeven عند +0.8% ثم Trailing عند +1.5% (يتحرك SL على البورصة)
+  • استعادة كاملة للصفقات بعد إعادة التشغيل (مصدر الحقيقة = Binance)
+  • قياس الربح من futures_income: صافي بعد العمولات والتمويل
+  • رافعة ثابتة 5x | حد أقصى 3 صفقات مفتوحة
 =============================================================
 """
 
@@ -31,12 +26,45 @@ from binance.client import Client
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 from flask import Flask, request as flask_request
 
+
+# ══════════════════════════════════════════════════════════════
+#  تحميل ملف .env (بلا مكتبات إضافية)
+#  ويندوز لا يمرّر متغيرات البيئة من ملف تلقائياً مثل systemd،
+#  فنقرأ .env بأنفسنا قبل أي os.getenv أدناه.
+#  متغيرات النظام الموجودة مسبقاً لها الأولوية ولا تُستبدل.
+# ══════════════════════════════════════════════════════════════
+def _load_env(path=None):
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return 0
+    n = 0
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                # أزل علامات الاقتباس إن وُجدت
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                if k and k not in os.environ:
+                    os.environ[k] = v
+                    n += 1
+    except Exception as e:
+        print(f"تحذير: تعذّرت قراءة .env — {e}")
+    return n
+
+_ENV_LOADED = _load_env()
+
 # ─── CREDENTIALS ─────────────────────────────────────────────
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY",    "YOUR_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_SECRET")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN",     "YOUR_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT")
-TV_SECRET          = os.getenv("TV_SECRET",           "my_secret_123")
+# لا مفتاح افتراضي — المفتاح "my_secret_123" كان معروفاً لأي شخص يرى الكود
+TV_SECRET          = os.getenv("TV_SECRET", "")
 
 # ─── العملات (فقط الكبيرة الموثوقة) ──────────────────────────
 SYMBOLS = [
@@ -67,10 +95,25 @@ MAX_DAILY_LOSS = 0.05             # 5% يومياً
 MAX_TOTAL_LOSS = 0.12             # 12% إجمالي
 
 # ─── شروط الدخول ─────────────────────────────────────────────
-MIN_VOL_RATIO     = 1.5           # الحجم ≥ 1.5× المتوسط
-RSI_MIN           = 35            # RSI لا يكون في ذروة
-RSI_MAX           = 65
-BREAKOUT_LOOKBACK = 20            # نشوف آخر 20 شمعة للمستويات
+# ملاحظة: هذه القيم كانت معرّفة هنا لكن الكود يتجاهلها ويستخدم أرقاماً
+# مكتوبة داخل analyze(). الآن هي المصدر الوحيد — والقيم مطابقة
+# للسلوك الفعلي السابق حتى لا يتغيّر التداول بلا قصد منك.
+MIN_VOL_RATIO     = 1.0           # الحد الأدنى لنسبة الحجم (كان 1.5 معطّلاً / 1.0 فعلياً)
+RSI_LONG_MAX      = 78            # فوقه: ذروة شراء → لا long
+RSI_SHORT_MIN     = 22            # تحته: ذروة بيع  → لا short
+RANGE_LOOKBACK    = 20            # عدد الشموع لحساب الدعم/المقاومة على 15m
+POS_LONG_MAX      = 0.85          # لا long إذا كان السعر أعلى من 85% من النطاق
+POS_SHORT_MIN     = 0.15          # لا short إذا كان السعر أدنى من 15% من النطاق
+MIN_SCORE         = 60            # كان مدفوناً داخل analyze()
+
+# ─── فلتر اتجاه السوق العام (BTC) ─────────────────────────────
+# ⚠️ يغيّر سلوك التداول: كان مكتوباً لكنه لا يعمل إطلاقاً (شرط مستحيل).
+# مفعّلاً: سوق BTC صاعد → long فقط | هابط → short فقط.
+# لتعطيله: MARKET_FILTER=false في متغيرات البيئة.
+MARKET_FILTER     = os.getenv("MARKET_FILTER", "true").lower() == "true"
+
+# ─── حد الصفقات اليومي ────────────────────────────────────────
+MAX_DAILY_TRADES  = int(os.getenv("MAX_DAILY_TRADES", "12"))
 
 # ─── Fear & Greed Sentiment ───────────────────────────────────
 SENTIMENT_ENABLED     = True
@@ -81,14 +124,23 @@ GREED_BLOCK_SHORT     = 75        # لو الطمع > 75 → لا short
 # ─── ساعات راحة (UTC) ─────────────────────────────────────────
 NO_TRADE_HOURS = {2, 3, 4}
 
-LEARNING_FILE = "bot_v10_data.json"
+# ─── تخزين ─────────────────────────────────────────────────────
+# DATA_DIR: على Render اربط Persistent Disk وحط المسار هنا (مثلاً /var/data)
+# بدونه الملفات تُمسح مع كل deploy
+DATA_DIR      = os.getenv("DATA_DIR", ".")
+LEARNING_FILE = os.path.join(DATA_DIR, "bot_v10_data.json")
+STATE_FILE    = os.path.join(DATA_DIR, "bot_v10_state.json")   # الصفقات المفتوحة
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("bot_v10.log", encoding="utf-8"),
+        logging.FileHandler(os.path.join(DATA_DIR, "bot_v10.log"), encoding="utf-8"),
     ]
 )
 log = logging.getLogger(__name__)
@@ -119,7 +171,11 @@ data = {
     "trades":      [],
     "wins":        0,
     "losses":      0,
-    "total_pnl":   0.0,
+    "total_pnl":   0.0,      # نسبة تراكمية (للعرض فقط — غير قابلة للجمع منطقياً)
+    "net_usdt":    0.0,      # صافي الربح الفعلي بالدولار بعد الرسوم
+    "fees_usdt":   0.0,      # إجمالي العمولات + التمويل
+    "gross_usdt":  0.0,      # الربح قبل الرسوم
+    "unmeasured":  0,        # صفقات تعذّر قياسها من Binance
     "peak_bal":    0.0,
     "daily_count": 0,
 }
@@ -145,6 +201,37 @@ class TradeState:
         self.trailing  = False
         self.trail_sl  = sl
         self.notified  = False
+
+    # ── حفظ/استعادة ──────────────────────────────────────────
+    def to_dict(self):
+        return {
+            "symbol": self.symbol, "entry": self.entry, "qty": self.qty,
+            "direction": self.direction, "tp_price": self.tp_price,
+            "sl_price": self.sl_price, "atr": self.atr, "reasons": self.reasons,
+            "open_time": self.open_time.isoformat(),
+            "highest": self.highest, "lowest": self.lowest,
+            "breakeven": self.breakeven, "trailing": self.trailing,
+            "trail_sl": self.trail_sl, "notified": self.notified,
+        }
+
+    @classmethod
+    def from_dict(cls, d, entry=None, qty=None):
+        t = cls(
+            d["symbol"], entry if entry else d["entry"], qty if qty else d["qty"],
+            d["direction"], d["tp_price"], d["sl_price"], d.get("atr", 0),
+            d.get("reasons", []),
+        )
+        try:
+            t.open_time = datetime.fromisoformat(d["open_time"])
+        except Exception:
+            pass
+        t.highest   = d.get("highest",  t.entry)
+        t.lowest    = d.get("lowest",   t.entry)
+        t.breakeven = d.get("breakeven", False)
+        t.trailing  = d.get("trailing",  False)
+        t.trail_sl  = d.get("trail_sl",  t.sl_price)
+        t.notified  = d.get("notified",  False)
+        return t
 
     def pnl_pct(self, price):
         if self.direction == "long":
@@ -231,27 +318,101 @@ def load_data():
     except Exception as e:
         log.error(f"load_data: {e}")
 
+def fetch_trade_income(symbol, start_ms, tries=4):
+    """
+    يجلب الأرقام الحقيقية من Binance بدل التقدير:
+    REALIZED_PNL + COMMISSION + FUNDING_FEE.
+    قيم COMMISSION و FUNDING تأتي سالبة من Binance، فالجمع صحيح.
+    """
+    for attempt in range(tries):
+        try:
+            rows = client.futures_income(symbol=symbol, startTime=start_ms, limit=1000)
+        except Exception as e:
+            log.warning(f"income {symbol} #{attempt+1}: {e}")
+            time.sleep(1.5)
+            continue
+
+        realized = commission = funding = 0.0
+        for r in rows:
+            t = r.get("incomeType")
+            try: v = float(r.get("income", 0))
+            except: continue
+            if   t == "REALIZED_PNL": realized   += v
+            elif t == "COMMISSION":   commission += v
+            elif t == "FUNDING_FEE":  funding    += v
+
+        # الربح المحقق يظهر بعد الإغلاق بثوانٍ — ننتظر ظهوره
+        if realized != 0.0:
+            return {
+                "ok": True, "realized": realized,
+                "commission": commission, "funding": funding,
+                "net": realized + commission + funding,
+            }
+        time.sleep(1.5)
+
+    log.warning(f"⚠️ {symbol}: تعذّر قياس الربح من Binance — سيُسجَّل تقديرياً")
+    return {"ok": False, "realized": 0.0, "commission": 0.0, "funding": 0.0, "net": 0.0}
+
+
 def record_trade(trade, exit_price):
-    won  = exit_price > trade.entry if trade.direction == "long" else exit_price < trade.entry
-    pnl  = trade.pnl_pct(exit_price)
-    data["total_pnl"] += pnl
+    """
+    يسجّل الصفقة بالأرقام الفعلية من Binance (صافي بعد الرسوم).
+    يرجع (فوز, نسبة على الهامش, تفاصيل).
+    """
+    # نبدأ من دقيقة قبل الفتح لالتقاط عمولة الدخول
+    start_ms = int((trade.open_time.timestamp() - 60) * 1000)
+    inc      = fetch_trade_income(trade.symbol, start_ms)
+    margin   = (trade.entry * trade.qty / LEVERAGE) if LEVERAGE else 0.0
+
+    if inc["ok"]:
+        net     = inc["net"]
+        fees    = inc["commission"] + inc["funding"]
+        gross   = inc["realized"]
+        pnl_pct = (net / margin * 100) if margin > 0 else 0.0
+        won     = net > 0
+        source  = "binance"
+    else:
+        # احتياطي: التقدير القديم من السعر (بدون رسوم — متفائل)
+        pnl_pct = trade.pnl_pct(exit_price)
+        gross   = pnl_pct / 100 * margin
+        fees    = 0.0
+        net     = gross
+        won     = gross > 0
+        source  = "تقديري"
+        data["unmeasured"] += 1
+
+    data["total_pnl"]   += pnl_pct
+    data["net_usdt"]    += net
+    data["fees_usdt"]   += fees
+    data["gross_usdt"]  += gross
     data["daily_count"] += 1
     if won: data["wins"]   += 1
     else:   data["losses"] += 1
+
     data["trades"].append({
         "sym": trade.symbol, "dir": trade.direction,
         "entry": trade.entry, "exit": exit_price,
-        "pnl": round(pnl, 2), "won": won,
+        "qty": trade.qty, "margin": round(margin, 2),
+        "gross": round(gross, 4), "fees": round(fees, 4),
+        "net": round(net, 4), "pnl": round(pnl_pct, 2),
+        "won": won, "src": source,
         "hrs": round(trade.duration_hrs(), 1),
         "ts":  utcnow().isoformat(),
     })
     if len(data["trades"]) > 200:
         data["trades"] = data["trades"][-200:]
     save_data()
+
     total = data["wins"] + data["losses"]
     wr    = data["wins"] / total * 100 if total else 0
-    log.info(f"📊 {trade.symbol} {'✅' if won else '❌'} {pnl:+.2f}% | WR:{wr:.0f}% ({total}صفقة)")
-    return won, pnl
+    log.info(
+        f"📊 {trade.symbol} {'✅' if won else '❌'} "
+        f"صافي:{net:+.4f}$ (خام:{gross:+.4f} رسوم:{fees:+.4f}) "
+        f"{pnl_pct:+.2f}% [{source}] | WR:{wr:.0f}% ({total} صفقة)"
+    )
+    inc["net"], inc["fees"], inc["gross"], inc["source"] = net, fees, gross, source
+    return won, pnl_pct, inc
+
 
 def win_rate():
     total = data["wins"] + data["losses"]
@@ -317,6 +478,14 @@ def balance():
         log.error(f"balance: {e}")
     return 0.0
 
+def equity():
+    """الرصيد شاملاً الأرباح/الخسائر غير المحققة — هذا ما يجب أن تُقاس عليه الحدود."""
+    try:
+        return float(client.futures_account()["totalMarginBalance"])
+    except Exception as e:
+        log.error(f"equity: {e}")
+        return balance()
+
 def avail_margin():
     try:
         return float(client.futures_account()["availableBalance"])
@@ -356,52 +525,138 @@ def get_filters(symbol):
                 return _filters_cache[symbol]
     except Exception as e:
         log.error(f"filters {symbol}: {e}")
-    return (0.001, 0.01, 5.0)
+    # لا نخترع قيماً — كمية خاطئة أخطر من تفويت صفقة
+    log.error(f"❌ {symbol}: تعذّر جلب الفلاتر — لن يُتداول على هذه العملة")
+    return None
+
+def _decimals(x):
+    """عدد الخانات العشرية الفعلية لـ stepSize/tickSize (0.005 → 3)."""
+    s = f"{x:.10f}".rstrip("0")
+    return len(s.split(".")[1]) if "." in s else 0
 
 def rqty(symbol, qty):
-    lot, _, _ = get_filters(symbol)
+    """
+    يقصّ الكمية لأقرب مضاعف أدنى لـ stepSize.
+    الطريقة القديمة f"{qty:.Nf}" تقرّب لأعلى أحياناً وتفترض أن stepSize
+    قوة عشرة — فتنتج كمية أكبر من المتاح أو غير مقبولة.
+    """
+    f = get_filters(symbol)
+    if not f: return 0.0
+    lot = f[0]
     if lot <= 0: return round(qty, 3)
-    prec = max(0, round(-math.log10(lot)))
-    return float(f"{qty:.{prec}f}")
+    steps = math.floor(qty / lot + 1e-9)
+    return round(steps * lot, _decimals(lot))
 
 def rprice(symbol, price):
-    _, tick, _ = get_filters(symbol)
+    """يحاذي السعر لمضاعف tickSize."""
+    f = get_filters(symbol)
+    if not f: return round(price, 4)
+    tick = f[1]
     if tick <= 0: return round(price, 4)
-    prec = max(0, round(-math.log10(tick)))
-    return float(f"{price:.{prec}f}")
+    steps = round(price / tick)
+    return round(steps * tick, _decimals(tick))
 
 def cancel_stops(symbol):
+    """يلغي كل أوامر الحماية (STOP و TAKE_PROFIT) المعلّقة على العملة."""
     try:
         for o in client.futures_get_open_orders(symbol=symbol):
-            if "STOP" in o.get("type", ""):
+            t = o.get("type", "")
+            if "STOP" in t or "TAKE_PROFIT" in t:
                 try: client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
                 except: pass
     except: pass
 
-def place_sl(symbol, entry, qty, direction):
-    if symbol in _sl_no_support: return False
+
+def has_protection(symbol):
+    """يرجع (فيه SL؟, فيه TP؟) حسب الأوامر المعلّقة فعلياً على Binance."""
+    try:
+        orders = client.futures_get_open_orders(symbol=symbol)
+    except Exception as e:
+        log.warning(f"open_orders {symbol}: {e}")
+        return None, None                       # None = غير معروف، لا تتصرف
+    sl = any("STOP" in o.get("type", "") for o in orders)
+    tp = any("TAKE_PROFIT" in o.get("type", "") for o in orders)
+    return sl, tp
+
+
+def _valid_stop(direction, kind, price, mark):
+    """يتأكد أن السعر على الجهة الصحيحة من السعر الحالي حتى لا يرفضه Binance (-2021)."""
+    if mark <= 0 or price <= 0: return False
+    if direction == "long":
+        return price < mark if kind == "sl" else price > mark
+    return price > mark if kind == "sl" else price < mark
+
+
+def place_protection(symbol, sl_price, tp_price, direction, want_tp=True):
+    """
+    يضع SL و TP حقيقيين على Binance بمستويات الاستراتيجية الفعلية (ATR)،
+    باستخدام closePosition=True فيتبعان حجم الصفقة تلقائياً.
+    يرجع (ok_sl, ok_tp).
+    """
     is_long = direction == "long"
-    sl_p = rprice(symbol, entry * (1 - 0.03) if is_long else entry * (1 + 0.03))
-    side = SIDE_SELL if is_long else SIDE_BUY
+    side    = SIDE_SELL if is_long else SIDE_BUY
+    mark    = cur_price(symbol)
+    ok_sl = ok_tp = False
+
     cancel_stops(symbol)
     time.sleep(0.3)
-    for wt in ("MARK_PRICE", "CONTRACT_PRICE"):
-        try:
-            client.futures_create_order(
-                symbol=symbol, side=side, type="STOP_MARKET",
-                stopPrice=sl_p, quantity=qty,
-                reduceOnly=True, workingType=wt
-            )
-            log.info(f"✅ SL {symbol}={sl_p} [{wt}]")
-            return True
-        except Exception as e:
-            if "-4120" in str(e) or "does not support" in str(e).lower():
-                continue
-            log.error(f"SL {symbol} [{wt}]: {e}")
-            return False
-    _sl_no_support.add(symbol)
-    log.warning(f"⚠️ {symbol}: لا يدعم SL على Binance")
-    return False
+
+    # ── Stop Loss ────────────────────────────────────────────
+    if symbol not in _sl_no_support and sl_price:
+        sl_p = rprice(symbol, sl_price)
+        if not _valid_stop(direction, "sl", sl_p, mark):
+            log.warning(f"⚠️ {symbol}: SL={sl_p} على الجهة الخاطئة من {mark} — لم يُوضع")
+        else:
+            for wt in ("MARK_PRICE", "CONTRACT_PRICE"):
+                try:
+                    client.futures_create_order(
+                        symbol=symbol, side=side, type="STOP_MARKET",
+                        stopPrice=sl_p, closePosition=True, workingType=wt
+                    )
+                    log.info(f"✅ SL {symbol}={sl_p} [{wt}]")
+                    ok_sl = True
+                    break
+                except Exception as e:
+                    if "-4120" in str(e) or "does not support" in str(e).lower():
+                        continue
+                    log.error(f"SL {symbol} [{wt}]: {e}")
+                    break
+            else:
+                _sl_no_support.add(symbol)
+                log.warning(f"⚠️ {symbol}: لا يدعم SL على Binance")
+
+    # ── Take Profit ──────────────────────────────────────────
+    if want_tp and tp_price:
+        tp_p = rprice(symbol, tp_price)
+        if not _valid_stop(direction, "tp", tp_p, mark):
+            log.warning(f"⚠️ {symbol}: TP={tp_p} على الجهة الخاطئة من {mark} — لم يُوضع")
+        else:
+            for wt in ("MARK_PRICE", "CONTRACT_PRICE"):
+                try:
+                    client.futures_create_order(
+                        symbol=symbol, side=side, type="TAKE_PROFIT_MARKET",
+                        stopPrice=tp_p, closePosition=True, workingType=wt
+                    )
+                    log.info(f"✅ TP {symbol}={tp_p} [{wt}]")
+                    ok_tp = True
+                    break
+                except Exception as e:
+                    if "-4120" in str(e) or "does not support" in str(e).lower():
+                        continue
+                    log.error(f"TP {symbol} [{wt}]: {e}")
+                    break
+
+    return ok_sl, ok_tp
+
+
+def sync_protection(trade, reason=""):
+    """يحرّك SL على Binance ليطابق trail_sl بعد Breakeven / Trailing."""
+    ok_sl, ok_tp = place_protection(
+        trade.symbol, trade.trail_sl, trade.tp_price, trade.direction
+    )
+    log.info(f"🔄 حماية {trade.symbol} {reason}: SL={'✅' if ok_sl else '❌'} TP={'✅' if ok_tp else '❌'}")
+    return ok_sl
+
 
 def mkt_close(symbol, qty, direction):
     qty  = abs(qty)
@@ -452,7 +707,7 @@ def atr_calc(highs, lows, closes, period=14):
     return sum(trs[-period:]) / min(period, len(trs)) if trs else closes[-1] * 0.01
 
 def macd_signal(closes, fast=12, slow=26, sig=9):
-    if len(closes) < slow + sig: return 0, False
+    if len(closes) < slow + sig: return 0, False, False
     kf, ks = 2/(fast+1), 2/(slow+1)
     ef = es = closes[0]
     line = []
@@ -466,64 +721,6 @@ def macd_signal(closes, fast=12, slow=26, sig=9):
     crossed_up   = hist > 0 and hist_p <= 0
     crossed_down = hist < 0 and hist_p >= 0
     return hist, crossed_up, crossed_down
-
-
-# ══════════════════════════════════════════════════════════════
-#  BREAKOUT DETECTION
-# ══════════════════════════════════════════════════════════════
-def find_breakout(closes, highs, lows, lookback=20):
-    """
-    وضعان للدخول:
-    1. BREAKOUT: السعر يكسر أعلى قمة (قوي)
-    2. PULLBACK: السعر يرتد من منتصف النطاق صاعداً (أكثر تكراراً)
-    """
-    if len(closes) < lookback + 2:
-        return False, False, 0, 0, 0, "none"
-
-    window_h = highs[-lookback-1:-1]
-    window_l = lows[-lookback-1:-1]
-
-    resistance = max(window_h)
-    support    = min(window_l)
-    mid        = (resistance + support) / 2
-    rng        = resistance - support
-    if rng < 1e-9:
-        return False, False, resistance, support, 0, "none"
-
-    price = closes[-1]
-
-    # ── وضع 1: Breakout حقيقي ─────────────────────────────────
-    bullish_break = price > resistance * 1.0005
-    bearish_break = price < support * 0.9995
-
-    if bullish_break:
-        strength = min((price - resistance) / (rng * 0.1 + 1e-9), 1.0)
-        return True, False, resistance, support, strength, "breakout"
-    if bearish_break:
-        strength = min((support - price) / (rng * 0.1 + 1e-9), 1.0)
-        return False, True, resistance, support, strength, "breakout"
-
-    # ── وضع 2: Pullback من دعم/مقاومة ────────────────────────
-    # Long: السعر في الثلث السفلي من النطاق ويتحرك صاعد
-    in_lower_third  = price < support + rng * 0.35
-    in_upper_third  = price > resistance - rng * 0.35
-
-    # تأكيد الحركة: الشمعة الأخيرة خضراء (close > open)
-    last_green = closes[-1] > closes[-2]
-    last_red   = closes[-1] < closes[-2]
-
-    # قوة الـ pullback بناءً على المسافة من الدعم
-    if in_lower_third and last_green:
-        dist_from_support = (price - support) / rng
-        strength = max(0.3, 1.0 - dist_from_support * 2)
-        return True, False, resistance, support, strength * 0.7, "pullback"
-
-    if in_upper_third and last_red:
-        dist_from_resist = (resistance - price) / rng
-        strength = max(0.3, 1.0 - dist_from_resist * 2)
-        return False, True, resistance, support, strength * 0.7, "pullback"
-
-    return False, False, resistance, support, 0, "none"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -577,18 +774,21 @@ def analyze(symbol):
         direction = "long" if ema_bull else "short"
 
         # ── فلتر السوق العام ──────────────────────────────────
-        if _market_bull and direction == "short" and not ema_bear:
-            log.info(f"🔕 {symbol}: short في سوق صاعد — رفض")
-            return None
-        if not _market_bull and direction == "long" and not ema_bull:
-            log.info(f"🔕 {symbol}: long في سوق هابط — رفض")
-            return None
+        # كان: (direction=="short" and not ema_bear) — مستحيل التحقق،
+        # لأن short لا تحدث إلا مع ema_bear. الفلتر لم يعمل ولا مرة.
+        if MARKET_FILTER:
+            if _market_bull and direction == "short":
+                log.info(f"🔕 {symbol}: short في سوق BTC صاعد — رفض")
+                return None
+            if not _market_bull and direction == "long":
+                log.info(f"🔕 {symbol}: long في سوق BTC هابط — رفض")
+                return None
 
         # ── RSI Filter — أكثر مرونة ──────────────────────────
-        if direction == "long"  and rsi_1h > 78:
+        if direction == "long"  and rsi_1h > RSI_LONG_MAX:
             log.info(f"🔕 {symbol}: RSI ذروة شراء {rsi_1h:.0f}")
             return None
-        if direction == "short" and rsi_1h < 22:
+        if direction == "short" and rsi_1h < RSI_SHORT_MIN:
             log.info(f"🔕 {symbol}: RSI ذروة بيع {rsi_1h:.0f}")
             return None
 
@@ -599,19 +799,19 @@ def analyze(symbol):
         rsi_15 = rsi(cl15)
 
         # حساب النطاق من آخر 20 شمعة
-        resist = max(hi15[-21:-1])
-        support= min(lo15[-21:-1])
+        resist = max(hi15[-(RANGE_LOOKBACK+1):-1])
+        support= min(lo15[-(RANGE_LOOKBACK+1):-1])
         rng    = resist - support or 1e-9
         pos    = (price - support) / rng   # 0=دعم, 1=مقاومة
 
         if direction == "long":
             # الدخول عندما EMA15 صاعدة والسعر ليس في ذروة
-            entry_ok = e9_15 > e21_15 and pos < 0.85
+            entry_ok = e9_15 > e21_15 and pos < POS_LONG_MAX
             if not entry_ok:
                 log.info(f"🔕 {symbol}: 15m لا يؤكد long (EMA15={'↑' if e9_15>e21_15 else '↓'} pos={pos:.2f})")
                 return None
         else:
-            entry_ok = e9_15 < e21_15 and pos > 0.15
+            entry_ok = e9_15 < e21_15 and pos > POS_SHORT_MIN
             if not entry_ok:
                 log.info(f"🔕 {symbol}: 15m لا يؤكد short (EMA15={'↓' if e9_15<e21_15 else '↑'} pos={pos:.2f})")
                 return None
@@ -620,9 +820,9 @@ def analyze(symbol):
         entry_type = "ema_confirm"
 
         # ── طبقة 3: حجم ───────────────────────────────────────
-        avg_vol = sum(vo15[-21:-1]) / 20 or 1
+        avg_vol = sum(vo15[-(RANGE_LOOKBACK+1):-1]) / RANGE_LOOKBACK or 1
         vol_r   = vo15[-2] / avg_vol
-        if vol_r < 1.0:
+        if vol_r < MIN_VOL_RATIO:
             log.info(f"🔕 {symbol}: حجم ضعيف جداً {vol_r:.2f}")
             return None
 
@@ -691,7 +891,6 @@ def analyze(symbol):
         if direction == "short" and price < e50_1h: score += 10; reasons.append("↓EMA50")
 
         # نحتاج على الأقل 60 نقطة
-        MIN_SCORE = 60
         if score < MIN_SCORE:
             log.info(f"🔕 {symbol} {direction}: score={score} < {MIN_SCORE}")
             return None
@@ -706,8 +905,11 @@ def analyze(symbol):
             tp_p = price - atr_1h * ATR_TP_MULT
             rr   = (price - tp_p) / (sl_p - price) if (sl_p - price) > 0 else 0
 
+        # ملاحظة: بما أن SL و TP كلاهما من ATR بمضاعفات ثابتة، فإن
+        # RR = ATR_TP_MULT/ATR_SL_MULT دائماً. الفحص هنا لا يُفعّل عملياً،
+        # والتحقق الحقيقي انتقل إلى بدء التشغيل (validate_config).
         if rr < MIN_RR:
-            log.info(f"🔕 {symbol}: RR={rr:.2f} < {MIN_RR}")
+            log.warning(f"🔕 {symbol}: RR={rr:.2f} < {MIN_RR} — راجع مضاعفات ATR")
             return None
 
         log.info(
@@ -759,6 +961,113 @@ def update_market():
 
 
 # ══════════════════════════════════════════════════════════════
+#  STATE PERSISTENCE + RECOVERY
+# ══════════════════════════════════════════════════════════════
+def save_state():
+    """يحفظ الصفقات المفتوحة — تُستدعى عند كل تغيير مهم."""
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {s: t.to_dict() for s, t in open_trades.items()},
+                f, ensure_ascii=False, indent=2
+            )
+    except Exception as e:
+        log.error(f"save_state: {e}")
+
+
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.error(f"load_state: {e}")
+    return {}
+
+
+def current_atr(symbol):
+    """ATR على 1h — يُستخدم لإعادة بناء SL/TP لصفقة فقدنا بياناتها."""
+    try:
+        k = client.futures_klines(symbol=symbol, interval="1h", limit=100)
+        return atr_calc([float(x[2]) for x in k],
+                        [float(x[3]) for x in k],
+                        [float(x[4]) for x in k])
+    except Exception as e:
+        log.error(f"atr {symbol}: {e}")
+        return 0.0
+
+
+def recover_trades():
+    """
+    مصدر الحقيقة هو Binance، لا الملف.
+    لكل وضعية مفتوحة فعلياً: نعيد بناء TradeState (من الملف إن توفّر، وإلا من ATR)
+    ونتأكد أن SL/TP موجودان على البورصة.
+    """
+    saved = load_state()
+    found = []
+
+    for p in all_positions():
+        try:
+            amt = float(p["positionAmt"])
+        except Exception:
+            continue
+        if abs(amt) < 1e-8:
+            continue
+
+        sym       = p["symbol"]
+        entry     = float(p.get("entryPrice") or 0)
+        direction = "long" if amt > 0 else "short"
+        qty       = abs(amt)
+
+        if entry <= 0:
+            entry = cur_price(sym)
+        if entry <= 0:
+            log.error(f"❌ {sym}: تعذّر تحديد سعر الدخول — تخطّي")
+            continue
+
+        s = saved.get(sym)
+        if s and s.get("direction") == direction:
+            trade  = TradeState.from_dict(s, entry=entry, qty=qty)
+            origin = "الملف"
+        else:
+            a = current_atr(sym)
+            if a <= 0:
+                a = entry * 0.01                       # احتياطي 1%
+            if direction == "long":
+                sl = entry - a * ATR_SL_MULT
+                tp = entry + a * ATR_TP_MULT
+            else:
+                sl = entry + a * ATR_SL_MULT
+                tp = entry - a * ATR_TP_MULT
+            trade  = TradeState(sym, entry, qty, direction, tp, sl, a, ["recovered"])
+            origin = "ATR"
+
+        open_trades[sym] = trade
+
+        sl_ok, tp_ok = has_protection(sym)
+        if sl_ok is None:                              # لم نستطع القراءة — لا نعبث
+            log.warning(f"⚠️ {sym}: تعذّرت قراءة الأوامر — الحماية غير مؤكدة")
+        elif not (sl_ok and tp_ok):
+            place_protection(sym, trade.trail_sl, trade.tp_price, direction)
+
+        found.append(f"{sym} {direction} @{entry:.4f} ({origin})")
+        log.info(f"♻️ استُعيدت: {sym} {direction} qty={qty} entry={entry:.4f} [{origin}]")
+
+    # صفقات في الملف لم تعد موجودة على Binance → أُغلقت أثناء التوقف
+    for sym in saved:
+        if sym not in open_trades:
+            log.info(f"🗑️ {sym}: في الملف لكن لا وضعية على Binance — أُهملت")
+
+    save_state()
+
+    if found:
+        tg("♻️ *استعادة بعد إعادة التشغيل*\n" + "\n".join(f"• {x}" for x in found))
+    else:
+        log.info("♻️ لا صفقات مفتوحة للاستعادة")
+    return len(found)
+
+
+# ══════════════════════════════════════════════════════════════
 #  OPEN POSITION
 # ══════════════════════════════════════════════════════════════
 def open_pos(cand):
@@ -774,7 +1083,10 @@ def open_pos(cand):
     if abs(amt) > 1e-8: return False
 
     try:
-        _, _, min_n = get_filters(sym)
+        f = get_filters(sym)
+        if not f:
+            return False
+        min_n = f[2]
         bal = balance()
         av  = avail_margin()
 
@@ -832,7 +1144,8 @@ def open_pos(cand):
         trade = TradeState(sym, re, rq, dire, cand["tp"], cand["sl"], cand["atr"], cand["reasons"])
         open_trades[sym] = trade
         _daily_trades   += 1
-        bn = place_sl(sym, re, rq, dire)
+        save_state()
+        bn, tp_ok = place_protection(sym, cand["sl"], cand["tp"], dire)
 
         dl = "📈 Long" if dire == "long" else "📉 Short"
         tg(
@@ -840,7 +1153,7 @@ def open_pos(cand):
             f"سعر:`{re:.4f}` | رافعة:`{LEVERAGE}x`\n"
             f"TP:`{cand['tp']:.4f}` | SL:`{cand['sl']:.4f}`\n"
             f"RR:`{trade.rr():.2f}` | BE`+{BE_TRIGGER*100:.1f}%`\n"
-            f"SL-BN:{'✅' if bn else 'ℹ️محلي'}\n"
+            f"SL-BN:{'✅' if bn else '⚠️محلي'} | TP-BN:{'✅' if tp_ok else '⚠️محلي'}\n"
             f"─────────────────\n"
             f"Score:`{cand['score']}` | RSI:`{cand['rsi_1h']:.0f}`\n"
             f"Vol:`×{cand['vol_r']:.1f}` | Break:`×{cand['b_str']:.1f}`\n"
@@ -862,22 +1175,26 @@ def open_pos(cand):
 def execute_close(symbol, trade, price, reason):
     amt, _ = get_position(symbol)
     if abs(amt) < 1e-8:
-        open_trades.pop(symbol, None); return
+        open_trades.pop(symbol, None); save_state(); return
     ok = mkt_close(symbol, abs(amt), trade.direction)
     if ok:
         open_trades.pop(symbol, None)
-        won, pnl = record_trade(trade, price)
+        save_state()
+        won, pnl, inc = record_trade(trade, price)
         bal = balance()
-        em  = "🟢" if pnl >= 0 else "🔴"
+        em  = "🟢" if won else "🔴"
         de  = "📈L" if trade.direction == "long" else "📉S"
         total = data["wins"] + data["losses"]
         wr    = data["wins"] / total * 100 if total else 0
+        src_tag = "" if inc["source"] == "binance" else " ⚠️تقديري"
         tg(
             f"{em} *{de} {symbol}*\n"
             f"{reason}\n"
             f"دخول:`{trade.entry:.4f}` → خروج:`{price:.4f}`\n"
-            f"P&L:`{pnl:+.2f}%` | مدة:`{trade.duration_hrs():.1f}h`\n"
-            f"WR:`{wr:.0f}%` ({total} صفقة)\n"
+            f"صافي:`{inc['net']:+.4f}` USDT{src_tag}\n"
+            f"خام:`{inc['gross']:+.4f}` | رسوم:`{inc['fees']:+.4f}`\n"
+            f"على الهامش:`{pnl:+.2f}%` | مدة:`{trade.duration_hrs():.1f}h`\n"
+            f"WR:`{wr:.0f}%` ({total} صفقة) | تراكمي:`{data['net_usdt']:+.2f}` USDT\n"
             f"💰 رصيد:`{bal:.2f}` USDT"
         )
     else:
@@ -897,6 +1214,7 @@ def close_all(reason):
                 quantity=abs(amt), reduceOnly=True
             )
             open_trades.pop(sym, None)
+            save_state()
         except Exception as e:
             log.error(f"close_all {sym}: {e}")
 
@@ -915,10 +1233,15 @@ def protection_monitor():
                 if abs(amt) < 1e-8:
                     # أُغلقت خارجياً
                     open_trades.pop(sym, None)
+                    save_state()
                     p = cur_price(sym)
                     if p > 0:
-                        won, pnl = record_trade(tr, p)
-                        tg(f"{'🟢' if pnl>=0 else '🔴'} *مُغلقة(BN): {sym}*\nP&L:`{pnl:+.2f}%`")
+                        won, pnl, inc = record_trade(tr, p)
+                        tg(
+                            f"{'🟢' if won else '🔴'} *مُغلقة على Binance: {sym}*\n"
+                            f"صافي:`{inc['net']:+.4f}` USDT | رسوم:`{inc['fees']:+.4f}`\n"
+                            f"على الهامش:`{pnl:+.2f}%`"
+                        )
                     continue
 
                 p = cur_price(sym)
@@ -936,17 +1259,19 @@ def protection_monitor():
                     execute_close(sym, tr, p, "وقف SL ⛔")
                 elif ev == "be" and not tr.notified:
                     tr.notified = True
-                    tg(f"🔒 *BE {sym}* P&L:`+{tr.pnl_pct(p):.2f}%`")
+                    save_state()
+                    sync_protection(tr, "BE")
+                    tg(f"🔒 *BE {sym}* SL→`{tr.trail_sl:.4f}` P&L:`+{tr.pnl_pct(p):.2f}%`")
                 elif ev == "trail":
+                    save_state()
+                    sync_protection(tr, "Trail")
                     tg(f"📈 *Trail {sym}* SL:`{tr.trail_sl:.4f}` P&L:`+{tr.pnl_pct(p):.2f}%`")
 
-                # تجديد SL على Binance لو اختفى
-                if sym not in _sl_no_support:
-                    try:
-                        orders = client.futures_get_open_orders(symbol=sym)
-                        if not any("STOP" in o.get("type","") for o in orders):
-                            place_sl(sym, tr.entry, abs(amt), tr.direction)
-                    except: pass
+                # تجديد الحماية لو اختفت من Binance
+                sl_ok, tp_ok = has_protection(sym)
+                if sl_ok is not None and not (sl_ok and tp_ok):
+                    log.warning(f"⚠️ {sym}: حماية ناقصة (SL:{sl_ok} TP:{tp_ok}) — إعادة وضع")
+                    place_protection(sym, tr.trail_sl, tr.tp_price, tr.direction)
 
         except Exception as e:
             log.error(f"prot_mon: {e}")
@@ -959,6 +1284,8 @@ def protection_monitor():
 def check_protection(bal):
     global halted, daily_start_bal, daily_reset_dt, _daily_trades
     if halted: return False
+    eq = equity()
+    if eq > 0: bal = eq          # احسب الحدود على الرصيد + الخسائر المفتوحة
 
     today = utcnow().date()
     if daily_reset_dt != today:
@@ -983,6 +1310,10 @@ def check_protection(bal):
             tg("🚨 *البوت متوقف نهائياً — حد الخسارة الإجمالي*")
             return False
 
+    if _daily_trades >= MAX_DAILY_TRADES:
+        log.info(f"⏸️ بلغ حد الصفقات اليومي ({MAX_DAILY_TRADES})")
+        return False
+
     if utcnow().hour in NO_TRADE_HOURS:
         return False
 
@@ -992,10 +1323,48 @@ def check_protection(bal):
 # ══════════════════════════════════════════════════════════════
 #  MAIN LOOP
 # ══════════════════════════════════════════════════════════════
+def validate_config():
+    """يفحص التناقضات في الإعدادات قبل أي تداول — يمنع الإقلاع لو كانت قاتلة."""
+    fatal, warn = [], []
+
+    if not BINANCE_API_KEY or BINANCE_API_KEY == "YOUR_KEY":
+        fatal.append("BINANCE_API_KEY غير مضبوط")
+    if not BINANCE_API_SECRET or BINANCE_API_SECRET == "YOUR_SECRET":
+        fatal.append("BINANCE_API_SECRET غير مضبوط")
+
+    rr_struct = ATR_TP_MULT / ATR_SL_MULT if ATR_SL_MULT else 0
+    if rr_struct < MIN_RR:
+        fatal.append(f"RR البنيوي {rr_struct:.2f} < MIN_RR {MIN_RR} — عدّل مضاعفات ATR")
+
+    if BE_TRIGGER >= TRAIL_TRIGGER:
+        warn.append(f"BE_TRIGGER({BE_TRIGGER}) ≥ TRAIL_TRIGGER({TRAIL_TRIGGER}) — Trailing لن يعمل")
+    if MAX_DAILY_LOSS >= MAX_TOTAL_LOSS:
+        warn.append("MAX_DAILY_LOSS ≥ MAX_TOTAL_LOSS — الحد الإجمالي بلا معنى")
+    if DATA_DIR == ".":
+        warn.append("DATA_DIR=. → الملفات تُمسح مع كل deploy. اربط Persistent Disk")
+    if not TV_SECRET:
+        warn.append("TV_SECRET فارغ — ويبهوك TradingView معطّل")
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "YOUR_TOKEN":
+        warn.append("TELEGRAM_TOKEN غير مضبوط — لا إشعارات")
+
+    for w in warn:  log.warning(f"⚠️ إعدادات: {w}")
+    for e in fatal: log.error(f"❌ إعدادات: {e}")
+
+    log.info(
+        f"⚙️ رافعة:{LEVERAGE}x | RR:{rr_struct:.2f} | MIN_SCORE:{MIN_SCORE} | "
+        f"فلتر السوق:{'مفعّل' if MARKET_FILTER else 'معطّل'} | "
+        f"حد يومي:{MAX_DAILY_TRADES} صفقة"
+    )
+    if fatal:
+        raise SystemExit("توقف: " + " | ".join(fatal))
+    return warn
+
+
 def main_loop():
     global bot_start_bal, daily_start_bal, daily_reset_dt, client
 
-    log.info("🚀 Bot v10.0 — EMA + Breakout + Sentiment")
+    log.info("🚀 Bot v11.0 — EMA(1h) + تأكيد(15m) + Sentiment")
+    warns = validate_config()
     client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
     load_data()
@@ -1006,6 +1375,7 @@ def main_loop():
 
     update_market()
     update_sentiment()
+    recover_trades()
 
     ini = balance()
     data["peak_bal"]   = max(data.get("peak_bal", 0), ini)
@@ -1018,7 +1388,7 @@ def main_loop():
     total = data["wins"] + data["losses"]
     wr    = data["wins"] / total * 100 if total else 0
     tg(
-        f"🤖 *Bot v10.0* ✅\n"
+        f"🤖 *Bot v11.0* ✅\n"
         f"رصيد:`{ini:.2f}` USDT\n"
         f"─── الاستراتيجية ───\n"
         f"EMA Crossover + Breakout + Sentiment\n"
@@ -1026,6 +1396,7 @@ def main_loop():
         f"SL:`ATR×{ATR_SL_MULT}` | TP:`ATR×{ATR_TP_MULT}`\n"
         f"─── السجل ───\n"
         f"WR:`{wr:.0f}%` ({total} صفقة)\n"
+        f"صافي تراكمي:`{data['net_usdt']:+.2f}` USDT | رسوم:`{data['fees_usdt']:+.2f}`\n"
         f"😱 Sentiment: {sentiment_label()}"
     )
 
@@ -1046,7 +1417,11 @@ def main_loop():
 
             # تحديثات دورية
             if mf >= 20: update_market(); update_sentiment(); mf = 0
-            if sc >= 600: sc = 0  # إعادة تحميل filters كل 5 ساعات
+            # كان يصفّر العدّاد فقط دون مسح الكاش — أي لا إعادة تحميل إطلاقاً
+            if sc >= 600:
+                _filters_cache.clear()
+                log.info("🔄 أُعيد تحميل فلاتر العملات")
+                sc = 0
 
             if not check_protection(bal):
                 time.sleep(SCAN_INTERVAL_SEC); continue
@@ -1094,9 +1469,10 @@ def home():
     total = data["wins"] + data["losses"]
     wr    = data["wins"] / total * 100 if total else 0
     lines = [
-        f"<b>🤖 Bot v10.0 — EMA + Breakout + Sentiment</b> | {bull}",
+        f"<b>🤖 Bot v11.0 — EMA(1h) + تأكيد(15m) + Sentiment</b> | {bull}",
         f"رصيد:<b>{bal:.2f} USDT</b> | مفتوحة:{len(open_trades)}/{MAX_OPEN_TRADES}",
-        f"WR:<b>{wr:.0f}%</b> ({total} صفقة) | Pnl:{data['total_pnl']:+.1f}%",
+        f"WR:<b>{wr:.0f}%</b> ({total} صفقة) | "
+        f"صافي:<b>{data['net_usdt']:+.2f} USDT</b> | رسوم:{data['fees_usdt']:+.2f}",
         f"Sentiment: {sentiment_label()} | رافعة:{LEVERAGE}x",
         "<hr>",
     ]
@@ -1133,11 +1509,18 @@ def trades_r():
 @app.route("/stats")
 def stats_r():
     total = data["wins"] + data["losses"]
+    net, fees, gross = data["net_usdt"], data["fees_usdt"], data["gross_usdt"]
     return json.dumps({
-        "wins":      data["wins"],
-        "losses":    data["losses"],
-        "wr":        round(data["wins"]/total*100, 1) if total else 0,
-        "total_pnl": round(data["total_pnl"], 2),
+        "wins":         data["wins"],
+        "losses":       data["losses"],
+        "wr":           round(data["wins"]/total*100, 1) if total else 0,
+        "net_usdt":     round(net, 4),
+        "gross_usdt":   round(gross, 4),
+        "fees_usdt":    round(fees, 4),
+        "fees_pct_of_gross": round(abs(fees)/abs(gross)*100, 1) if gross else 0,
+        "avg_net_per_trade": round(net/total, 4) if total else 0,
+        "unmeasured":   data["unmeasured"],
+        "total_pnl":    round(data["total_pnl"], 2),
         "sentiment": {"value": _sentiment["value"], "label": _sentiment["label"]},
         "market":    "bull" if _market_bull else "bear",
     }, ensure_ascii=False, indent=2)
@@ -1146,6 +1529,8 @@ def stats_r():
 def webhook():
     """إشارات TradingView يدوية"""
     try:
+        if not TV_SECRET:
+            return {"status": "disabled", "msg": "اضبط TV_SECRET لتفعيل الويبهوك"}, 403
         d = flask_request.get_json(force=True, silent=True) or {}
         if d.get("secret") != TV_SECRET:
             return {"status": "unauthorized"}, 401
@@ -1159,10 +1544,36 @@ def webhook():
             p  = cur_price(sym)
             execute_close(sym, tr, p, "TV-Close")
             return {"status": "closed"}
-        return {"status": "received", "symbol": sym, "direction": dire}
+        # الفتح عبر الويبهوك غير مدعوم عمداً: يتجاوز كل فلاتر الدخول
+        # وإدارة المخاطر. المدعوم فقط: direction="close".
+        return {
+            "status": "open_not_supported",
+            "msg": "الويبهوك يدعم الإغلاق فقط — الفتح يتجاوز فلاتر المخاطر",
+            "symbol": sym, "direction": dire,
+        }
     except Exception as e:
         return {"status": "error", "msg": str(e)}, 500
 
+# ══════════════════════════════════════════════════════════════
+#  ENTRYPOINT
+# ══════════════════════════════════════════════════════════════
+# ⚠️ الـ Procfile كان: gunicorn main:app
+#    مع gunicorn لا يُنفَّذ __main__ إطلاقاً → خيط التداول لا يبدأ،
+#    والبوت يعرض صفحة ويب فقط ولا يتداول. لذلك نبدأ الخيط عند الاستيراد.
+#    وإذا استُخدم gunicorn فيجب أن يكون --workers 1 وإلا شُغّل بوت لكل عامل.
+_bot_started = threading.Lock()
+_started     = False
+
+def start_bot_once():
+    global _started
+    with _bot_started:
+        if _started:
+            return
+        _started = True
+        threading.Thread(target=main_loop, daemon=True).start()
+        log.info("🧵 خيط التداول بدأ")
+
+start_bot_once()
+
 if __name__ == "__main__":
-    threading.Thread(target=main_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
